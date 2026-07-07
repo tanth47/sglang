@@ -105,6 +105,44 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def _restore_glm_moe_dsa_head_dims_from_raw_config(
+    hf_config: PretrainedConfig,
+    raw_config_dict: Optional[dict],
+    model_override_args: dict,
+    model_path: str,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    kwargs: dict,
+) -> None:
+    if _hf_arch(hf_config) != "GlmMoeDsaForCausalLM":
+        return
+
+    if raw_config_dict is None:
+        try:
+            raw_config_dict, _ = PretrainedConfig.get_config_dict(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to restore GLM DSA raw head dimensions from config.json: %s",
+                exc,
+            )
+            return
+
+    for name in (
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "qk_head_dim",
+        "v_head_dim",
+    ):
+        value = model_override_args.get(name, raw_config_dict.get(name))
+        if value is not None:
+            setattr(hf_config, name, value)
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -275,6 +313,7 @@ class ModelConfig:
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
         # remapping and architecture-specific normalization, so each instance
         # must own an isolated copy.
+        raw_config_dict = None
         try:
             hf_config = get_config(
                 self.model_path,
@@ -287,16 +326,25 @@ class ModelConfig:
         except ValueError as exc:
             if not (is_draft_model and _is_missing_model_type_error(exc)):
                 raise
-            config_dict, _ = PretrainedConfig.get_config_dict(
+            raw_config_dict, _ = PretrainedConfig.get_config_dict(
                 self.model_path,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
                 **kwargs,
             )
-            hf_config = PretrainedConfig.from_dict(config_dict)
+            hf_config = PretrainedConfig.from_dict(raw_config_dict)
             if self.model_override_args:
                 hf_config.update(self.model_override_args)
         self.hf_config = copy.deepcopy(hf_config)
+        _restore_glm_moe_dsa_head_dims_from_raw_config(
+            self.hf_config,
+            raw_config_dict,
+            self.model_override_args,
+            self.model_path,
+            trust_remote_code,
+            revision,
+            kwargs,
+        )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,

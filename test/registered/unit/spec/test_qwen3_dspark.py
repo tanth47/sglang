@@ -38,6 +38,30 @@ def _glm_dspark_config_dict(**overrides):
     return cfg
 
 
+def _glm52_target_config_dict(**overrides):
+    cfg = {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "hidden_size": 6144,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "kv_lora_rank": 512,
+        "max_position_embeddings": 4096,
+        "model_type": "glm_moe_dsa",
+        "num_attention_heads": 64,
+        "num_hidden_layers": 78,
+        "num_key_value_heads": 64,
+        "q_lora_rank": 2048,
+        "qk_head_dim": 256,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "rope_scaling": None,
+        "v_head_dim": 256,
+        "vocab_size": 154880,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 @pytest.mark.parametrize("arch", ["Qwen3DSparkDraftModel", "DSparkDraftModel"])
 def test_dspark_alias_routes_dspark_draft_to_dflash(monkeypatch, arch):
     import sglang.srt.utils.hf_transformers_utils as hf_utils
@@ -225,6 +249,44 @@ def test_model_config_normalizes_glm_dspark_before_shape_derivation(monkeypatch)
     assert model_config.num_hidden_layers == 5
     assert model_config.num_attention_heads == 64
     assert model_config.vocab_size == 154880
+
+
+def test_model_config_restores_glm_moe_dsa_raw_head_dims(monkeypatch):
+    import sglang.srt.configs.model_config as model_config_module
+    from sglang.srt.configs.model_config import ModelConfig
+
+    raw_config = _glm52_target_config_dict()
+    mutated_config = PretrainedConfig.from_dict(
+        _glm52_target_config_dict(qk_rope_head_dim=192)
+    )
+
+    monkeypatch.setattr(
+        model_config_module, "get_config", lambda *args, **kwargs: mutated_config
+    )
+    monkeypatch.setattr(
+        model_config_module, "get_generation_config", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        PretrainedConfig,
+        "get_config_dict",
+        classmethod(lambda cls, *args, **kwargs: (raw_config, {})),
+    )
+    monkeypatch.setattr(ModelConfig, "_maybe_pull_model_for_runai", lambda *args: None)
+    monkeypatch.setattr(
+        ModelConfig, "_maybe_pull_model_tokenizer_from_remote", lambda *args: None
+    )
+
+    model_config = ModelConfig(
+        model_path="unused-glm52-target",
+        trust_remote_code=True,
+        dtype="float32",
+    )
+
+    assert model_config.hf_config.qk_nope_head_dim == 192
+    assert model_config.hf_config.qk_rope_head_dim == 64
+    assert model_config.hf_config.qk_head_dim == 256
+    assert model_config.qk_nope_head_dim == 192
+    assert model_config.qk_rope_head_dim == 64
 
 
 def test_dspark_draft_model_builds_glm_markov_and_confidence_heads(monkeypatch):
