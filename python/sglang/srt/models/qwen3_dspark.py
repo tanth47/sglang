@@ -1,4 +1,4 @@
-"""Qwen3 DSpark draft model for SGLang (DFLASH backbone + Markov/confidence heads)."""
+"""DSpark draft models for SGLang (DFLASH backbone + Markov/confidence heads)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dflash_utils import normalize_dspark_draft_config
 from sglang.srt.utils import add_prefix
+
+
+def _normalize_dspark_config(config):
+    return normalize_dspark_draft_config(config)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -75,6 +80,7 @@ class Qwen3DSparkDraftModel(DFlashDraftModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        config = _normalize_dspark_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
 
         self.vocab_size = int(config.vocab_size)
@@ -138,6 +144,7 @@ class Qwen3DSparkDraftModel(DFlashDraftModel):
         super().load_weights(backbone_weights)
 
         params = dict(self.named_parameters())
+        loaded_head_params = set()
         for name, loaded in markov_weights + confidence_weights + lm_head_weights:
             if name not in params:
                 continue
@@ -147,6 +154,33 @@ class Qwen3DSparkDraftModel(DFlashDraftModel):
                 loader(param, loaded)
             else:
                 param.data.copy_(loaded)
+            loaded_head_params.add(name)
+
+        required_head_params = ["lm_head.weight"]
+        if self.markov_head is not None:
+            required_head_params.extend(
+                ["markov_head.markov_w1.weight", "markov_head.markov_w2.weight"]
+            )
+        if self.confidence_head is not None:
+            required_head_params.extend(
+                ["confidence_head.proj.weight", "confidence_head.proj.bias"]
+            )
+        missing = [
+            name for name in required_head_params if name not in loaded_head_params
+        ]
+        if missing:
+            raise ValueError(
+                "DSpark draft checkpoint is missing required head weights: "
+                f"{missing}."
+            )
 
 
-EntryClass = Qwen3DSparkDraftModel
+class DSparkDraftModel(Qwen3DSparkDraftModel):
+    """Generic Speculators DSpark draft model.
+
+    This matches checkpoints with ``architectures: ["DSparkDraftModel"]`` such
+    as RedHatAI/GLM-5.2-speculator.dspark.
+    """
+
+
+EntryClass = [Qwen3DSparkDraftModel, DSparkDraftModel]

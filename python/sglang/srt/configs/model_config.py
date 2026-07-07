@@ -47,6 +47,11 @@ MIMO_V2_MODEL_ARCHS = (
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
+def _is_missing_model_type_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return "Unrecognized model" in message and "model_type" in message
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -270,8 +275,8 @@ class ModelConfig:
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
         # remapping and architecture-specific normalization, so each instance
         # must own an isolated copy.
-        self.hf_config = copy.deepcopy(
-            get_config(
+        try:
+            hf_config = get_config(
                 self.model_path,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
@@ -279,7 +284,19 @@ class ModelConfig:
                 model_config_parser=model_config_parser,
                 **kwargs,
             )
-        )
+        except ValueError as exc:
+            if not (is_draft_model and _is_missing_model_type_error(exc)):
+                raise
+            config_dict, _ = PretrainedConfig.get_config_dict(
+                self.model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+            hf_config = PretrainedConfig.from_dict(config_dict)
+            if self.model_override_args:
+                hf_config.update(self.model_override_args)
+        self.hf_config = copy.deepcopy(hf_config)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -522,6 +539,17 @@ class ModelConfig:
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
+
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3DSparkDraftModel",
+            "DSparkDraftModel",
+        ]:
+            from sglang.srt.speculative.dflash_utils import (
+                normalize_dspark_draft_config,
+            )
+
+            normalize_dspark_draft_config(self.hf_config, inplace=True)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",

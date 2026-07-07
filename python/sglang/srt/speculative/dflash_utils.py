@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+DEFAULT_DFLASH_NUMERIC_MASK_TOKEN = "<|DFLASH_NUMERIC_MASK_TOKEN|>"
 
 logger = logging.getLogger(__name__)
 
@@ -331,14 +333,63 @@ def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
+def _cfg_set(config: Any, key: str, value: Any) -> None:
+    if isinstance(config, dict):
+        config[key] = value
+    else:
+        setattr(config, key, value)
+
+
+def _cfg_items(config: Any):
+    if isinstance(config, dict):
+        return config.items()
+    return vars(config).items()
+
+
+def normalize_dspark_draft_config(config: Any, *, inplace: bool = False) -> Any:
+    """Expose Speculators DSpark transformer config on the draft config itself.
+
+    Public Speculators checkpoints store the draft transformer under
+    ``transformer_layer_config`` while SGLang's model config and DFlash backbone
+    read these fields from the draft config itself.
+    """
+
+    transformer_cfg = _cfg_get(config, "transformer_layer_config", None)
+    if transformer_cfg is None:
+        return config
+
+    normalized = config if inplace else copy.copy(config)
+    for key, value in _cfg_items(transformer_cfg):
+        if key.startswith("_"):
+            continue
+        if _cfg_get(normalized, key, None) is None:
+            _cfg_set(normalized, key, value)
+
+    aux_layer_ids = _cfg_get(normalized, "aux_hidden_state_layer_ids", None)
+    if _cfg_get(normalized, "num_target_layers", None) is None:
+        parsed_aux_layer_ids = (
+            [int(x) for x in aux_layer_ids] if aux_layer_ids is not None else []
+        )
+        if parsed_aux_layer_ids:
+            _cfg_set(normalized, "num_target_layers", max(parsed_aux_layer_ids) + 1)
+
+    return normalized
+
+
 def _get_text_config(config: Any) -> Any:
     if config is None:
         return None
     if isinstance(config, dict):
-        return config.get("text_config", config)
+        text_config = config.get("text_config", None)
+        if text_config is not None:
+            return text_config
+        return config.get("transformer_layer_config", config)
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
         return text_config
+    transformer_layer_config = getattr(config, "transformer_layer_config", None)
+    if transformer_layer_config is not None:
+        return transformer_layer_config
     get_text_config = getattr(config, "get_text_config", None)
     if callable(get_text_config):
         try:
@@ -469,7 +520,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
-        _cfg_get(draft_hf_config, "target_layer_ids", None),
+        _cfg_get(
+            draft_hf_config,
+            "target_layer_ids",
+            _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None),
+        ),
     )
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:
@@ -487,16 +542,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
             )
 
-    mask_token = dflash_cfg.get("mask_token", None)
-    if mask_token is None:
-        mask_token = DEFAULT_DFLASH_MASK_TOKEN
-    if not isinstance(mask_token, str) or not mask_token:
-        raise ValueError(
-            "DFLASH dflash_config.mask_token must be a non-empty string, "
-            f"got {mask_token!r}."
-        )
-
-    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    mask_token_id = dflash_cfg.get(
+        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
+    )
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
@@ -509,6 +557,19 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 "DFLASH dflash_config.mask_token_id must be non-negative, "
                 f"got {mask_token_id}."
             )
+
+    mask_token = dflash_cfg.get("mask_token", None)
+    if mask_token is None:
+        mask_token = (
+            DEFAULT_DFLASH_NUMERIC_MASK_TOKEN
+            if mask_token_id is not None
+            else DEFAULT_DFLASH_MASK_TOKEN
+        )
+    if not isinstance(mask_token, str) or not mask_token:
+        raise ValueError(
+            "DFLASH dflash_config.mask_token must be a non-empty string, "
+            f"got {mask_token!r}."
+        )
 
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,

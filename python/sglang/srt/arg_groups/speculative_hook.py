@@ -11,29 +11,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_missing_model_type_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return "Unrecognized model" in message and "model_type" in message
+
+
+def _load_speculative_draft_config(
+    speculative_draft_model_path: str,
+    trust_remote_code: bool = False,
+    kwargs: Optional[dict] = None,
+):
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    kwargs = dict(kwargs or {})
+    try:
+        return get_config(
+            speculative_draft_model_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+    except ValueError as exc:
+        if not _is_missing_model_type_error(exc):
+            raise
+
+        from transformers import PretrainedConfig
+
+        model_override_args = kwargs.pop("model_override_args", None)
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            speculative_draft_model_path,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+        config = PretrainedConfig.from_dict(config_dict)
+        if model_override_args:
+            config.update(model_override_args)
+        return config
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
-    kwargs: Optional[dict] = {},
+    kwargs: Optional[dict] = None,
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
-    is_qwen3_dspark_draft = False
+    is_dspark_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
-
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
+        cfg = _load_speculative_draft_config(
+            speculative_draft_model_path,
+            trust_remote_code=trust_remote_code,
+            kwargs=kwargs,
         )
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
             arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
             for arch in draft_archs
         )
-        is_qwen3_dspark_draft = any(
-            arch == "Qwen3DSparkDraftModel" for arch in draft_archs
+        is_dspark_draft = any(
+            arch in ("Qwen3DSparkDraftModel", "DSparkDraftModel")
+            for arch in draft_archs
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
@@ -52,9 +90,9 @@ def _resolve_speculative_algorithm_alias(
             return "FROZEN_KV_MTP"
         return "EAGLE"
 
-    if speculative_algorithm == "DSPARK" and is_qwen3_dspark_draft:
+    if speculative_algorithm == "DSPARK" and is_dspark_draft:
         logger.info(
-            "Detected Qwen3DSparkDraftModel draft; "
+            "Detected DSpark draft model; "
             "routing --speculative-algorithm DSPARK to DFLASH."
         )
         return "DFLASH"
@@ -140,13 +178,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
+    dspark_block_size = getattr(server_args, "speculative_dspark_block_size", None)
     if (
         server_args.speculative_dflash_block_size is None
-        and server_args.speculative_dspark_block_size is not None
+        and dspark_block_size is not None
     ):
-        server_args.speculative_dflash_block_size = (
-            server_args.speculative_dspark_block_size
-        )
+        server_args.speculative_dflash_block_size = dspark_block_size
 
     if server_args.enable_dp_attention:
         raise ValueError(
@@ -213,13 +250,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         model_override_args = json.loads(server_args.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
+            draft_hf_config = _load_speculative_draft_config(
                 server_args.speculative_draft_model_path,
                 trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.speculative_draft_model_revision,
-                model_override_args=model_override_args,
+                kwargs={
+                    "revision": server_args.speculative_draft_model_revision,
+                    "model_override_args": model_override_args,
+                },
             )
             inferred_block_size = parse_dflash_draft_config(
                 draft_hf_config=draft_hf_config
