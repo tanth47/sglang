@@ -70,12 +70,13 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
-            if seq_lens_cpu_backup is not None:
-                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            base_seq_lens_cpu = (
+                seq_lens_cpu_backup
+                if seq_lens_cpu_backup is not None
+                else batch.seq_lens.cpu()
+            )
+            batch.seq_lens_cpu = base_seq_lens_cpu
+            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -156,16 +157,14 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            verify_lens_cpu = (
-                layout.verify_lens_cpu
-                if layout.verify_lens_cpu is not None
-                else layout.verify_lens.cpu().tolist()
+        if not self._verify_backend_self_adds_seq_lens():
+            base_seq_lens_cpu = (
+                seq_lens_cpu_backup
+                if seq_lens_cpu_backup is not None
+                else batch.seq_lens.cpu()
             )
-            batch.seq_lens_cpu = seq_lens_cpu_backup + torch.tensor(
-                verify_lens_cpu, dtype=seq_lens_cpu_backup.dtype
-            )
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.seq_lens_cpu = base_seq_lens_cpu
+            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -182,10 +181,11 @@ class TargetVerifyExecutor:
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        return TargetVerifyResult(
+        result = TargetVerifyResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+        return result
 
     def run_compact(
         self,
@@ -231,23 +231,28 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+            full_width = bool(torch.all(layout.verify_lens[:bs] == stride).item())
+            if full_width:
+                strided_logits = compact_logits[: bs * stride]
+                hidden_strided = compact_hidden[: bs * stride]
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
+                hidden_strided = ScatterCompactToStrided.execute(
+                    compact=compact_hidden,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
