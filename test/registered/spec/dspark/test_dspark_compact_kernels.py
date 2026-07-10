@@ -6,12 +6,15 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     DSparkScheduleConfig,
 )
+from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.accept_greedy import (
     accept_greedy,
     accept_greedy_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_ragged_verify_window import (
     build_ragged_verify_window,
+    build_ragged_verify_window_from_strided_torch,
+    build_ragged_verify_window_from_strided_triton,
     build_ragged_verify_window_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
@@ -110,6 +113,50 @@ def test_build_ragged_verify_window_triton_matches_torch(bs, pad):
         device=device,
         verify_num_draft_tokens=VERIFY_TOKENS,
         model_runner=model_runner,
+    )
+    assert torch.equal(got.positions, ref.positions)
+    assert torch.equal(got.verify_cache_loc, ref.verify_cache_loc)
+    assert torch.equal(got.verify_ids, ref.verify_ids)
+
+
+@pytest.mark.parametrize("bs", [2, 8])
+@pytest.mark.parametrize("pad", ["exact", "bucket"])
+def test_build_ragged_verify_window_from_strided_triton_matches_torch(bs, pad):
+    device = torch.device("cuda")
+    verify_lens = torch.randint(
+        1, VERIFY_TOKENS + 1, (bs,), dtype=torch.int32, device=device
+    )
+    total = int(verify_lens.sum().item())
+    graph_num_tokens = total if pad == "exact" else bs * VERIFY_TOKENS
+    layout = RaggedVerifyLayout.from_verify_lens_device(
+        verify_lens=verify_lens,
+        graph_num_tokens=graph_num_tokens,
+    )
+    positions_2d = torch.randint(
+        0, 1 << 20, (bs, VERIFY_TOKENS), dtype=torch.int64, device=device
+    )
+    cache_2d = torch.randint(
+        0, 1 << 20, (bs, VERIFY_TOKENS), dtype=torch.int64, device=device
+    )
+    verify_ids_2d = torch.randint(
+        0, 129280, (bs, VERIFY_TOKENS), dtype=torch.int64, device=device
+    )
+    verify_window = VerifyWindow(
+        positions_2d=positions_2d,
+        verify_cache_loc=cache_2d.reshape(-1),
+        verify_cache_loc_2d=cache_2d,
+    )
+    ref = build_ragged_verify_window_from_strided_torch(
+        layout=layout,
+        verify_ids_2d=verify_ids_2d,
+        verify_window=verify_window,
+        device=device,
+    )
+    got = build_ragged_verify_window_from_strided_triton(
+        layout=layout,
+        verify_ids_2d=verify_ids_2d,
+        verify_window=verify_window,
+        device=device,
     )
     assert torch.equal(got.positions, ref.positions)
     assert torch.equal(got.verify_cache_loc, ref.verify_cache_loc)
