@@ -94,6 +94,7 @@ def idle_ragged_layout(
         device=device,
         grid=grid,
         graph_num_tokens_floor=dp_tier_num_tokens,
+        num_draft_tokens=verify_num_draft_tokens,
     )
 
 
@@ -130,6 +131,7 @@ def uniform_ragged_layout(
         device=device,
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
+        num_draft_tokens=verify_num_draft_tokens,
     )
 
 

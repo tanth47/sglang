@@ -516,6 +516,7 @@ class DSparkVerifyPlanner:
             device=device,
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
+            num_draft_tokens=self.verify_num_draft_tokens,
         )
 
     def _budget_aligned_to_graph_tier(

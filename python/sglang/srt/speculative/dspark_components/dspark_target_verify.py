@@ -236,8 +236,7 @@ class TargetVerifyExecutor:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            full_width = bool(torch.all(layout.verify_lens[:bs] == stride).item())
-            if full_width:
+            if layout.is_full_width is True:
                 strided_logits = compact_logits[: bs * stride]
                 hidden_strided = compact_hidden[: bs * stride]
             else:

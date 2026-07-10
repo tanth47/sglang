@@ -81,6 +81,28 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
         self.assertEqual(layout.graph_num_tokens, 16)
         self.assertEqual(int(layout.qo_indptr_device[-1]), 7)
 
+    def test_uniform_layout_marks_full_width(self):
+        layout = RaggedVerifyLayout.uniform(
+            bs=2, num_draft_tokens=8, device=_DEVICE, grid=_GRID
+        )
+        self.assertIs(layout.is_full_width, True)
+
+    def test_cpu_layout_marks_non_full_width_when_context_is_known(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 4],
+            device=_DEVICE,
+            grid=_GRID,
+            num_draft_tokens=8,
+        )
+        self.assertIs(layout.is_full_width, False)
+
+    def test_device_layout_leaves_full_width_unknown_without_sync(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([8, 8], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=16,
+        )
+        self.assertIsNone(layout.is_full_width)
+
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
     def test_mixed_verify_lens_geometry(self):
@@ -212,6 +234,7 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertEqual(padded.total_verify_tokens, 16)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8])
         self.assertEqual(padded.qo_indptr_device.tolist(), [0, 8, 16])
+        self.assertIs(padded.is_full_width, True)
 
     def test_padded_to_full_rows_noops_when_already_full(self):
         raw = RaggedVerifyLayout.from_verify_lens(
