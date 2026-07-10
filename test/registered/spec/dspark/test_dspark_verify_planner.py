@@ -8,6 +8,7 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,6 +67,29 @@ class TestDSparkVerifyPlanner(CustomTestCase):
                     server_args=_server_args(),
                     verify_num_draft_tokens=8,
                 )
+
+    def test_compact_backend_check_can_defer_until_backend_init(self):
+        with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}):
+            planner = DSparkVerifyPlanner(
+                draft_model=_draft_model(with_confidence_head=False),
+                gamma=7,
+                model_runner=types.SimpleNamespace(),
+                device=torch.device("cpu"),
+                tp_rank=0,
+                server_args=_server_args(),
+                verify_num_draft_tokens=8,
+            )
+
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._require_compact_backend_support(allow_missing=True)
+
+        with self.assertRaisesRegex(ValueError, "current backend <missing>"):
+            planner.validate_attention_backend_support()
+
+        planner.model_runner.attn_backend = types.SimpleNamespace(
+            supports_ragged_verify_graph=True
+        )
+        planner.validate_attention_backend_support()
 
 
 if __name__ == "__main__":

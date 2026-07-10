@@ -142,7 +142,7 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-            self._require_compact_backend_support()
+            self._require_compact_backend_support(allow_missing=True)
             self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
@@ -234,11 +234,16 @@ class DSparkVerifyPlanner:
                         "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE=1."
                     )
 
-    def _require_compact_backend_support(self) -> None:
+    def validate_attention_backend_support(self) -> None:
+        self._require_compact_backend_support(allow_missing=False)
+
+    def _require_compact_backend_support(self, *, allow_missing: bool = False) -> None:
         if self._ragged_verify_mode is not RaggedVerifyMode.COMPACT:
             return
         attn_backend = getattr(self.model_runner, "attn_backend", None)
         if getattr(attn_backend, "supports_ragged_verify_graph", False):
+            return
+        if attn_backend is None and allow_missing:
             return
         backend_name = type(attn_backend).__name__ if attn_backend is not None else None
         raise ValueError(

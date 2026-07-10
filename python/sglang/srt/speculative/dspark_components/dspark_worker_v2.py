@@ -417,6 +417,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        self._verify_planner.validate_attention_backend_support()
         with self._draft_context():
             self._draft_worker.init_attention_backends()
 
