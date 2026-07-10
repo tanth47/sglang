@@ -445,6 +445,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         return getattr(spec_info, "ragged_verify_layout", None)
 
+    def _is_full_width_target_verify_without_layout(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        if not forward_batch.forward_mode.is_target_verify():
+            return False
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is None:
+            return False
+        return int(input_ids.numel()) == (
+            int(forward_batch.batch_size) * int(self.num_tokens_per_bs)
+        )
+
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.num_tokens_per_bs
@@ -486,7 +498,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
-            return False
+            if not self._is_full_width_target_verify_without_layout(forward_batch):
+                return False
 
         if (
             self.require_mlp_tp_gather

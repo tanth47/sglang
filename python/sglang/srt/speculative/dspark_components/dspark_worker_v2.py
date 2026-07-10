@@ -1085,6 +1085,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         if not collect_path:
             return
+        if self._verify_planner.is_compact_mode:
+            raise RuntimeError(
+                "DSpark STS collection (SGLANG_DSPARK_STS_COLLECT_PATH) is not "
+                "supported under SGLANG_RAGGED_VERIFY_MODE=compact because compact "
+                "verify layouts can corrupt per-position prefix labels. Collect "
+                "STS data with cap-accept or static mode."
+            )
         if not self._verify_planner.carries_confidence:
             return
         confidence_raw = self._verify_planner.last_confidence_raw

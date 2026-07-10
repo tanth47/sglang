@@ -19,6 +19,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft_proposer import (
 from sglang.srt.speculative.dspark_components.dspark_target_verify import (
     TargetVerifyExecutor,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     create_dummy_verify_input,
@@ -109,6 +110,18 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         with envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(False):
             with self.assertRaisesRegex(AssertionError, "over-allocation"):
                 draft_input.prepare_for_decode(batch)
+
+    def test_dspark_sts_collection_rejects_compact_mode(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._verify_planner = SimpleNamespace(is_compact_mode=True)
+
+        with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/tmp/dspark-sts"):
+            with self.assertRaisesRegex(RuntimeError, "cap-accept or static"):
+                worker._maybe_record_sts_collect(
+                    verify_ids_2d=None,
+                    target_logits=None,
+                    bs=1,
+                )
 
     def test_dflash_draft_block_uses_prefix_seq_lens_cpu(self):
         dst = torch.empty((2,), dtype=torch.int32)
