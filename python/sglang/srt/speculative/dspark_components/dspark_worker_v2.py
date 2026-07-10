@@ -836,8 +836,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
                     layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
+                    verify_ids_2d=verify_ids_2d,
+                    verify_window=verify_window,
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,

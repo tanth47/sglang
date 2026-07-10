@@ -21,7 +21,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_ragged_verify_window import (
-    BuildRaggedVerifyWindow,
+    build_ragged_verify_window_from_strided,
 )
 from sglang.srt.speculative.dspark_components.kernels.scatter_compact_to_strided import (
     ScatterCompactToStrided,
@@ -194,22 +194,18 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
+        verify_ids_2d: torch.Tensor,
+        verify_window: VerifyWindow,
         bs: int,
         device: str,
         sampling_info,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
+        ragged_window = build_ragged_verify_window_from_strided(
             layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
+            verify_ids_2d=verify_ids_2d,
+            verify_window=verify_window,
             device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
         )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)

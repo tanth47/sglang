@@ -6,8 +6,12 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.dspark_components.dspark_info import RaggedVerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_info import (
+    RaggedVerifyWindow,
+    VerifyWindow,
+)
 from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
+    CompactRowIndex,
     compact_row_index,
     compact_row_index_triton,
     compact_verify_ids,
@@ -122,6 +126,47 @@ def build_ragged_verify_window(
         device=device,
     )
 
+    return RaggedVerifyWindow(
+        positions=positions,
+        verify_cache_loc=verify_cache_loc,
+        verify_ids=verify_ids,
+    )
+
+
+def build_ragged_verify_window_from_strided(
+    *,
+    layout: RaggedVerifyLayout,
+    verify_ids_2d: torch.Tensor,
+    verify_window: VerifyWindow,
+    device: str,
+) -> RaggedVerifyWindow:
+    """Compact an already-built full verify window.
+
+    DSpark decode always builds the strided/full verify window before proposal.
+    Compact verify only needs the rows selected by ``layout.verify_lens``. Reusing
+    the strided window avoids recomputing cache locations and rebuilding ids from
+    the draft block on the critical path.
+    """
+    verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+    padded_total = layout.graph_num_tokens
+    bs = int(verify_lens.shape[0])
+    req_id, within, valid = CompactRowIndex.execute(
+        verify_lens=verify_lens,
+        padded_total=padded_total,
+        device=device,
+    )
+    safe_req = req_id.clamp(max=bs - 1)
+    positions_2d = verify_window.positions_2d.to(device=device)
+    cache_2d = verify_window.verify_cache_loc_2d.to(device=device)
+    ids_2d = verify_ids_2d.to(device=device, dtype=torch.int64)
+    positions = positions_2d[safe_req, within]
+    verify_cache_loc = cache_2d[safe_req, within]
+    verify_ids = ids_2d[safe_req, within]
+    positions = torch.where(valid, positions, torch.zeros_like(positions))
+    verify_cache_loc = torch.where(
+        valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
+    )
+    verify_ids = torch.where(valid, verify_ids, torch.zeros_like(verify_ids))
     return RaggedVerifyWindow(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
