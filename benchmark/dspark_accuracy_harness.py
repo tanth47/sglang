@@ -377,15 +377,14 @@ def command_collect(args) -> None:
                     record = future.result()
                     append_jsonl(output_path, record)
                     print_collect_record(record, args)
+        if args.server_info_output:
+            server_info = get_json(
+                args.base_url.rstrip("/") + "/server_info", timeout_s=args.timeout_s
+            )
+            write_json(args.server_info_output, server_info)
     finally:
         if force_budget_applied and args.dspark_reset_force_budget:
             set_internal_state(args.base_url, {"dspark_force_budget_frac": None}, args)
-
-    if args.server_info_output:
-        server_info = get_json(
-            args.base_url.rstrip("/") + "/server_info", timeout_s=args.timeout_s
-        )
-        write_json(args.server_info_output, server_info)
 
     rows = read_jsonl(output_path)
     summary = summarize_run(rows)

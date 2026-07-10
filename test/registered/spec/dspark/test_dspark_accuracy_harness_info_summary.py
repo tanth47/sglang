@@ -194,6 +194,72 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
             self.assertNotIn("HF_TOKEN", manifest["environment"])
             self.assertNotIn("SGLANG_API_KEY", manifest["environment"])
 
+    def test_collect_captures_server_info_before_reset_force_budget(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            prompts = tmpdir / "prompts.jsonl"
+            output = tmpdir / "collect.jsonl"
+            server_info = tmpdir / "server_info.json"
+            prompts.write_text('{"idx": 0, "text": "hello"}\n', encoding="utf-8")
+            events = []
+            args = Namespace(
+                base_url="http://127.0.0.1:30000",
+                prompts=str(prompts),
+                output=str(output),
+                run_label="dspark-smoke",
+                start_idx=None,
+                end_idx=None,
+                limit=None,
+                resume=False,
+                concurrency=1,
+                print_records=False,
+                temperature=0.0,
+                sampling_seed=None,
+                allow_nondeterministic_sampling=False,
+                dspark_force_budget_frac=0.35,
+                dspark_reset_force_budget=True,
+                dspark_clear_info_records=False,
+                timeout_s=1,
+                server_info_output=str(server_info),
+                manifest_output=None,
+            )
+
+            def fake_set_internal_state(base_url, server_args, args):
+                if server_args == {"dspark_force_budget_frac": 0.35}:
+                    events.append("force")
+                elif server_args == {"dspark_force_budget_frac": None}:
+                    events.append("reset")
+                else:
+                    events.append(f"set:{server_args}")
+                return {"updated": True}
+
+            def fake_collect_one(row, args):
+                events.append("collect")
+                return {
+                    "idx": row["idx"],
+                    "ok": True,
+                    "meta_info": {"completion_tokens": 1},
+                }
+
+            def fake_get_json(url, *, timeout_s):
+                events.append("server_info")
+                return {"internal_states": []}
+
+            with (
+                patch.object(
+                    self.harness,
+                    "set_internal_state",
+                    side_effect=fake_set_internal_state,
+                ),
+                patch.object(self.harness, "collect_one", side_effect=fake_collect_one),
+                patch.object(self.harness, "get_json", side_effect=fake_get_json),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.harness.command_collect(args)
+
+            self.assertEqual(events, ["force", "collect", "server_info", "reset"])
+            self.assertTrue(server_info.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
