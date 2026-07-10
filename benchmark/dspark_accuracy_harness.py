@@ -157,6 +157,16 @@ def post_json(url: str, body: dict[str, Any], *, timeout_s: int) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def get_json(url: str, *, timeout_s: int) -> Any:
+    with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def write_json(path: str | Path, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
 def set_internal_state(base_url: str, server_args: dict[str, Any], args) -> Any:
     response = post_json(
         base_url.rstrip("/") + "/set_internal_state",
@@ -268,6 +278,12 @@ def command_collect(args) -> None:
         if force_budget_applied and args.dspark_reset_force_budget:
             set_internal_state(args.base_url, {"dspark_force_budget_frac": None}, args)
 
+    if args.server_info_output:
+        server_info = get_json(
+            args.base_url.rstrip("/") + "/server_info", timeout_s=args.timeout_s
+        )
+        write_json(args.server_info_output, server_info)
+
     rows = read_jsonl(output_path)
     summary = summarize_run(rows)
     summary.update(
@@ -276,6 +292,7 @@ def command_collect(args) -> None:
             "output": str(output_path),
             "elapsed_s": time.perf_counter() - started,
             "dspark_force_budget_frac": args.dspark_force_budget_frac,
+            "server_info_output": args.server_info_output,
         }
     )
     print(json.dumps(summary, sort_keys=True))
@@ -1146,6 +1163,7 @@ def add_collect(subparsers) -> None:
         default=True,
     )
     parser.add_argument("--dspark-clear-info-records", action="store_true")
+    parser.add_argument("--server-info-output")
     parser.set_defaults(func=command_collect)
 
 
