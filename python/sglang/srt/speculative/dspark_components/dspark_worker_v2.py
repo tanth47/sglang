@@ -851,6 +851,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
                 gamma=self.gamma,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                positions_2d=verify_window.positions_2d,
                 cutoff_layout=layout,
             )
             if self._simulate_acc_len > 0:
