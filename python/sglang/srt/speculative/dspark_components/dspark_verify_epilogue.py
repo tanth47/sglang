@@ -13,8 +13,9 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
     BuildOutTokens,
 )
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
-    BuildCommitInjectLayout,
+    BuildCommitInjectLayoutFromWindow,
 )
+from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     finalize_accept_lens_triton,
 )
@@ -77,6 +78,12 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
+        self.verify_cache_loc_2d_buf = torch.zeros(
+            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
+        self.positions_2d_buf = torch.zeros(
+            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
 
@@ -98,7 +105,12 @@ class DsparkVerifyEpilogue:
             bs=forward_batch.batch_size,
         )
 
-    def begin_step(self, verify_lens, armed: bool) -> None:
+    def begin_step(
+        self,
+        verify_lens,
+        armed: bool,
+        verify_window: Optional[VerifyWindow] = None,
+    ) -> None:
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -106,6 +118,21 @@ class DsparkVerifyEpilogue:
             self.verify_lens_buf[:bs].copy_(verify_lens)
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
+            if armed and self.folds_commit and verify_window is not None:
+                self.verify_cache_loc_2d_buf[:bs].copy_(
+                    verify_window.verify_cache_loc_2d[:bs, : self.stride].to(
+                        device=self.verify_cache_loc_2d_buf.device,
+                        dtype=torch.int64,
+                        non_blocking=True,
+                    )
+                )
+                self.positions_2d_buf[:bs].copy_(
+                    verify_window.positions_2d[:bs, : self.stride].to(
+                        device=self.positions_2d_buf.device,
+                        dtype=torch.int64,
+                        non_blocking=True,
+                    )
+                )
         self.inject_gate_buf.fill_(1 if armed else 0)
 
     def read_accept(self, bs: int) -> AcceptOuts:
@@ -227,11 +254,9 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        inject_layout = BuildCommitInjectLayout.execute(
-            req_pool_indices=req_pool_indices,
-            req_to_token=ctx.resolve_req_to_token(),
-            prefix_lens=seq_lens[:bs],
-            block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+        inject_layout = BuildCommitInjectLayoutFromWindow.execute(
+            cache_loc_2d=self.verify_cache_loc_2d_buf[:bs],
+            positions_2d=self.positions_2d_buf[:bs],
             full_to_swa_mapping=pool.full_to_swa_index_mapping,
             commit_lens=gated_commit_lens,
             stride=self.stride,

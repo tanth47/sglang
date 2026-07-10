@@ -209,7 +209,9 @@ class TargetVerifyExecutor:
             device=device,
         )
         if self.verify_epilogue is not None:
-            self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
+            self.verify_epilogue.begin_step(
+                layout.verify_lens, armed=inject_gate, verify_window=verify_window
+            )
         target_verify = self._run_ragged(
             batch=batch,
             layout=layout,
