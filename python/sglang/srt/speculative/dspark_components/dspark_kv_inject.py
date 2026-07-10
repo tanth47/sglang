@@ -3,8 +3,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
     BuildCommitInjectLayout,
+    BuildCommitInjectLayoutFromWindow,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
@@ -110,6 +112,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
+        verify_window: Optional[VerifyWindow] = None,
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
@@ -119,15 +122,24 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            inject_layout = BuildCommitInjectLayout.execute(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                prefix_lens=prefix_lens,
-                block_pos_offsets=self._block_pos_offsets[:stride],
-                full_to_swa_mapping=pool.full_to_swa_index_mapping,
-                commit_lens=commit_lens,
-                stride=stride,
-            )
+            if verify_window is None:
+                inject_layout = BuildCommitInjectLayout.execute(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    prefix_lens=prefix_lens,
+                    block_pos_offsets=self._block_pos_offsets[:stride],
+                    full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                    commit_lens=commit_lens,
+                    stride=stride,
+                )
+            else:
+                inject_layout = BuildCommitInjectLayoutFromWindow.execute(
+                    cache_loc_2d=verify_window.verify_cache_loc_2d,
+                    positions_2d=verify_window.positions_2d,
+                    full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                    commit_lens=commit_lens,
+                    stride=stride,
+                )
             with torch.inference_mode():
                 self.draft_model.write_target_hidden_kv(
                     main_hidden=hidden.reshape(-1, hidden.shape[-1]),
@@ -135,6 +147,16 @@ class TargetHiddenKvInjector:
                     positions=inject_layout.positions,
                     pool=pool,
                 )
+            return
+
+        if verify_window is not None:
+            self.inject_target_hidden(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_window.verify_cache_loc,
+                cache_loc_2d=verify_window.verify_cache_loc_2d,
+                positions=verify_window.positions_2d.reshape(-1),
+                commit_lens=commit_lens,
+            )
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets

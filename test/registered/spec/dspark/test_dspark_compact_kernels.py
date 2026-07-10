@@ -27,6 +27,8 @@ from sglang.srt.speculative.dspark_components.kernels.cap_correct_len import (
 )
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
     build_commit_inject_layout,
+    build_commit_inject_layout_from_window,
+    build_commit_inject_layout_from_window_triton,
     build_commit_inject_layout_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
@@ -390,3 +392,53 @@ def test_commit_inject_layout_triton_matches_torch_and_masks_edges():
     swa_2d = got.swa_loc.view(2, VERIFY_TOKENS)
     assert bool((swa_2d[0] == -1).all())
     assert bool((swa_2d[1] >= 0).all())
+
+
+def test_commit_inject_layout_from_window_triton_matches_legacy_layout():
+    device = torch.device("cuda")
+    (
+        req_pool_indices,
+        req_to_token,
+        prefix_lens,
+        block_pos_offsets,
+        full_to_swa,
+        _,
+    ) = _commit_inject_inputs(3, device)
+    commit_lens = torch.tensor(
+        [0, VERIFY_TOKENS // 2, VERIFY_TOKENS], device=device, dtype=torch.int32
+    )
+    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:VERIFY_TOKENS]
+    cache_loc_2d = req_to_token[req_pool_indices.view(-1, 1), positions_2d]
+
+    ref = build_commit_inject_layout(
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        prefix_lens=prefix_lens,
+        block_pos_offsets=block_pos_offsets,
+        full_to_swa_mapping=full_to_swa,
+        commit_lens=commit_lens,
+        stride=VERIFY_TOKENS,
+    )
+    ref_from_window = build_commit_inject_layout_from_window(
+        cache_loc_2d=cache_loc_2d,
+        positions_2d=positions_2d,
+        full_to_swa_mapping=full_to_swa,
+        commit_lens=commit_lens,
+        stride=VERIFY_TOKENS,
+    )
+    got = build_commit_inject_layout_from_window_triton(
+        cache_loc_2d=cache_loc_2d,
+        positions_2d=positions_2d,
+        full_to_swa_mapping=full_to_swa,
+        commit_lens=commit_lens,
+        stride=VERIFY_TOKENS,
+    )
+    assert torch.equal(ref_from_window.swa_loc, ref.swa_loc)
+    assert torch.equal(ref_from_window.positions, ref.positions)
+    assert torch.equal(got.swa_loc, ref.swa_loc)
+    assert torch.equal(got.positions, ref.positions)
+    swa_2d = got.swa_loc.view(3, VERIFY_TOKENS)
+    assert bool((swa_2d[0] == -1).all())
+    assert bool((swa_2d[1, : VERIFY_TOKENS // 2] >= 0).all())
+    assert bool((swa_2d[1, VERIFY_TOKENS // 2 :] == -1).all())
+    assert bool((swa_2d[2] >= 0).all())

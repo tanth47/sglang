@@ -124,6 +124,7 @@ class TargetVerifyExecutor:
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
+                verify_window=verify_window,
                 commit_lens=commit_lens,
                 bs=bs,
             )
