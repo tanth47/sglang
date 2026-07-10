@@ -18,6 +18,7 @@ from sglang.srt.speculative.dspark_components.kernels.cap_correct_len import (
 )
 from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+from sglang.srt.utils import is_hip
 
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_ACCEPT_SAMPLING.get()
 
@@ -205,7 +206,7 @@ class AcceptSampling:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
+        if _KERNEL_IMPL == "torch" or is_hip():
             return cls.torch(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -223,7 +224,7 @@ class AcceptSampling:
         positions_2d: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return accept_sampling(
+        return accept_sampling_torch(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -262,6 +263,34 @@ class AcceptSampling:
         )
 
 
+def _build_target_probs(
+    *,
+    target_logits: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    if (
+        not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
+    ):
+        return SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        ).view(bs, verify_num_draft_tokens, -1)
+    return build_dflash_verify_target_probs(
+        next_token_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_token_num=verify_num_draft_tokens,
+        bs=bs,
+        max_top_k=draft_input.max_top_k,
+        uniform_top_k_value=draft_input.uniform_top_k_value,
+    )
+
+
 def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
@@ -282,25 +311,13 @@ def _accept_sampling_core(
 ]:
     bs = candidates.shape[0]
     device = candidates.device
-    if (
-        not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
-        and not sampling_info.need_min_p_sampling
-    ):
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
-    else:
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits,
-            sampling_info=sampling_info,
-            draft_token_num=verify_num_draft_tokens,
-            bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
-        )
+    target_probs = _build_target_probs(
+        target_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        bs=bs,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+    )
     (
         retrieve_index,
         retrieve_next_token,
@@ -353,6 +370,46 @@ def _accept_sampling_core(
             cutoff_verify_lens,
         )
     return correct_len, cap_trim_lens, accept_index, predicts, debug_tensors
+
+
+def accept_sampling_torch(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_probs: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    positions_2d: Optional[torch.Tensor] = None,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs = candidates.shape[0]
+    device = candidates.device
+    target_probs = _build_target_probs(
+        target_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        bs=bs,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+    )
+    uniform_samples, uniform_samples_final = _chain_uniform_samples(
+        sampling_info=sampling_info,
+        positions_2d=positions_2d,
+        bs=bs,
+        gamma=gamma,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        device=device,
+    )
+    return _reference_chain_accept(
+        candidates=candidates,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
+        gamma=gamma,
+        cutoff_verify_lens=cutoff_verify_lens,
+    )
 
 
 def accept_sampling(

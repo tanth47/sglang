@@ -122,12 +122,7 @@ def sample_draft_block(
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            if fast_sampling:
-                if sampling_info.sampling_seed is not None:
-                    raise RuntimeError(
-                        "SGLANG_DSPARK_FAST_SAMPLING does not support seeded "
-                        "non-greedy sampling yet."
-                    )
+            if fast_sampling and sampling_info.sampling_seed is None:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)

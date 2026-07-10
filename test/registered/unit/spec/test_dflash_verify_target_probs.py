@@ -6,6 +6,7 @@ import torch
 
 import sglang.srt.speculative.dflash_utils as dflash_utils
 from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
+    AcceptSampling,
     _chain_uniform_samples,
     _reference_chain_accept,
 )
@@ -103,6 +104,72 @@ class TestDFlashVerifyTargetProbs(unittest.TestCase):
         torch.testing.assert_close(correct, torch.tensor([0], dtype=torch.int32))
         torch.testing.assert_close(bonus, torch.tensor([1], dtype=torch.int64))
         torch.testing.assert_close(cap_trim, torch.tensor([1], dtype=torch.int32))
+
+    def test_accept_sampling_torch_matches_reference(self):
+        candidates = torch.tensor([[10, 1, 2, 3]], dtype=torch.int64)
+        target_probs = torch.tensor(
+            [
+                [
+                    [0.0, 0.6, 0.1, 0.1, 0.2],
+                    [0.0, 0.0, 0.1, 0.2, 0.7],
+                    [0.1, 0.1, 0.1, 0.6, 0.1],
+                    [0.2, 0.2, 0.2, 0.2, 0.2],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        draft_probs = torch.tensor(
+            [
+                [
+                    [0.0, 0.5, 0.1, 0.2, 0.2],
+                    [0.0, 0.0, 0.8, 0.1, 0.1],
+                    [0.1, 0.1, 0.1, 0.6, 0.1],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        uniform = torch.tensor([[0.5, 0.5, 0.5]], dtype=torch.float32)
+        uniform_final = torch.tensor([[0.9, 0.2, 0.3, 0.4]], dtype=torch.float32)
+        sampling_info = SimpleNamespace(
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            temperatures=torch.ones((1, 1), dtype=torch.float32),
+            sampling_seed=None,
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.dspark_components.kernels.accept_sampling."
+                "SoftmaxTemp.execute",
+                return_value=target_probs.reshape(4, 5),
+            ),
+            patch(
+                "sglang.srt.speculative.dspark_components.kernels.accept_sampling."
+                "_chain_uniform_samples",
+                return_value=(uniform, uniform_final),
+            ),
+        ):
+            actual = AcceptSampling.torch(
+                candidates=candidates,
+                target_logits=torch.empty((4, 5), dtype=torch.float32),
+                draft_probs=draft_probs,
+                sampling_info=sampling_info,
+                draft_input=SimpleNamespace(),
+                gamma=3,
+                verify_num_draft_tokens=4,
+            )
+
+        expected = _reference_chain_accept(
+            candidates=candidates,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=uniform,
+            uniform_samples_final=uniform_final,
+            gamma=3,
+        )
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(actual_tensor, expected_tensor)
 
     def test_seeded_chain_uniform_samples_are_position_deterministic(self):
         if not torch.cuda.is_available():
@@ -224,6 +291,42 @@ class TestDFlashVerifyTargetProbs(unittest.TestCase):
             )
 
         torch.testing.assert_close(result_a.draft_tokens, result_b.draft_tokens)
+
+    def test_seeded_draft_sampling_falls_back_when_fast_sampling_enabled(self):
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA/ROCm for seeded multinomial Triton kernel")
+
+        device = torch.device("cuda")
+        base_logits = torch.tensor(
+            [[[2.0, 1.0, 0.2, -0.5], [0.1, 1.5, 0.3, 0.0]]],
+            dtype=torch.float32,
+            device=device,
+        )
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            top_ks=torch.full((1,), TOP_K_ALL, dtype=torch.int32, device=device),
+            temperatures=torch.ones((1, 1), dtype=torch.float32, device=device),
+            sampling_seed=torch.tensor([1234], dtype=torch.int64, device=device),
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.envs."
+            "SGLANG_DSPARK_FAST_SAMPLING.get",
+            return_value=True,
+        ):
+            result = sample_draft_block(
+                base_logits=base_logits,
+                anchor_tokens=torch.tensor([7], dtype=torch.int64, device=device),
+                draft_hidden=torch.zeros((1, 2, 1), dtype=torch.float32, device=device),
+                sampling_info=sampling_info,
+                markov_head=_FakeMarkovHead(),
+                device=device,
+                draft_positions=torch.tensor(
+                    [[11, 12]], dtype=torch.int64, device=device
+                ),
+            )
+
+        self.assertEqual(tuple(result.draft_tokens.shape), (1, 2))
 
     def test_min_p_filters_and_renormalizes_target_probs(self):
         logits = torch.log(
