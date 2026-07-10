@@ -415,7 +415,10 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
-    supports_ragged_verify_graph: bool = True
+    # The HIP radix backend rejects ragged target-verify layouts in both eager
+    # and cuda-graph metadata paths. Do not advertise graph support until those
+    # paths are implemented.
+    supports_ragged_verify_graph: bool = False
 
     def __init__(
         self,

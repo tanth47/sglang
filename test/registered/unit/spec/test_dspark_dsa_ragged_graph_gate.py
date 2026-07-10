@@ -20,6 +20,9 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 DeepseekSparseAttnBackend = type(
     "DeepseekSparseAttnBackend", (), {"supports_ragged_verify_graph": True}
 )
+NoRaggedGraphBackend = type(
+    "NoRaggedGraphBackend", (), {"supports_ragged_verify_graph": False}
+)
 OtherBackend = type("OtherBackend", (), {})
 
 
@@ -165,6 +168,16 @@ def test_compact_mode_admits_non_uniform_dsa_ragged_layout():
     layout = _layout(verify_lens=[8, 1], graph_num_tokens=16)
 
     assert runner.can_run_graph(
+        _target_verify_batch(bs=2, num_tokens=16, layout=layout)
+    )
+
+
+def test_compact_mode_rejects_backend_without_ragged_graph_support():
+    runner = _can_run_runner()
+    runner.attn_backend = NoRaggedGraphBackend()
+    layout = _layout(verify_lens=[8, 1], graph_num_tokens=16)
+
+    assert not runner.can_run_graph(
         _target_verify_batch(bs=2, num_tokens=16, layout=layout)
     )
 
