@@ -125,6 +125,15 @@ class ResolvedConfidence(msgspec.Struct):
     generation: torch.Tensor
 
 
+class ConfidenceRelayStats(msgspec.Struct):
+
+    attempts: int = 0
+    hits: int = 0
+    misses: int = 0
+    last_status: str = "never"
+    ring_pos: int = 0
+
+
 @dataclass
 class RelayPayload:
     """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
@@ -159,6 +168,10 @@ class ConfidenceRelay(msgspec.Struct):
     copy_done: Optional[list] = None
     ring_pos: int = 0
     initialized: bool = False
+    resolve_attempts: int = 0
+    resolve_hits: int = 0
+    resolve_misses: int = 0
+    last_resolve_status: str = "never"
 
     def _lazy_init(self, confidence: torch.Tensor) -> None:
         self.initialized = True
@@ -194,33 +207,57 @@ class ConfidenceRelay(msgspec.Struct):
         self.gen_ring[slot].copy_(self.pool.req_generation)
         self.ring_pos += 1
 
+    def _record_resolve(self, *, status: str, hit: bool) -> None:
+        self.resolve_attempts += 1
+        if hit:
+            self.resolve_hits += 1
+        else:
+            self.resolve_misses += 1
+        self.last_resolve_status = status
+
+    def snapshot_stats(self) -> ConfidenceRelayStats:
+        return ConfidenceRelayStats(
+            attempts=int(self.resolve_attempts),
+            hits=int(self.resolve_hits),
+            misses=int(self.resolve_misses),
+            last_status=self.last_resolve_status,
+            ring_pos=int(self.ring_pos),
+        )
+
     def resolve(
         self, batch: ScheduleBatch, *, stream, publish_ready
     ) -> Optional[ResolvedConfidence]:
         if not self.initialized:
+            self._record_resolve(status="uninitialized", hit=False)
             return None
         draft_input = batch.spec_info
         if draft_input is None:
+            self._record_resolve(status="no_spec_info", hit=False)
             return None
         fi = draft_input.future_indices
         if fi is None or fi.shape[0] == 0:
+            self._record_resolve(status="empty_future_indices", hit=False)
             return None
 
         if stream is None or publish_ready is None:
             idx = batch.req_pool_indices
             idx_cpu = batch.req_pool_indices_cpu
+            self._record_resolve(status="direct", hit=True)
             return ResolvedConfidence(
                 confidence=self.confidence_buf[idx].cpu(),
                 generation=self.pool.req_generation[idx_cpu].clone(),
             )
 
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
+            self._record_resolve(status="ring_warmup", hit=False)
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
         if not self.copy_done[slot].query():
+            self._record_resolve(status="copy_not_ready", hit=False)
             return None
 
         idx_cpu = batch.req_pool_indices_cpu
+        self._record_resolve(status="ring", hit=True)
         return ResolvedConfidence(
             confidence=self.conf_ring[slot][idx_cpu],
             generation=self.gen_ring[slot][idx_cpu],
@@ -338,6 +375,11 @@ class FutureMap:
             stream=self.fwd_prepare_d2h_stream,
             publish_ready=self.publish_ready,
         )
+
+    def confidence_relay_stats(self) -> ConfidenceRelayStats:
+        if not self.needs_confidence_relay:
+            return ConfidenceRelayStats(last_status="disabled")
+        return self.confidence_relay.snapshot_stats()
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():

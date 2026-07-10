@@ -1046,6 +1046,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
+                    confidence_relay_stats=(
+                        self._verify_planner.last_confidence_relay_stats
+                    ),
                     verify_lens=layout.verify_lens if layout is not None else None,
                     confidence=confidence,
                     req_pool_indices=batch.req_pool_indices,

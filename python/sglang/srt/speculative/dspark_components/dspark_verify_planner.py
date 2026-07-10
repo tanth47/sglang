@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
+    ConfidenceRelayStats,
     FutureMap,
     ResolvedConfidence,
 )
@@ -128,6 +129,7 @@ class DSparkVerifyPlanner:
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
+        self._last_confidence_relay_stats: Optional[ConfidenceRelayStats] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
@@ -309,6 +311,10 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.lag_steps
 
+    @property
+    def last_confidence_relay_stats(self) -> Optional[ConfidenceRelayStats]:
+        return self._last_confidence_relay_stats
+
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
         if self._budget_planner is None:
             return None
@@ -369,6 +375,7 @@ class DSparkVerifyPlanner:
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
+        self._last_confidence_relay_stats = future_map.confidence_relay_stats()
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )

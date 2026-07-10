@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.managers.overlap_utils import ConfidenceRelayStats
 from sglang.srt.speculative.dspark_components.dspark_info_dumper import (
     DecodeStepObservation,
     DsparkInfoDumper,
@@ -52,6 +53,7 @@ def make_obs(
     verify_tokens_graph_key=None,
     predicted_step_ms=None,
     predicted_theta=None,
+    confidence_relay_stats=None,
 ):
     verify_tokens_local = (
         num_verify_tokens if verify_tokens_local is None else verify_tokens_local
@@ -78,6 +80,7 @@ def make_obs(
         verify_tokens_graph_key=verify_tokens_graph_key,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
+        confidence_relay_stats=confidence_relay_stats,
         verify_lens=torch.full((bs,), 6, dtype=torch.int32),
         confidence=torch.full((bs, 5), 0.9),
         req_pool_indices=torch.arange(bs, dtype=torch.int64),
@@ -170,6 +173,27 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["verify_tokens_dp_synced"], 21)
         self.assertEqual(record["verify_tokens_graph_key"], 24)
         self.assertEqual(record["mode"], "static")
+
+    def test_core_fields_include_confidence_relay_stats_when_present(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                confidence_relay_stats=ConfidenceRelayStats(
+                    attempts=4,
+                    hits=3,
+                    misses=1,
+                    last_status="ring",
+                    ring_pos=9,
+                ),
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(record["confidence_relay_status"], "ring")
+        self.assertEqual(record["confidence_relay_attempts"], 4)
+        self.assertEqual(record["confidence_relay_hits"], 3)
+        self.assertEqual(record["confidence_relay_misses"], 1)
+        self.assertEqual(record["confidence_relay_ring_pos"], 9)
 
     def test_core_only_omits_timing_fields(self):
         dumper, clock = make_dumper({"core"})
@@ -264,6 +288,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         verify_tokens_graph_key=num_verify_tokens,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=1.0,
+        confidence_relay_stats=None,
         step_cpu_ms=None,
         rids=None,
         future=None,
@@ -345,6 +370,7 @@ class TestReqsAndGpuTiming(CustomTestCase):
             verify_tokens_graph_key=obs.verify_tokens_graph_key,
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
+            confidence_relay_stats=obs.confidence_relay_stats,
             verify_lens=obs.verify_lens.cuda(),
             confidence=obs.confidence.cuda(),
             req_pool_indices=obs.req_pool_indices.cuda(),
