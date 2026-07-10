@@ -167,6 +167,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark draft requires markov_rank > 0; got "
                 f"markov_rank={dspark_config.markov_rank}."
             )
+        capture_layer_ids = getattr(
+            self.model_runner, "dflash_or_dspark_target_layer_ids", None
+        )
+        num_context_features = getattr(self.draft_model, "num_context_features", None)
+        if capture_layer_ids is not None and num_context_features is not None:
+            expected_features = len(capture_layer_ids)
+            if int(num_context_features) != expected_features:
+                raise ValueError(
+                    "DSpark draft target-hidden feature count mismatch: draft "
+                    f"expects num_context_features={num_context_features}, but "
+                    f"target capture is configured for {expected_features} layers "
+                    f"({capture_layer_ids}). Ensure DSpark target_layer_ids are "
+                    "canonicalized before DFlash draft initialization."
+                )
         if server_args.speculative_num_draft_tokens is None:
             gamma = int(dspark_config.resolve_gamma(default=None) or 0)
             if gamma < 1:

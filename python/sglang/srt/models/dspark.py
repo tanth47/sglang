@@ -61,8 +61,23 @@ def normalize_dspark_draft_config(config: Any) -> Any:
             _cfg_set(config, key, value)
 
     aux_layer_ids = _cfg_get(config, "aux_hidden_state_layer_ids", None)
-    if _cfg_get(config, "num_target_layers", None) is None and aux_layer_ids is not None:
-        parsed = [int(x) for x in aux_layer_ids]
+    dspark_target_layer_ids = _cfg_get(config, "dspark_target_layer_ids", None)
+    if (
+        _cfg_get(config, "target_layer_ids", None) is None
+        and dspark_target_layer_ids is not None
+    ):
+        _cfg_set(config, "target_layer_ids", [int(x) for x in dspark_target_layer_ids])
+
+    target_layer_ids_for_num_target = (
+        dspark_target_layer_ids
+        if dspark_target_layer_ids is not None
+        else aux_layer_ids
+    )
+    if (
+        _cfg_get(config, "num_target_layers", None) is None
+        and target_layer_ids_for_num_target is not None
+    ):
+        parsed = [int(x) for x in target_layer_ids_for_num_target]
         if parsed:
             _cfg_set(config, "num_target_layers", max(parsed) + 1)
 

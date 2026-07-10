@@ -8,6 +8,9 @@ from sglang.srt.configs.model_config import (
     _normalize_nested_transformer_config,
     _restore_glm_moe_dsa_head_dims_from_raw_config,
 )
+from sglang.srt.model_executor.model_runner import (
+    _resolve_dflash_or_dspark_capture_spec,
+)
 from sglang.srt.models.dspark import EntryClass, normalize_dspark_draft_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_worker_common import (
@@ -127,6 +130,62 @@ class TestGLM52RedHatDSparkConfig(CustomTestCase):
         self.assertEqual(config.num_hidden_layers, 5)
         self.assertEqual(config.vocab_size, 154880)
         self.assertEqual(config.num_target_layers, 71)
+
+    def test_normalize_dspark_draft_config_canonicalizes_prefixed_target_layers(self):
+        config = _glm52_redhat_dspark_config()
+        config.dspark_target_layer_ids = [3, 11, 19]
+
+        normalize_dspark_draft_config(config)
+        parsed = parse_dflash_draft_config(draft_hf_config=config)
+
+        self.assertEqual(config.target_layer_ids, [3, 11, 19])
+        self.assertEqual(config.num_target_layers, 20)
+        self.assertEqual(parsed.target_layer_ids, [3, 11, 19])
+        self.assertEqual(parsed.num_target_layers, 20)
+
+    def test_dspark_capture_spec_keeps_explicit_redhat_aux_layers_for_glm52(self):
+        with self.assertLogs(
+            "sglang.srt.model_executor.model_runner", level="WARNING"
+        ) as logs:
+            capture_spec = _resolve_dflash_or_dspark_capture_spec(
+                draft_hf_config=_glm52_redhat_dspark_config(),
+                target_num_layers=78,
+                is_dspark=True,
+            )
+
+        self.assertEqual(capture_spec.draft_num_layers, 5)
+        self.assertEqual(capture_spec.target_layer_ids, [8, 23, 39, 55, 70])
+        warning_text = "\n".join(logs.output)
+        self.assertIn(
+            "using explicit target_layer_ids=[8, 23, 39, 55, 70]",
+            warning_text,
+        )
+        self.assertNotIn(
+            "selecting capture layers based on the runtime target", warning_text
+        )
+
+    def test_dspark_capture_spec_rejects_mismatch_without_explicit_layers(self):
+        config = _glm52_redhat_dspark_config()
+        delattr(config, "aux_hidden_state_layer_ids")
+        config.num_target_layers = 71
+
+        with self.assertRaisesRegex(ValueError, "does not provide explicit"):
+            _resolve_dflash_or_dspark_capture_spec(
+                draft_hf_config=config,
+                target_num_layers=78,
+                is_dspark=True,
+            )
+
+    def test_dspark_capture_spec_rejects_final_layer_id(self):
+        config = _glm52_redhat_dspark_config()
+        config.aux_hidden_state_layer_ids = [8, 23, 77]
+
+        with self.assertRaisesRegex(ValueError, "cannot include the final target layer"):
+            _resolve_dflash_or_dspark_capture_spec(
+                draft_hf_config=config,
+                target_num_layers=78,
+                is_dspark=True,
+            )
 
 
 class TestGLM52RedHatDSparkWorkerConfig(CustomTestCase):

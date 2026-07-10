@@ -92,6 +92,15 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
+    def test_dspark_rejects_two_batch_overlap(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_two_batch_overlap = True
+
+        with self.assertRaisesRegex(ValueError, "two-batch-overlap"):
+            _handle_dspark(server_args)
+
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(
             model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
@@ -174,6 +183,18 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             ),
             self.assertRaisesRegex(ValueError, "Use --speculative-algorithm DSPARK"),
         ):
+            _handle_dflash(server_args)
+
+    def test_dflash_rejects_two_batch_overlap(self):
+        server_args = _make_dspark_server_args(
+            model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+        )
+        server_args.speculative_algorithm = "DFLASH"
+        server_args.speculative_draft_model_path = "deepseek-ai/DeepSeek-V4-Flash"
+        server_args.speculative_dspark_block_size = None
+        server_args.enable_two_batch_overlap = True
+
+        with self.assertRaisesRegex(ValueError, "two-batch-overlap"):
             _handle_dflash(server_args)
 
 
