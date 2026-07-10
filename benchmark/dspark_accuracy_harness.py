@@ -319,6 +319,26 @@ def print_collect_record(record: dict[str, Any], args) -> None:
         )
 
 
+def sum_histogram(metas: list[dict[str, Any]], key: str) -> list[int]:
+    total: list[int] = []
+    for meta in metas:
+        hist = meta.get(key) or []
+        if len(hist) > len(total):
+            total.extend([0] * (len(hist) - len(total)))
+        for idx, value in enumerate(hist):
+            total[idx] += int(value)
+    return total
+
+
+def per_position_acceptance_from_histogram(hist: list[int]) -> list[float]:
+    total = sum(hist)
+    if total == 0:
+        return []
+    # hist[k] counts verify steps that accepted exactly k draft tokens.
+    # Position j survives when accepted_len >= j.
+    return [sum(hist[pos:]) / total for pos in range(1, len(hist))]
+
+
 def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ok = [r for r in rows if r.get("ok")]
     metas = [r.get("meta_info") or {} for r in ok]
@@ -328,6 +348,8 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     verify = sum(m.get("spec_verify_ct") or 0 for m in spec_metas)
     correct = sum(m.get("spec_num_correct_drafts") or 0 for m in spec_metas)
     proposed = sum(m.get("spec_num_proposed_drafts") or 0 for m in spec_metas)
+    accept_len_histogram = sum_histogram(spec_metas, "spec_accept_histogram")
+    cap_lens_histogram = sum_histogram(spec_metas, "spec_cap_lens_histogram")
     accept_lengths = [
         m["spec_accept_length"] for m in metas if m.get("spec_accept_length") is not None
     ]
@@ -344,8 +366,17 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if verify:
         summary["aggregate_accept_length"] = spec_completion / verify
+        summary["aggregate_accept_length_including_bonus"] = spec_completion / verify
+        summary["aggregate_draft_accept_length"] = correct / verify
     if proposed:
         summary["aggregate_accept_rate"] = correct / proposed
+    if accept_len_histogram:
+        summary["accept_len_histogram"] = accept_len_histogram
+        summary["per_position_acceptance"] = per_position_acceptance_from_histogram(
+            accept_len_histogram
+        )
+    if cap_lens_histogram:
+        summary["cap_lens_histogram"] = cap_lens_histogram
     if accept_lengths:
         summary["mean_accept_length"] = statistics.fmean(accept_lengths)
         summary["min_accept_length"] = min(accept_lengths)
