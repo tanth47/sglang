@@ -1,5 +1,6 @@
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +17,7 @@ from sglang.srt.speculative.dspark_components.kernels import (
     padded_to_bucket as _padded_to_bucket_mod,
 )
 from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +39,14 @@ def tearDownModule():
 
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
+
+
+class _FakeFlashinferKvIndicesKernel:
+    def __getitem__(self, grid):
+        def _run(*args, **kwargs):
+            return None
+
+        return _run
 
 
 class TestRaggedVerifyGraphCapability(CustomTestCase):
@@ -79,10 +89,20 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
         )
         self.assertIs(_resolve_ragged_verify_layout(fb), layout)
 
-    def test_device_layout_preserves_real_total_under_padded_bucket(self):
+    def test_device_layout_omits_real_total_without_sync(self):
         layout = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=torch.tensor([1, 2, 4], dtype=torch.int32, device=_DEVICE),
             graph_num_tokens=16,
+        )
+        self.assertIsNone(layout.total_verify_tokens)
+        self.assertEqual(layout.graph_num_tokens, 16)
+        self.assertEqual(int(layout.qo_indptr_device[-1]), 7)
+
+    def test_device_layout_preserves_explicit_real_total(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([1, 2, 4], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=16,
+            total_verify_tokens=7,
         )
         self.assertEqual(layout.total_verify_tokens, 7)
         self.assertEqual(layout.graph_num_tokens, 16)
@@ -109,6 +129,43 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
             graph_num_tokens=16,
         )
         self.assertIsNone(layout.is_full_width)
+
+
+class TestDFlashVerifyInputRaggedLayout(CustomTestCase):
+    def test_prefill_uses_graph_capacity_when_real_total_unknown(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=8,
+        )
+        self.assertIsNone(layout.total_verify_tokens)
+
+        verify_input = DFlashVerifyInput(
+            draft_token=torch.arange(8, dtype=torch.int64, device=_DEVICE),
+            positions=torch.arange(8, dtype=torch.int64, device=_DEVICE),
+            draft_token_num=8,
+            ragged_verify_layout=layout,
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE)
+        paged_kernel_lens = torch.tensor([5, 6], dtype=torch.int32, device=_DEVICE)
+        req_to_token = torch.zeros((2, 16), dtype=torch.int32, device=_DEVICE)
+
+        with patch(
+            "sglang.srt.speculative.dflash_info.create_flashinfer_kv_indices_triton",
+            _FakeFlashinferKvIndicesKernel(),
+        ):
+            kv_indices, cum_kv_seq_len, qo_indptr, mask = (
+                verify_input.generate_attn_arg_prefill(
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=11,
+                    req_to_token=req_to_token,
+                )
+            )
+
+        self.assertEqual(kv_indices.numel(), 19)
+        self.assertEqual(cum_kv_seq_len.tolist(), [0, 6, 14])
+        self.assertEqual(qo_indptr.tolist(), [0, 1, 3])
+        self.assertIsNone(mask)
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):

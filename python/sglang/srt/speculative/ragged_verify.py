@@ -117,10 +117,6 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
         verify_lens = verify_lens.to(torch.int32)
-        if total_verify_tokens is None:
-            total_verify_tokens = int(
-                verify_lens.to("cpu", non_blocking=False).sum().item()
-            )
         indptr = BuildQoIndptr.execute(verify_lens=verify_lens)
         return cls(
             verify_lens=verify_lens,
