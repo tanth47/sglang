@@ -48,6 +48,12 @@ MANIFEST_ENV_KEYS = (
     "ROCR_VISIBLE_DEVICES",
     "PYTHONPATH",
 )
+MANIFEST_SECRET_ENV_SUBSTRINGS = (
+    "API_KEY",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+)
 
 
 def stable_json(data: Any) -> str:
@@ -102,6 +108,8 @@ def git_metadata(root: str | Path | None = None) -> dict[str, Any]:
 def selected_environment() -> dict[str, str]:
     selected = {}
     for key, value in os.environ.items():
+        if any(secret in key.upper() for secret in MANIFEST_SECRET_ENV_SUBSTRINGS):
+            continue
         if key in MANIFEST_ENV_KEYS or key.startswith(MANIFEST_ENV_PREFIXES):
             selected[key] = value
     return dict(sorted(selected.items()))

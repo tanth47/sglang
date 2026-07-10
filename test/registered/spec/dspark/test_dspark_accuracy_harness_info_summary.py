@@ -159,6 +159,7 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                 {
                     "HF_TOKEN": "should-not-be-recorded",
                     "HIP_VISIBLE_DEVICES": "0,1,2,3",
+                    "SGLANG_API_KEY": "should-not-be-recorded",
                     "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 },
             ):
@@ -191,6 +192,7 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                 manifest["environment"]["HIP_VISIBLE_DEVICES"], "0,1,2,3"
             )
             self.assertNotIn("HF_TOKEN", manifest["environment"])
+            self.assertNotIn("SGLANG_API_KEY", manifest["environment"])
 
 
 if __name__ == "__main__":
