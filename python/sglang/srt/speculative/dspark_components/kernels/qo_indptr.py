@@ -18,7 +18,10 @@ class QoIndptrResult(msgspec.Struct):
 class BuildQoIndptr:
     @classmethod
     def execute(cls, *args, **kwargs) -> QoIndptrResult:
-        if _KERNEL_IMPL == "torch":
+        verify_lens = kwargs.get("verify_lens")
+        if _KERNEL_IMPL == "torch" or (
+            isinstance(verify_lens, torch.Tensor) and verify_lens.device.type == "cpu"
+        ):
             return cls.torch(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 

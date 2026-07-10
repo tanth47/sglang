@@ -834,6 +834,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_input=draft_input,
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
+                    layout=layout,
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None

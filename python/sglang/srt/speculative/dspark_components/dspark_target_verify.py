@@ -53,6 +53,7 @@ class TargetVerifyExecutor:
         draft_input: DFlashDraftInputV2,
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
+        layout: Optional[RaggedVerifyLayout] = None,
         sampling_info,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
@@ -65,6 +66,7 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=layout,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
