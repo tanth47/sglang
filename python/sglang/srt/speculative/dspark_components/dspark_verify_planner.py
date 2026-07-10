@@ -234,14 +234,27 @@ class DSparkVerifyPlanner:
                     )
 
     def _require_prep_in_cuda_graph(self) -> None:
-        if not envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            raise ValueError(
-                f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                f"requires SGLANG_PREP_IN_CUDA_GRAPH=1 (the captured-graph prepare "
-                f"path). It is currently disabled, which would put per-step "
-                f"verify_lens_cpu host reads on the critical path. Set "
-                f"SGLANG_PREP_IN_CUDA_GRAPH=1 or run SGLANG_RAGGED_VERIFY_MODE=static."
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+            return
+        if envs.SGLANG_DSPARK_ALLOW_HOST_RAGGED_VERIFY.get():
+            logger.warning(
+                "DSpark ragged-verify mode %r is running without "
+                "SGLANG_PREP_IN_CUDA_GRAPH=1 because "
+                "SGLANG_DSPARK_ALLOW_HOST_RAGGED_VERIFY=1. This is a "
+                "functionality/debug fallback and may put per-step verify_lens_cpu "
+                "host reads on the critical path.",
+                self._ragged_verify_mode.value,
             )
+            return
+        raise ValueError(
+            f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
+            f"requires SGLANG_PREP_IN_CUDA_GRAPH=1 (the captured-graph prepare "
+            f"path). It is currently disabled, which would put per-step "
+            f"verify_lens_cpu host reads on the critical path. Set "
+            f"SGLANG_PREP_IN_CUDA_GRAPH=1, run SGLANG_RAGGED_VERIFY_MODE=static, "
+            f"or set SGLANG_DSPARK_ALLOW_HOST_RAGGED_VERIFY=1 for a "
+            f"functionality/debug fallback."
+        )
 
     @property
     def carries_confidence(self) -> bool:
