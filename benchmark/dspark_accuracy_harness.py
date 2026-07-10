@@ -143,14 +143,38 @@ def command_prepare(args) -> None:
 
 def post_generate(base_url: str, text: str, args) -> dict[str, Any]:
     body = make_generate_payload(text, args)
+    return post_json(base_url.rstrip("/") + "/generate", body, timeout_s=args.timeout_s)
+
+
+def post_json(url: str, body: dict[str, Any], *, timeout_s: int) -> Any:
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
+        url,
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=args.timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def set_internal_state(base_url: str, server_args: dict[str, Any], args) -> Any:
+    response = post_json(
+        base_url.rstrip("/") + "/set_internal_state",
+        {"server_args": server_args},
+        timeout_s=args.timeout_s,
+    )
+    accepted = bool(response)
+    if isinstance(response, list):
+        accepted = bool(response) and all(
+            item is True
+            or (isinstance(item, dict) and item.get("updated") is not False)
+            for item in response
+        )
+    elif isinstance(response, dict):
+        accepted = response.get("updated") is not False
+    if not accepted:
+        raise RuntimeError(f"set_internal_state rejected update: {response}")
+    return response
 
 
 def make_generate_payload(text: str, args) -> dict[str, Any]:
@@ -209,22 +233,40 @@ def command_collect(args) -> None:
 
     started = time.perf_counter()
     pending_prompts = [row for row in prompts if row["idx"] not in done]
-    if args.concurrency <= 1:
-        for row in pending_prompts:
-            record = collect_one(row, args)
-            append_jsonl(output_path, record)
-            print_collect_record(record, args)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.concurrency
-        ) as executor:
-            futures = [
-                executor.submit(collect_one, row, args) for row in pending_prompts
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                record = future.result()
+    force_budget_applied = False
+    try:
+        if args.dspark_force_budget_frac is not None:
+            set_internal_state(
+                args.base_url,
+                {"dspark_force_budget_frac": args.dspark_force_budget_frac},
+                args,
+            )
+            force_budget_applied = True
+        if args.dspark_clear_info_records:
+            set_internal_state(
+                args.base_url,
+                {"dspark_clear_info_records": True},
+                args,
+            )
+        if args.concurrency <= 1:
+            for row in pending_prompts:
+                record = collect_one(row, args)
                 append_jsonl(output_path, record)
                 print_collect_record(record, args)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.concurrency
+            ) as executor:
+                futures = [
+                    executor.submit(collect_one, row, args) for row in pending_prompts
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    record = future.result()
+                    append_jsonl(output_path, record)
+                    print_collect_record(record, args)
+    finally:
+        if force_budget_applied and args.dspark_reset_force_budget:
+            set_internal_state(args.base_url, {"dspark_force_budget_frac": None}, args)
 
     rows = read_jsonl(output_path)
     summary = summarize_run(rows)
@@ -233,6 +275,7 @@ def command_collect(args) -> None:
             "run_label": args.run_label,
             "output": str(output_path),
             "elapsed_s": time.perf_counter() - started,
+            "dspark_force_budget_frac": args.dspark_force_budget_frac,
         }
     )
     print(json.dumps(summary, sort_keys=True))
@@ -729,6 +772,8 @@ def command_trace_summary(args) -> None:
     request_rows = 0
     max_bs = 0
     verify_lens_sums = []
+    full_verify_token_sum = 0
+    scheduled_verify_token_sum = 0
     graph_token_counts = []
     graph_padding_tokens = []
     for i, row in enumerate(rows):
@@ -781,6 +826,10 @@ def command_trace_summary(args) -> None:
         if row.get("verify_lens_sum") is not None:
             verify_lens_sum = int(row["verify_lens_sum"])
             verify_lens_sums.append(verify_lens_sum)
+            scheduled_verify_token_sum += verify_lens_sum
+            verify_num_draft_tokens = row.get("verify_num_draft_tokens")
+            if verify_num_draft_tokens is not None:
+                full_verify_token_sum += req_count * int(verify_num_draft_tokens)
             layout_graph_num_tokens = row.get("layout_graph_num_tokens")
             if layout_graph_num_tokens is not None:
                 graph_num_tokens = int(layout_graph_num_tokens)
@@ -817,6 +866,17 @@ def command_trace_summary(args) -> None:
         gate_failures.append(f"{skipped_count} skipped records were observed")
     if args.require_padded_graph and padded_graph_count == 0:
         gate_failures.append("no padded graph records were observed")
+    saved_verify_tokens = full_verify_token_sum - scheduled_verify_token_sum
+    if args.require_trimmed_verify_tokens and saved_verify_tokens <= 0:
+        gate_failures.append("no verify tokens were trimmed")
+    if (
+        args.min_saved_verify_tokens is not None
+        and saved_verify_tokens < args.min_saved_verify_tokens
+    ):
+        gate_failures.append(
+            f"saved_verify_tokens {saved_verify_tokens} is below "
+            f"{args.min_saved_verify_tokens}"
+        )
 
     summary = {
         "trace": args.trace,
@@ -835,6 +895,14 @@ def command_trace_summary(args) -> None:
         "sampling_backends": sampling_backends,
         "simulated_accept_records": simulated_count,
         "padded_graph_records": padded_graph_count,
+        "full_verify_token_sum": full_verify_token_sum,
+        "scheduled_verify_token_sum": scheduled_verify_token_sum,
+        "saved_verify_tokens": saved_verify_tokens,
+        "scheduled_verify_token_ratio": (
+            scheduled_verify_token_sum / full_verify_token_sum
+            if full_verify_token_sum
+            else None
+        ),
         "max_bs": max_bs,
         "min_verify_lens_sum": min(verify_lens_sums) if verify_lens_sums else None,
         "max_verify_lens_sum": max(verify_lens_sums) if verify_lens_sums else None,
@@ -901,6 +969,13 @@ def add_collect(subparsers) -> None:
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-sleep-s", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dspark-force-budget-frac", type=float)
+    parser.add_argument(
+        "--dspark-reset-force-budget",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--dspark-clear-info-records", action="store_true")
     parser.set_defaults(func=command_collect)
 
 
@@ -943,6 +1018,8 @@ def add_trace_summary(subparsers) -> None:
     parser.add_argument("--require-seeded-sampling", action="store_true")
     parser.add_argument("--require-non-greedy-accept-coverage", action="store_true")
     parser.add_argument("--require-padded-graph", action="store_true")
+    parser.add_argument("--require-trimmed-verify-tokens", action="store_true")
+    parser.add_argument("--min-saved-verify-tokens", type=int)
     parser.add_argument("--require-no-skipped", action="store_true")
     parser.add_argument("--fail-on-verdict", action="store_true")
     parser.set_defaults(func=command_trace_summary)
