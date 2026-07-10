@@ -2,13 +2,15 @@ import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
     LoadInfo,
+    SPS_RECORD_SOURCE,
     ServerContext,
     SpsRow,
     build_request_count_sweep,
-    build_table_from_rounds,
+    build_table_from_summaries,
     count_aligned_steps,
     postprocess_round,
     resolve_cuda_graph_max_bs,
+    round_summary_dict,
     validate_sweep_against_server,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,9 +55,22 @@ def make_context(**overrides) -> ServerContext:
         cuda_graph_max_bs=128,
         skip_max_running_requests_threshold=float("inf"),
         skip_token_capacity_threshold=float("inf"),
+        record_source=SPS_RECORD_SOURCE,
     )
     values.update(overrides)
     return ServerContext(**values)
+
+
+def build_table_from_rounds(rounds, max_batch_tokens):
+    summaries = [
+        round_summary_dict(outcome=outcome, repeat=repeat)
+        for repeat, outcome in enumerate(rounds)
+    ]
+    return build_table_from_summaries(
+        summaries=summaries,
+        max_batch_tokens=max_batch_tokens,
+        offdiag=False,
+    )
 
 
 class TestPostprocessRound(CustomTestCase):

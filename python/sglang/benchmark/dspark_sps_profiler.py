@@ -984,6 +984,14 @@ def postprocess_round(
                 aligned_verify_tokens.add(row.num_verify_tokens)
             aligned_cts.append(ct)
 
+    if not offdiag and len(aligned_verify_tokens) != 1:
+        raise RuntimeError(
+            f"Round bs={batch_size} aligned steps ran at differing "
+            f"num_verify_tokens {sorted(aligned_verify_tokens)} across ranks/steps; "
+            "the static SPS table needs a single replayed graph tier for this "
+            "probe. Inspect the raw records."
+        )
+
     if len(aligned_cts) < ROUND_WARMUP_STEPS + min_steady_steps:
         raise RuntimeError(
             f"Round bs={batch_size} never stabilized: only {len(aligned_cts)} "

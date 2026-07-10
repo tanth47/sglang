@@ -33,9 +33,17 @@ def _make_confidence(mode, bs, device):
 @pytest.mark.parametrize("bs", [1, 2, 3, 8, 64])
 @pytest.mark.parametrize("budget", [0, 1, 3, 7, 10, 1000])
 @pytest.mark.parametrize("mode", ["random", "ties", "coarse", "some_invalid"])
-def test_triton_matches_torch_selection(bs, budget, mode):
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        DSparkScheduleConfig(gamma=GAMMA),
+        DSparkScheduleConfig(gamma=GAMMA, min_verify_len=0),
+        DSparkScheduleConfig(gamma=GAMMA, min_verify_len=2),
+        DSparkScheduleConfig(gamma=GAMMA, min_verify_len=1, max_verify_len=3),
+    ],
+)
+def test_triton_matches_torch_selection(bs, budget, mode, cfg):
     device = torch.device("cuda")
-    cfg = DSparkScheduleConfig(gamma=GAMMA)
     confidence = _make_confidence(mode, bs, device)
     ref = schedule_verify_lens_topk(confidence=confidence, budget=budget, cfg=cfg)
     got = schedule_verify_lens_topk_triton(

@@ -30,7 +30,7 @@ def _dump_records(
     enabled: bool,
     tp_rank: int = 0,
     confidence: Optional[torch.Tensor] = None,
-    verify_lens_cpu: Optional[list[int]] = None,
+    verify_lens: Optional[list[int]] = None,
     bs: int = 2,
     gamma: int = 3,
 ) -> list[dict]:
@@ -48,9 +48,14 @@ def _dump_records(
                 mode="cap-accept",
                 budget=5,
                 lag_steps=2,
-                verify_lens_cpu=verify_lens_cpu,
+                verify_lens=(
+                    None
+                    if verify_lens is None
+                    else torch.tensor(verify_lens[:bs], dtype=torch.int32)
+                ),
                 confidence=confidence,
                 req_pool_indices=torch.tensor([4, 5][:bs]),
+                rids=[f"rid-{i}" for i in range(bs)],
                 prefix_lens=torch.tensor([100, 200][:bs]),
                 draft_tokens=torch.tensor([[11, 12, 13], [21, 22, 23]][:bs]),
                 bonus_tokens=torch.tensor([7, 8][:bs]),
@@ -77,7 +82,7 @@ class TestDsparkDecisionDumper(CustomTestCase):
     def test_enabled_dumps_global_and_per_request_decision(self):
         confidence = torch.tensor([[0.9, 0.8, 0.5], [1.0, 0.0, 0.0]])
         records = _dump_records(
-            enabled=True, confidence=confidence, verify_lens_cpu=[2, 4]
+            enabled=True, confidence=confidence, verify_lens=[2, 4]
         )
         self.assertEqual(len(records), 1)
         record = records[0]
@@ -91,6 +96,7 @@ class TestDsparkDecisionDumper(CustomTestCase):
         self.assertEqual(record["avg_verify_len"], 3.0)
 
         first, second = record["reqs"]
+        self.assertEqual(first["rid"], "rid-0")
         self.assertEqual(first["req"], 4)
         self.assertEqual(first["prefix"], 100)
         self.assertEqual(first["verify_len"], 2)
@@ -104,7 +110,7 @@ class TestDsparkDecisionDumper(CustomTestCase):
     def test_survival_is_prefix_product_of_confidence(self):
         confidence = torch.tensor([[0.9, 0.8, 0.5], [1.0, 0.5, 0.5]])
         record = _dump_records(
-            enabled=True, confidence=confidence, verify_lens_cpu=[2, 4]
+            enabled=True, confidence=confidence, verify_lens=[2, 4]
         )[0]
         for row, conf_row in enumerate(confidence.tolist()):
             survival = record["reqs"][row]["survival"]
@@ -119,14 +125,14 @@ class TestDsparkDecisionDumper(CustomTestCase):
             )
 
     def test_none_confidence_omits_confidence_but_keeps_outcome(self):
-        record = _dump_records(enabled=True, confidence=None, verify_lens_cpu=[2, 4])[0]
+        record = _dump_records(enabled=True, confidence=None, verify_lens=[2, 4])[0]
         for entry in record["reqs"]:
             self.assertNotIn("confidence", entry)
             self.assertNotIn("survival", entry)
             self.assertIn("acc_len", entry)
 
     def test_none_layout_falls_back_to_uniform_full_block(self):
-        record = _dump_records(enabled=True, confidence=None, verify_lens_cpu=None)[0]
+        record = _dump_records(enabled=True, confidence=None, verify_lens=None)[0]
         self.assertTrue(all(entry["verify_len"] == 4 for entry in record["reqs"]))
         self.assertEqual(record["num_verify_tokens"], 8)
 
