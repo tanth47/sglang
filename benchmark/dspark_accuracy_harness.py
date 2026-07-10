@@ -720,6 +720,8 @@ def command_trace_summary(args) -> None:
     folded_count = 0
     non_uniform_count = 0
     non_greedy_count = 0
+    non_greedy_accept_covered_count = 0
+    non_greedy_accept_uncovered_count = 0
     seeded_count = 0
     sampling_backends = {}
     simulated_count = 0
@@ -760,6 +762,11 @@ def command_trace_summary(args) -> None:
             non_uniform_count += 1
         if not row.get("all_greedy", True):
             non_greedy_count += 1
+            coverage = row.get("coverage") or {}
+            if coverage.get("non_greedy_accept") == "accept_sampling_reference":
+                non_greedy_accept_covered_count += 1
+            else:
+                non_greedy_accept_uncovered_count += 1
         sampling = row.get("sampling") or {}
         if sampling.get("seed_present"):
             seeded_count += 1
@@ -798,6 +805,14 @@ def command_trace_summary(args) -> None:
         gate_failures.append("no non-greedy records were observed")
     if args.require_seeded_sampling and seeded_count == 0:
         gate_failures.append("no seeded sampling records were observed")
+    if (
+        args.require_non_greedy_accept_coverage
+        and non_greedy_accept_uncovered_count
+    ):
+        gate_failures.append(
+            f"{non_greedy_accept_uncovered_count} non-greedy records did not "
+            "have accept-sampling reference coverage"
+        )
     if args.require_no_skipped and skipped_count:
         gate_failures.append(f"{skipped_count} skipped records were observed")
     if args.require_padded_graph and padded_graph_count == 0:
@@ -814,6 +829,8 @@ def command_trace_summary(args) -> None:
         "folded_accept_records": folded_count,
         "non_uniform_verify_lens_records": non_uniform_count,
         "non_greedy_records": non_greedy_count,
+        "non_greedy_accept_covered_records": non_greedy_accept_covered_count,
+        "non_greedy_accept_uncovered_records": non_greedy_accept_uncovered_count,
         "seeded_sampling_records": seeded_count,
         "sampling_backends": sampling_backends,
         "simulated_accept_records": simulated_count,
@@ -924,6 +941,7 @@ def add_trace_summary(subparsers) -> None:
     parser.add_argument("--require-folded-accept", action="store_true")
     parser.add_argument("--require-non-greedy", action="store_true")
     parser.add_argument("--require-seeded-sampling", action="store_true")
+    parser.add_argument("--require-non-greedy-accept-coverage", action="store_true")
     parser.add_argument("--require-padded-graph", action="store_true")
     parser.add_argument("--require-no-skipped", action="store_true")
     parser.add_argument("--fail-on-verdict", action="store_true")

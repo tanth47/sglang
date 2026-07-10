@@ -901,6 +901,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidates=verify_ids_2d,
             draft_tokens=draft_tokens,
             target_logits=logits_output.next_token_logits,
+            greedy_mask=draft_block.greedy_mask,
             correct_len=correct_len,
             bonus=bonus,
             cap_trim_lens=cap_trim_lens,

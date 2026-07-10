@@ -57,6 +57,7 @@ class DsparkVerifyTracer:
         candidates: torch.Tensor,
         draft_tokens: torch.Tensor,
         target_logits: torch.Tensor,
+        greedy_mask: Optional[torch.Tensor],
         correct_len: torch.Tensor,
         bonus: torch.Tensor,
         cap_trim_lens: torch.Tensor,
@@ -91,6 +92,7 @@ class DsparkVerifyTracer:
             candidates=candidates,
             draft_tokens=draft_tokens,
             target_logits=target_logits,
+            greedy_mask=greedy_mask,
             correct_len=correct_len,
             bonus=bonus,
             cap_trim_lens=cap_trim_lens,
@@ -143,6 +145,7 @@ class DsparkVerifyTracer:
         candidates: torch.Tensor,
         draft_tokens: torch.Tensor,
         target_logits: torch.Tensor,
+        greedy_mask: Optional[torch.Tensor],
         correct_len: torch.Tensor,
         bonus: torch.Tensor,
         cap_trim_lens: torch.Tensor,
@@ -155,11 +158,17 @@ class DsparkVerifyTracer:
             bs, self.verify_num_draft_tokens
         )
 
-        expected = self._expected_greedy(
+        greedy_expected = self._expected_greedy(
             candidates=candidates,
             target_predict=target_predict,
             prefix_lens=prefix_lens,
             verify_lens=verify_lens,
+        )
+        finalize_expected = self._expected_from_accept(
+            draft_tokens=draft_tokens,
+            correct_len=correct_len,
+            bonus=bonus,
+            prefix_lens=prefix_lens,
         )
 
         actual_cpu = {
@@ -170,44 +179,68 @@ class DsparkVerifyTracer:
             "new_seq_lens": _cpu_list(new_seq_lens),
             "out_tokens": _cpu_list(out_tokens),
         }
-        expected_cpu = {key: _cpu_list(value) for key, value in expected.items()}
+        greedy_expected_cpu = {
+            key: _cpu_list(value) for key, value in greedy_expected.items()
+        }
+        finalize_expected_cpu = {
+            key: _cpu_list(value) for key, value in finalize_expected.items()
+        }
+        if greedy_mask is None:
+            greedy_mask_cpu = [bool(all_greedy)] * bs
+        else:
+            greedy_mask_cpu = [bool(x) for x in _cpu_list(greedy_mask)]
+        has_non_greedy_rows = not all(greedy_mask_cpu)
+        sampling_accept_assert = (
+            envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get()
+        )
 
         failures = []
         skipped = []
-        if not all_greedy:
-            skipped.append("non-greedy sampling is not covered by this invariant")
         if simulated_accept:
             skipped.append("simulated accept length overrides verifier decisions")
-        if all_greedy and not simulated_accept:
-            _compare_vector(
+        if has_non_greedy_rows and not sampling_accept_assert:
+            skipped.append(
+                "non-greedy accept decision is not replayed by verifier trace; "
+                "enable SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT"
+            )
+        if not simulated_accept:
+            _compare_vector_masked(
                 failures,
                 "correct_len",
                 actual_cpu["correct_len"],
-                expected_cpu["correct_len"],
+                greedy_expected_cpu["correct_len"],
+                greedy_mask_cpu,
             )
-            _compare_vector(failures, "bonus", actual_cpu["bonus"], expected_cpu["bonus"])
-            _compare_vector(
+            _compare_vector_masked(
+                failures,
+                "bonus",
+                actual_cpu["bonus"],
+                greedy_expected_cpu["bonus"],
+                greedy_mask_cpu,
+            )
+            _compare_vector_masked(
                 failures,
                 "cap_trim_lens",
                 actual_cpu["cap_trim_lens"],
-                expected_cpu["cap_trim_lens"],
+                greedy_expected_cpu["cap_trim_lens"],
+                greedy_mask_cpu,
             )
             _compare_vector(
                 failures,
                 "commit_lens",
                 actual_cpu["commit_lens"],
-                expected_cpu["commit_lens"],
+                finalize_expected_cpu["commit_lens"],
             )
             _compare_vector(
                 failures,
                 "new_seq_lens",
                 actual_cpu["new_seq_lens"],
-                expected_cpu["new_seq_lens"],
+                finalize_expected_cpu["new_seq_lens"],
             )
             _compare_committed_out_tokens(
                 failures=failures,
                 actual_out=actual_cpu["out_tokens"],
-                expected_out=expected_cpu["out_tokens"],
+                expected_out=finalize_expected_cpu["out_tokens"],
                 commit_lens=actual_cpu["commit_lens"],
             )
 
@@ -231,13 +264,28 @@ class DsparkVerifyTracer:
                     "verify_len": int(verify_lens_cpu[row]),
                     "candidates": [int(x) for x in candidates_cpu[row]],
                     "target_predict": [int(x) for x in target_predict_cpu[row]],
-                    "expected_correct_len": int(expected_cpu["correct_len"][row]),
+                    "is_greedy": bool(greedy_mask_cpu[row]),
+                    "expected_correct_len": int(
+                        (
+                            greedy_expected_cpu
+                            if greedy_mask_cpu[row]
+                            else actual_cpu
+                        )["correct_len"][row]
+                    ),
                     "actual_correct_len": int(actual_cpu["correct_len"][row]),
-                    "expected_bonus": int(expected_cpu["bonus"][row]),
+                    "expected_bonus": int(
+                        (greedy_expected_cpu if greedy_mask_cpu[row] else actual_cpu)[
+                            "bonus"
+                        ][row]
+                    ),
                     "actual_bonus": int(actual_cpu["bonus"][row]),
-                    "expected_commit_len": int(expected_cpu["commit_lens"][row]),
+                    "expected_commit_len": int(
+                        finalize_expected_cpu["commit_lens"][row]
+                    ),
                     "actual_commit_len": int(actual_cpu["commit_lens"][row]),
-                    "expected_new_seq_len": int(expected_cpu["new_seq_lens"][row]),
+                    "expected_new_seq_len": int(
+                        finalize_expected_cpu["new_seq_lens"][row]
+                    ),
                     "actual_new_seq_len": int(actual_cpu["new_seq_lens"][row]),
                     "committed_out_tokens": [
                         int(x)
@@ -268,6 +316,22 @@ class DsparkVerifyTracer:
             "all_greedy": bool(all_greedy),
             "sampling": sampling_trace_info,
             "simulated_accept": bool(simulated_accept),
+            "coverage": {
+                "greedy_accept_rows": int(sum(1 for x in greedy_mask_cpu if x)),
+                "non_greedy_accept_rows": int(
+                    sum(1 for x in greedy_mask_cpu if not x)
+                ),
+                "non_greedy_accept": (
+                    "not_applicable"
+                    if not has_non_greedy_rows
+                    else (
+                        "accept_sampling_reference"
+                        if sampling_accept_assert
+                        else "not_replayed"
+                    )
+                ),
+                "finalize_commit": "replayed",
+            },
             "reqs": reqs,
             "verdict": {
                 "passed": not failures,
@@ -318,6 +382,32 @@ class DsparkVerifyTracer:
             "out_tokens": out_tokens,
         }
 
+    def _expected_from_accept(
+        self,
+        *,
+        draft_tokens: torch.Tensor,
+        correct_len: torch.Tensor,
+        bonus: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        commit_lens = correct_len.to(torch.int32) + 1
+        new_seq_lens = prefix_lens.to(device=commit_lens.device) + commit_lens.to(
+            prefix_lens.dtype
+        )
+        out_tokens = torch.empty(
+            (draft_tokens.shape[0], self.verify_num_draft_tokens),
+            dtype=torch.int64,
+            device=draft_tokens.device,
+        )
+        out_tokens[:, : self.gamma].copy_(draft_tokens)
+        out_tokens[:, self.gamma].fill_(0)
+        out_tokens.scatter_(1, correct_len.to(torch.int64)[:, None], bonus[:, None])
+        return {
+            "commit_lens": commit_lens,
+            "new_seq_lens": new_seq_lens,
+            "out_tokens": out_tokens,
+        }
+
 
 def _cpu_list(tensor: torch.Tensor) -> list:
     return tensor.detach().to("cpu").tolist()
@@ -360,6 +450,21 @@ def _compare_vector(
 ) -> None:
     if actual != expected:
         failures.append(f"{name} mismatch: actual={actual} expected={expected}")
+
+
+def _compare_vector_masked(
+    failures: list[str],
+    name: str,
+    actual: list,
+    expected: list,
+    mask: list[bool],
+) -> None:
+    for row, check in enumerate(mask):
+        if check and actual[row] != expected[row]:
+            failures.append(
+                f"{name} mismatch at row {row}: "
+                f"actual={actual[row]} expected={expected[row]}"
+            )
 
 
 def _compare_committed_out_tokens(
