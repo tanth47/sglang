@@ -931,6 +931,176 @@ def command_trace_summary(args) -> None:
         raise SystemExit(1)
 
 
+def read_json_or_jsonl(path: str | Path) -> Any:
+    path = Path(path)
+    if path.suffix == ".jsonl":
+        return read_jsonl(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def iter_dspark_info_records(obj: Any):
+    if isinstance(obj, list):
+        for item in obj:
+            yield from iter_dspark_info_records(item)
+        return
+    if not isinstance(obj, dict):
+        return
+    if "records" in obj and "verify_num_draft_tokens" in obj:
+        yield obj
+        return
+    if "dspark_info_record" in obj:
+        yield from iter_dspark_info_records(obj["dspark_info_record"])
+    for state in obj.get("internal_states") or []:
+        if isinstance(state, dict) and "dspark_info_record" in state:
+            yield from iter_dspark_info_records(state["dspark_info_record"])
+
+
+def summarize_timing(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    values = [float(r[key]) for r in records if r.get(key) is not None]
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "p50": quantile(values, 50),
+        "p90": quantile(values, 90),
+        "max": max(values),
+    }
+
+
+def command_info_summary(args) -> None:
+    dumps = list(iter_dspark_info_records(read_json_or_jsonl(args.input)))
+    records_with_cfg = [
+        (dump, record)
+        for dump in dumps
+        for record in dump.get("records", [])
+        if isinstance(record, dict)
+    ]
+    records = [record for _dump, record in records_with_cfg]
+    failures = []
+    compact_count = 0
+    non_uniform_count = 0
+    padded_graph_count = 0
+    graph_key_counts: dict[str, int] = {}
+    full_verify_token_sum = 0
+    scheduled_verify_token_sum = 0
+    graph_token_sum = 0
+    request_rows = 0
+    max_bs = 0
+    verify_len_histogram: dict[str, int] = {}
+
+    for dump, record in records_with_cfg:
+        mode = record.get("mode") or dump.get("mode")
+        if mode == "compact":
+            compact_count += 1
+        verify_width = int(dump.get("verify_num_draft_tokens") or 0)
+        reqs = record.get("reqs") or []
+        bs = int(record.get("bs") or len(reqs) or 0)
+        max_bs = max(max_bs, bs)
+        request_rows += len(reqs)
+        verify_lens = [
+            int(req["verify_len"])
+            for req in reqs
+            if isinstance(req, dict) and req.get("verify_len") is not None
+        ]
+        if verify_lens:
+            if len(set(verify_lens)) > 1:
+                non_uniform_count += 1
+            for value in verify_lens:
+                key = str(value)
+                verify_len_histogram[key] = verify_len_histogram.get(key, 0) + 1
+        num_verify_tokens = record.get("num_verify_tokens")
+        scheduled_tokens = (
+            int(num_verify_tokens)
+            if num_verify_tokens is not None and int(num_verify_tokens) >= 0
+            else sum(verify_lens)
+        )
+        graph_key = record.get("verify_tokens_graph_key")
+        graph_tokens = (
+            int(graph_key)
+            if graph_key is not None and int(graph_key) >= 0
+            else scheduled_tokens
+        )
+        graph_token_key = str(graph_tokens)
+        graph_key_counts[graph_token_key] = (
+            graph_key_counts.get(graph_token_key, 0) + 1
+        )
+        if graph_tokens > scheduled_tokens:
+            padded_graph_count += 1
+        if verify_width and bs:
+            full_verify_token_sum += bs * verify_width
+        scheduled_verify_token_sum += scheduled_tokens
+        graph_token_sum += graph_tokens
+
+    saved_verify_tokens = full_verify_token_sum - scheduled_verify_token_sum
+    graph_padding_tokens = graph_token_sum - scheduled_verify_token_sum
+
+    gate_failures = []
+    if args.require_records_min is not None and len(records) < args.require_records_min:
+        gate_failures.append(
+            f"records {len(records)} is below {args.require_records_min}"
+        )
+    if args.require_compact and compact_count == 0:
+        gate_failures.append("no compact records were observed")
+    if args.require_non_uniform_verify_lens and non_uniform_count == 0:
+        gate_failures.append("no non-uniform verify_lens records were observed")
+    if args.require_padded_graph and padded_graph_count == 0:
+        gate_failures.append("no padded graph records were observed")
+    if args.require_trimmed_verify_tokens and saved_verify_tokens <= 0:
+        gate_failures.append("no verify tokens were trimmed")
+    if (
+        args.min_saved_verify_tokens is not None
+        and saved_verify_tokens < args.min_saved_verify_tokens
+    ):
+        gate_failures.append(
+            f"saved_verify_tokens {saved_verify_tokens} is below "
+            f"{args.min_saved_verify_tokens}"
+        )
+
+    summary = {
+        "input": args.input,
+        "dumps": len(dumps),
+        "records": len(records),
+        "request_rows": request_rows,
+        "compact_records": compact_count,
+        "non_uniform_verify_lens_records": non_uniform_count,
+        "padded_graph_records": padded_graph_count,
+        "full_verify_token_sum": full_verify_token_sum,
+        "scheduled_verify_token_sum": scheduled_verify_token_sum,
+        "saved_verify_tokens": saved_verify_tokens,
+        "scheduled_verify_token_ratio": (
+            scheduled_verify_token_sum / full_verify_token_sum
+            if full_verify_token_sum
+            else None
+        ),
+        "graph_token_sum": graph_token_sum,
+        "graph_padding_tokens": graph_padding_tokens,
+        "max_bs": max_bs,
+        "verify_len_histogram": verify_len_histogram,
+        "graph_key_counts": graph_key_counts,
+        "timing_ms": {
+            "step_cpu": summarize_timing(records, "step_cpu_ms"),
+            "step_gpu": summarize_timing(records, "step_gpu_ms"),
+            "draft_gpu": summarize_timing(records, "draft_gpu_ms"),
+            "target_verify_gpu": summarize_timing(
+                records, "target_verify_gpu_ms"
+            ),
+        },
+        "verdict": {
+            "passed": not failures and not gate_failures,
+            "failures": failures,
+            "gate_failures": gate_failures,
+        },
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.summary_output:
+        with open(args.summary_output, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+    if args.fail_on_verdict and (failures or gate_failures):
+        raise SystemExit(1)
+
+
 def add_prepare(subparsers) -> None:
     parser = subparsers.add_parser("prepare")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
@@ -1025,6 +1195,20 @@ def add_trace_summary(subparsers) -> None:
     parser.set_defaults(func=command_trace_summary)
 
 
+def add_info_summary(subparsers) -> None:
+    parser = subparsers.add_parser("info-summary")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--summary-output")
+    parser.add_argument("--require-records-min", type=int)
+    parser.add_argument("--require-compact", action="store_true")
+    parser.add_argument("--require-non-uniform-verify-lens", action="store_true")
+    parser.add_argument("--require-padded-graph", action="store_true")
+    parser.add_argument("--require-trimmed-verify-tokens", action="store_true")
+    parser.add_argument("--min-saved-verify-tokens", type=int)
+    parser.add_argument("--fail-on-verdict", action="store_true")
+    parser.set_defaults(func=command_info_summary)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1033,6 +1217,7 @@ def main() -> None:
     add_compare(subparsers)
     add_run_summary(subparsers)
     add_trace_summary(subparsers)
+    add_info_summary(subparsers)
     args = parser.parse_args()
     args.func(args)
 
