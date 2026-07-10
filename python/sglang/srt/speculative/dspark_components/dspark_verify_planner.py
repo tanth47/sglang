@@ -142,6 +142,7 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
+            self._require_compact_backend_support()
             self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
@@ -232,6 +233,21 @@ class DSparkVerifyPlanner:
                         "--speculative-dspark-sps-table-path or set "
                         "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE=1."
                     )
+
+    def _require_compact_backend_support(self) -> None:
+        if self._ragged_verify_mode is not RaggedVerifyMode.COMPACT:
+            return
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        if getattr(attn_backend, "supports_ragged_verify_graph", False):
+            return
+        backend_name = type(attn_backend).__name__ if attn_backend is not None else None
+        raise ValueError(
+            "DSpark compact ragged verify requires an attention backend that "
+            "supports ragged target-verify layouts. The current backend "
+            f"{backend_name or '<missing>'} does not advertise "
+            "supports_ragged_verify_graph. Run SGLANG_RAGGED_VERIFY_MODE=static "
+            "or use a backend with ragged verify support."
+        )
 
     def _require_prep_in_cuda_graph(self) -> None:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():

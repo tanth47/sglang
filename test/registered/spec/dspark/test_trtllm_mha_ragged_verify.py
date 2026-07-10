@@ -53,6 +53,13 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
 
         self.assertTrue(DeepseekV4AttnBackend.supports_ragged_verify_graph)
 
+    def test_dsv4_hip_radix_does_not_support_ragged_verify_graph(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        self.assertFalse(DeepseekV4HipRadixBackend.supports_ragged_verify_graph)
+
 
 class TestResolveRaggedVerifyLayout(CustomTestCase):
     def test_none_without_spec_info(self):
