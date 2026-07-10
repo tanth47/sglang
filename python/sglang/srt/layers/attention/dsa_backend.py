@@ -1134,6 +1134,10 @@ class DeepseekSparseAttnBackend(
         layout,
         bs: int,
     ) -> torch.Tensor:
+        from sglang.srt.speculative.dspark_components.kernels.padded_to_bucket import (
+            PadVerifyLensWithinRows,
+        )
+
         raw_lens = layout.verify_lens.to(device=self.device, dtype=torch.int32)
         raw_bs = int(raw_lens.numel())
         if raw_bs > bs:
@@ -1142,35 +1146,13 @@ class DeepseekSparseAttnBackend(
                 f"graph tier only has {bs} slots."
             )
         verify_width = int(self.speculative_num_draft_tokens)
-        padded = torch.zeros((bs,), dtype=torch.int32, device=self.device)
-        padded[:raw_bs].copy_(raw_lens)
-        total = int(layout.graph_num_tokens)
-        current = int(raw_lens.to(torch.int64).sum().item())
-        extra = total - current
-        if extra < 0:
-            raise ValueError(
-                f"DSA ragged verify layout total {current} exceeds graph tier {total}."
-            )
-
-        # Preserve real-row lengths first. Padding tokens are unused downstream,
-        # so put them into dummy rows before borrowing spare real-row capacity.
-        lens_cpu = padded.tolist()
-        for start, stop in ((raw_bs, bs), (0, raw_bs)):
-            for i in range(start, stop):
-                if extra == 0:
-                    break
-                room = max(0, verify_width - int(lens_cpu[i]))
-                add = min(extra, room)
-                lens_cpu[i] = int(lens_cpu[i]) + add
-                extra -= add
-            if extra == 0:
-                break
-        if extra != 0:
-            raise ValueError(
-                f"DSA ragged verify layout cannot pad graph tier {total} into "
-                f"{bs} slots of width {verify_width}."
-            )
-        return torch.tensor(lens_cpu, dtype=torch.int32, device=self.device)
+        return PadVerifyLensWithinRows.execute(
+            verify_lens=raw_lens,
+            graph_num_tokens=int(layout.graph_num_tokens),
+            bs=raw_bs,
+            padded_bs=bs,
+            max_verify_len=verify_width,
+        )
 
     def _build_forward_metadata_cuda_graph(
         self,

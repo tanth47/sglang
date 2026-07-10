@@ -9,6 +9,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.speculative.dspark_components.kernels.padded_to_bucket import (
+    PadVerifyLensWithinRows,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -209,3 +212,47 @@ def test_dsa_ragged_metadata_padding_caps_each_row():
     assert padded.shape == (32,)
     assert int(padded.sum().item()) == 64
     assert int(padded.max().item()) <= 8
+
+
+def test_dsa_ragged_metadata_padding_prefers_dummy_rows():
+    backend = object.__new__(RealDeepseekSparseAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.speculative_num_draft_tokens = 8
+    layout = RaggedVerifyLayout.from_verify_lens(
+        verify_lens_cpu=[8, 1],
+        device=torch.device("cpu"),
+        grid=[24],
+        graph_num_tokens_floor=24,
+        num_draft_tokens=8,
+    )
+
+    padded = backend._ragged_verify_lens_for_cuda_graph(layout=layout, bs=3)
+
+    assert padded.tolist() == [8, 8, 8]
+
+
+def test_pad_verify_lens_within_rows_fills_real_rows_when_no_dummy_rows():
+    padded = PadVerifyLensWithinRows.execute(
+        verify_lens=torch.tensor([8, 1], dtype=torch.int32),
+        graph_num_tokens=16,
+        bs=2,
+        padded_bs=2,
+        max_verify_len=8,
+    )
+
+    assert padded.tolist() == [8, 8]
+
+
+def test_pad_verify_lens_within_rows_rejects_over_capacity():
+    try:
+        PadVerifyLensWithinRows.execute(
+            verify_lens=torch.tensor([8, 8], dtype=torch.int32),
+            graph_num_tokens=25,
+            bs=2,
+            padded_bs=3,
+            max_verify_len=8,
+        )
+    except ValueError as exc:
+        assert "cannot fit" in str(exc)
+    else:
+        raise AssertionError("expected over-capacity graph tier to be rejected")
