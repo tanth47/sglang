@@ -314,7 +314,7 @@ class TestDFlashVerifyTargetProbs(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.speculative.dspark_components.kernels.accept_sampling."
-                "envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get",
+                "envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get",
                 return_value=False,
             ),
             patch(

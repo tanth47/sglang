@@ -23,6 +23,13 @@ from sglang.srt.utils import is_hip
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_ACCEPT_SAMPLING.get()
 
 
+def _sampling_trace_assert_enabled() -> bool:
+    # The reference sampler is intentionally slow and synchronizing. Keep it
+    # separate from verify trace assertions, which are expected to be usable
+    # during serving-scale verifier trace collection.
+    return envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get()
+
+
 def _hash_uniform(
     *,
     seeds: torch.Tensor,
@@ -422,7 +429,7 @@ def _accept_sampling_core(
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
     debug_tensors = None
-    if envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get():
+    if _sampling_trace_assert_enabled():
         debug_tensors = (
             target_probs,
             uniform_samples,
@@ -470,7 +477,7 @@ def accept_sampling_torch(
         gamma=gamma,
         cutoff_verify_lens=cutoff_verify_lens,
     )
-    if envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get():
+    if _sampling_trace_assert_enabled():
         _assert_accept_sampling_reference(
             candidates=candidates,
             target_probs=target_probs,
