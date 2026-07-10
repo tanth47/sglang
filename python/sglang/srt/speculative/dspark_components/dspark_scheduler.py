@@ -229,17 +229,20 @@ class HostConfidenceBudgetPlanner:
             cfg=self.cfg,
         )
         self.last_decision = decision
-        if self._online_profiler is not None:
-            lower_bound = max(int(self.cfg.min_verify_len), 1)
-            self._observe_online_step(
-                batch_tokens=int(survival.shape[0]) * lower_bound + decision.budget
-            )
         return decision.budget
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
         decision = self.last_decision
         self.last_decision = None
         return decision
+
+    def observe_budget_step(self, *, num_requests: int, budget: Optional[int]) -> None:
+        if self._online_profiler is None or budget is None:
+            return
+        lower_bound = max(int(self.cfg.min_verify_len), 1)
+        self._observe_online_step(
+            batch_tokens=int(num_requests) * lower_bound + int(budget)
+        )
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None

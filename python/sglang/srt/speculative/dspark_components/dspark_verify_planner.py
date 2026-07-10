@@ -464,17 +464,22 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        self._observe_online_budget(
+            req_pool_indices=req_pool_indices,
+            budget=aligned_budget,
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -593,6 +598,19 @@ class DSparkVerifyPlanner:
             bs=int(req_pool_indices.shape[0]),
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+
+    def _observe_online_budget(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        budget: Optional[int],
+    ) -> None:
+        if self._budget_planner is None:
+            return
+        self._budget_planner.observe_budget_step(
+            num_requests=int(req_pool_indices.shape[0]),
+            budget=budget,
         )
 
     def _schedule_verify_lens(

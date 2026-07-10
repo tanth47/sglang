@@ -242,6 +242,26 @@ def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     )
 
 
+class _RecordingOnlineProfiler:
+    def __init__(self, table=None):
+        self.observed = []
+        self.note_non_decode_calls = 0
+        self.table = table
+
+    def observe_step(self, *, batch_tokens: int):
+        self.observed.append(batch_tokens)
+        return self.table
+
+    def note_non_decode_step(self):
+        self.note_non_decode_calls += 1
+
+    def num_measured_bins(self):
+        return 1
+
+    def num_bins(self):
+        return 1
+
+
 class TestBudgetDecisionLifecycle(CustomTestCase):
     def test_take_last_decision_is_consume_once(self):
         planner = _make_budget_planner()
@@ -257,6 +277,55 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestOnlineSpsObservation(CustomTestCase):
+    def _planner_with_profiler(self, profiler, *, min_verify_len=1):
+        return HostConfidenceBudgetPlanner(
+            sps_table=_flat_table(),
+            cfg=DSparkScheduleConfig(gamma=4, min_verify_len=min_verify_len),
+            model_runner=None,
+            relay_lag_steps=999,
+            online_profiler=profiler,
+        )
+
+    def test_compute_budget_does_not_observe_until_effective_budget_is_known(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler)
+        confidence = torch.full((2, 4), 0.9, dtype=torch.float32)
+        generation = torch.ones(2, dtype=torch.int64)
+        current_generation = torch.ones(2, dtype=torch.int64)
+        req_pool_indices_cpu = torch.tensor([0, 1], dtype=torch.int64)
+
+        budget = planner.compute_budget(
+            confidence=confidence,
+            generation=generation,
+            current_generation=current_generation,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
+        self.assertEqual(profiler.observed, [])
+
+        planner.observe_budget_step(num_requests=2, budget=budget + 3)
+        self.assertEqual(profiler.observed, [2 + budget + 3])
+
+    def test_observe_budget_step_uses_min_verify_len_floor(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler, min_verify_len=2)
+        planner.observe_budget_step(num_requests=3, budget=5)
+        self.assertEqual(profiler.observed, [11])
+
+    def test_observe_budget_step_swaps_rebuilt_online_table(self):
+        new_table = _cliff_table()
+        profiler = _RecordingOnlineProfiler(table=new_table)
+        planner = self._planner_with_profiler(profiler)
+        planner.observe_budget_step(num_requests=2, budget=4)
+        self.assertIs(planner.sps_table, new_table)
+
+    def test_note_non_decode_step_reaches_online_profiler(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler)
+        planner.note_non_decode_step()
+        self.assertEqual(profiler.note_non_decode_calls, 1)
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
