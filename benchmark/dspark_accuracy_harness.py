@@ -29,7 +29,9 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +41,13 @@ from typing import Any
 
 DEFAULT_DATASET = "mgoin/GLM-5.2-FP8-magpie-ultrachat"
 DEFAULT_MODEL = "zai-org/GLM-5.2-FP8"
+MANIFEST_ENV_PREFIXES = ("SGLANG_",)
+MANIFEST_ENV_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "PYTHONPATH",
+)
 
 
 def stable_json(data: Any) -> str:
@@ -51,6 +60,92 @@ def sha256_text(text: str) -> str:
 
 def sha256_json(data: Any) -> str:
     return sha256_text(stable_json(data))
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def git_metadata(root: str | Path | None = None) -> dict[str, Any]:
+    root = Path(root) if root is not None else repo_root()
+
+    def run_git(*args: str) -> str | None:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        except Exception:
+            return None
+
+    status = run_git("status", "--porcelain")
+    return {
+        "repo": str(root),
+        "commit": run_git("rev-parse", "HEAD"),
+        "branch": run_git("branch", "--show-current"),
+        "dirty": bool(status),
+        "status_porcelain": status.splitlines() if status else [],
+    }
+
+
+def selected_environment() -> dict[str, str]:
+    selected = {}
+    for key, value in os.environ.items():
+        if key in MANIFEST_ENV_KEYS or key.startswith(MANIFEST_ENV_PREFIXES):
+            selected[key] = value
+    return dict(sorted(selected.items()))
+
+
+def artifact_entry(path: str | Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"path": None, "exists": False}
+    path = Path(path)
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def jsonable_args(args) -> dict[str, Any]:
+    result = {}
+    for key, value in vars(args).items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            result[key] = value
+        else:
+            result[key] = repr(value)
+    return result
+
+
+def build_collect_manifest(args, summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "sglang-dspark-accuracy-harness-manifest-v1",
+        "created_unix_s": time.time(),
+        "command": "collect",
+        "args": jsonable_args(args),
+        "git": git_metadata(),
+        "environment": selected_environment(),
+        "artifacts": {
+            "prompts": artifact_entry(args.prompts),
+            "collect_output": artifact_entry(args.output),
+            "server_info": artifact_entry(args.server_info_output),
+        },
+        "summary": summary,
+    }
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -293,8 +388,11 @@ def command_collect(args) -> None:
             "elapsed_s": time.perf_counter() - started,
             "dspark_force_budget_frac": args.dspark_force_budget_frac,
             "server_info_output": args.server_info_output,
+            "manifest_output": args.manifest_output,
         }
     )
+    if args.manifest_output:
+        write_json(args.manifest_output, build_collect_manifest(args, summary))
     print(json.dumps(summary, sort_keys=True))
 
 
@@ -1164,6 +1262,7 @@ def add_collect(subparsers) -> None:
     )
     parser.add_argument("--dspark-clear-info-records", action="store_true")
     parser.add_argument("--server-info-output")
+    parser.add_argument("--manifest-output")
     parser.set_defaults(func=command_collect)
 
 

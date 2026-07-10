@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -133,6 +134,63 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                 require_non_uniform_verify_lens=True,
                 fail_on_verdict=True,
             )
+
+    def test_collect_manifest_hashes_artifacts_and_filters_environment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            prompts = tmpdir / "prompts.jsonl"
+            collect_output = tmpdir / "collect.jsonl"
+            server_info = tmpdir / "server_info.json"
+            prompts.write_text('{"idx": 0, "text": "hello"}\n', encoding="utf-8")
+            collect_output.write_text('{"idx": 0, "ok": true}\n', encoding="utf-8")
+            server_info.write_text('{"internal_states": []}\n', encoding="utf-8")
+            args = Namespace(
+                base_url="http://127.0.0.1:30000",
+                prompts=str(prompts),
+                output=str(collect_output),
+                server_info_output=str(server_info),
+                manifest_output=str(tmpdir / "manifest.json"),
+                run_label="dspark-smoke",
+                dspark_force_budget_frac=0.35,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "HF_TOKEN": "should-not-be-recorded",
+                    "HIP_VISIBLE_DEVICES": "0,1,2,3",
+                    "SGLANG_RAGGED_VERIFY_MODE": "compact",
+                },
+            ):
+                manifest = self.harness.build_collect_manifest(
+                    args, {"ok_requests": 1}
+                )
+
+            self.assertEqual(
+                manifest["schema"],
+                "sglang-dspark-accuracy-harness-manifest-v1",
+            )
+            self.assertEqual(manifest["command"], "collect")
+            self.assertEqual(manifest["args"]["run_label"], "dspark-smoke")
+            self.assertEqual(
+                manifest["artifacts"]["prompts"]["sha256"],
+                self.harness.sha256_file(prompts),
+            )
+            self.assertEqual(
+                manifest["artifacts"]["collect_output"]["sha256"],
+                self.harness.sha256_file(collect_output),
+            )
+            self.assertEqual(
+                manifest["artifacts"]["server_info"]["sha256"],
+                self.harness.sha256_file(server_info),
+            )
+            self.assertEqual(
+                manifest["environment"]["SGLANG_RAGGED_VERIFY_MODE"], "compact"
+            )
+            self.assertEqual(
+                manifest["environment"]["HIP_VISIBLE_DEVICES"], "0,1,2,3"
+            )
+            self.assertNotIn("HF_TOKEN", manifest["environment"])
 
 
 if __name__ == "__main__":
