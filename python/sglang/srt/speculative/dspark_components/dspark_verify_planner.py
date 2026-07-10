@@ -295,7 +295,9 @@ class DSparkVerifyPlanner:
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
-            self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
+            self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and layout is not None
+            and layout.is_full_width is not True
         )
 
     def compute_confidence_tensor(
