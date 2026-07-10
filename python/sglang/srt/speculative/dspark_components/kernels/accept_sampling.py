@@ -159,6 +159,66 @@ def _reference_chain_accept(
     return expected_correct, expected_bonus, expected_cap_trim
 
 
+def _sample_cdf_token_batched(probs: torch.Tensor, coins: torch.Tensor) -> torch.Tensor:
+    cdf = torch.cumsum(probs.float(), dim=-1)
+    total = cdf[:, -1].clamp_min(torch.finfo(cdf.dtype).tiny)
+    target = coins.to(cdf.dtype) * total
+    tokens = torch.sum(cdf <= target[:, None], dim=-1)
+    return torch.clamp(tokens, max=probs.shape[-1] - 1).to(torch.int64)
+
+
+def _vectorized_chain_accept(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_final: torch.Tensor,
+    gamma: int,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs = candidates.shape[0]
+    device = candidates.device
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    cur_prob_row = torch.zeros((bs,), dtype=torch.long, device=device)
+    raw_correct = torch.zeros((bs,), dtype=torch.long, device=device)
+    active = torch.ones((bs,), dtype=torch.bool, device=device)
+
+    for step in range(1, gamma + 1):
+        draft_token = candidates[:, step].to(torch.long)
+        p = target_probs[row_ids, cur_prob_row, draft_token]
+        q = draft_probs[row_ids, cur_prob_row, draft_token]
+        accepted = active & (uniform_samples[:, step - 1] * q < p)
+        raw_correct += accepted.to(raw_correct.dtype)
+        cur_prob_row = torch.where(
+            accepted,
+            torch.full_like(cur_prob_row, step),
+            cur_prob_row,
+        )
+        active &= accepted
+
+    target_final = target_probs[row_ids, cur_prob_row]
+    draft_final = draft_probs[row_ids, torch.clamp(cur_prob_row, max=gamma - 1)]
+    rejection_final = torch.clamp_min(target_final - draft_final, 0.0)
+    final_probs = torch.where(active[:, None], target_final, rejection_final)
+    final_token = _sample_cdf_token_batched(
+        final_probs, uniform_samples_final[row_ids, cur_prob_row]
+    )
+
+    capped_correct = raw_correct
+    if cutoff_verify_lens is not None:
+        cap_limit = torch.clamp_min(cutoff_verify_lens.to(torch.long) - 1, 0)
+        capped_correct = torch.minimum(raw_correct, cap_limit)
+        cap_trim_lens = (raw_correct - capped_correct).to(torch.int32)
+    else:
+        cap_trim_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+    candidate_bonus_pos = torch.clamp(capped_correct + 1, max=gamma)
+    accepted_bonus = candidates[row_ids, candidate_bonus_pos].to(torch.int64)
+    bonus = torch.where(capped_correct < raw_correct, accepted_bonus, final_token)
+    return capped_correct.to(torch.int32), bonus, cap_trim_lens
+
+
 def _assert_accept_sampling_reference(
     *,
     candidates: torch.Tensor,
@@ -401,7 +461,7 @@ def accept_sampling_torch(
         verify_num_draft_tokens=verify_num_draft_tokens,
         device=device,
     )
-    return _reference_chain_accept(
+    correct_len, bonus, cap_trim_lens = _vectorized_chain_accept(
         candidates=candidates,
         target_probs=target_probs,
         draft_probs=draft_probs,
@@ -410,6 +470,20 @@ def accept_sampling_torch(
         gamma=gamma,
         cutoff_verify_lens=cutoff_verify_lens,
     )
+    if envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get():
+        _assert_accept_sampling_reference(
+            candidates=candidates,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=uniform_samples,
+            uniform_samples_final=uniform_samples_final,
+            gamma=gamma,
+            cutoff_verify_lens=cutoff_verify_lens,
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+        )
+    return correct_len, bonus, cap_trim_lens
 
 
 def accept_sampling(
