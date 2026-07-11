@@ -1,10 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_req_to_token_extra_context_len,
@@ -19,6 +22,8 @@ from sglang.srt.speculative.dspark_components.dspark_draft_proposer import (
 from sglang.srt.speculative.dspark_components.dspark_target_verify import (
     TargetVerifyExecutor,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     create_dummy_verify_input,
@@ -82,6 +87,12 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         self.assertEqual(get_alloc_reserve_per_decode(args), 16)
         self.assertEqual(get_req_to_token_extra_context_len(args), 12)
 
+    def test_dspark_forces_future_map_seq_lens_cpu(self):
+        args = _spec_args(draft_tokens=8)
+        backend = SimpleNamespace(needs_cpu_seq_lens=False)
+
+        self.assertTrue(decide_needs_cpu_seq_lens(args, [backend]))
+
     def test_prepare_for_decode_keeps_committed_and_reserved_lengths_separate(self):
         args = _spec_args(draft_tokens=4)
         set_global_server_args_for_scheduler(args)
@@ -109,6 +120,279 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         with envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.override(False):
             with self.assertRaisesRegex(AssertionError, "over-allocation"):
                 draft_input.prepare_for_decode(batch)
+
+    def test_dspark_sts_collection_rejects_compact_mode(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker._verify_planner = SimpleNamespace(is_compact_mode=True)
+
+        with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override("/tmp/dspark-sts"):
+            with self.assertRaisesRegex(RuntimeError, "cap-accept or static"):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([0], dtype=torch.int32),
+                )
+
+    def test_dspark_scheduled_verify_tokens_use_layout_total_before_graph_key(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[3, 3],
+            device=torch.device("cpu"),
+            grid=[16],
+            num_draft_tokens=8,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=True,
+            ),
+            6,
+        )
+
+    def test_dspark_scheduled_verify_tokens_fall_back_to_local_tier(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([3, 3], dtype=torch.int32),
+            graph_num_tokens=16,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=True,
+            ),
+            6,
+        )
+
+    def test_dspark_scheduled_verify_tokens_use_fallback_without_compact(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[3, 3],
+            device=torch.device("cpu"),
+            grid=[16],
+            num_draft_tokens=8,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=False,
+            ),
+            16,
+        )
+
+    def test_dspark_dsa_multi_request_compact_verify_falls_back(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        self.assertFalse(
+            worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_dsa_single_request_keeps_compact_verify(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 1)
+
+        self.assertTrue(
+            worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        )
+
+    def test_dspark_sts_collection_writes_static_shard(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.gamma = 3
+        worker.verify_num_draft_tokens = 4
+        worker.tp_rank = 0
+        worker._sts_recorder = None
+        worker._verify_planner = SimpleNamespace(
+            is_compact_mode=False,
+            carries_confidence=True,
+            last_confidence_raw=torch.tensor(
+                [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=torch.float32
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sts")
+            with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(
+                stem
+            ), envs.SGLANG_DSPARK_STS_FLUSH_EVERY.override(1):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([2, 0], dtype=torch.int32),
+                )
+                worker.flush_sts_records()
+
+            shards = list(Path(tmp).glob("sts.tp0-pid*.0.pt"))
+            self.assertEqual(len(shards), 1)
+            shard = torch.load(shards[0])
+
+        self.assertTrue(
+            torch.equal(
+                shard["logits"], worker._verify_planner.last_confidence_raw
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                shard["prefix_mask"],
+                torch.tensor(
+                    [[1, 1, 0], [0, 0, 0]],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_dspark_sts_collection_prefers_explicit_confidence_raw(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.gamma = 3
+        worker.verify_num_draft_tokens = 4
+        worker.tp_rank = 0
+        worker._sts_recorder = None
+        worker._verify_planner = SimpleNamespace(
+            is_compact_mode=False,
+            carries_confidence=True,
+            last_confidence_raw=torch.full((1, 3), -99.0, dtype=torch.float32),
+        )
+        confidence_raw = torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sts")
+            with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(
+                stem
+            ), envs.SGLANG_DSPARK_STS_FLUSH_EVERY.override(1):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([1], dtype=torch.int32),
+                    confidence_raw=confidence_raw,
+                )
+                worker.flush_sts_records()
+
+            shards = list(Path(tmp).glob("sts.tp0-pid*.0.pt"))
+            self.assertEqual(len(shards), 1)
+            shard = torch.load(shards[0])
+
+        self.assertTrue(torch.equal(shard["logits"], confidence_raw))
+
+    def test_dspark_sts_collection_skips_non_greedy_batch(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.gamma = 3
+        worker.verify_num_draft_tokens = 4
+        worker.tp_rank = 0
+        worker._sts_recorder = None
+        worker._verify_planner = SimpleNamespace(
+            is_compact_mode=False,
+            carries_confidence=True,
+            last_confidence_raw=None,
+        )
+        confidence_raw = torch.tensor(
+            [[0.1, 0.2, 0.3], [9.1, 9.2, 9.3], [0.4, 0.5, 0.6]],
+            dtype=torch.float32,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sts")
+            with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(
+                stem
+            ), envs.SGLANG_DSPARK_STS_FLUSH_EVERY.override(1):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([2, 3, 1], dtype=torch.int32),
+                    confidence_raw=confidence_raw,
+                    all_rows_greedy=False,
+                )
+
+            self.assertEqual(list(Path(tmp).glob("*.pt")), [])
+            self.assertIsNone(worker._sts_recorder)
+
+    def test_dspark_sts_collection_only_records_on_tp0(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 1
+        worker._sts_recorder = None
+        worker._verify_planner = SimpleNamespace(is_compact_mode=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sts")
+            with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(stem):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([0], dtype=torch.int32),
+                )
+
+            self.assertEqual(list(Path(tmp).glob("*.pt")), [])
+            self.assertIsNone(worker._sts_recorder)
+
+    def test_dspark_sts_flush_syncs_tp_ranks(self):
+        events = []
+        worker = object.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(tp_size=4)
+        worker._sts_recorder = SimpleNamespace(flush=lambda: events.append("flush"))
+        group = SimpleNamespace(barrier=lambda: events.append("barrier"))
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_attention_tp_group",
+            return_value=group,
+        ):
+            worker.flush_sts_records()
+
+        self.assertEqual(events, ["barrier", "flush", "barrier"])
+
+    def test_dspark_sts_flush_syncs_tp_ranks_on_error(self):
+        def fail_flush():
+            events.append("flush")
+            raise RuntimeError("sts flush failed")
+
+        events = []
+        worker = object.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(tp_size=4)
+        worker._sts_recorder = SimpleNamespace(flush=fail_flush)
+        group = SimpleNamespace(barrier=lambda: events.append("barrier"))
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_attention_tp_group",
+            return_value=group,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sts flush failed"):
+                worker.flush_sts_records()
+
+        self.assertEqual(events, ["barrier", "flush", "barrier"])
+
+    def test_dspark_sts_collection_skips_health_check_rids(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.gamma = 3
+        worker.verify_num_draft_tokens = 4
+        worker.tp_rank = 0
+        worker._sts_recorder = None
+        worker._verify_planner = SimpleNamespace(
+            is_compact_mode=False,
+            carries_confidence=True,
+            last_confidence_raw=torch.tensor([[0.1, 0.2, 0.3]], dtype=torch.float32),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sts")
+            with envs.SGLANG_DSPARK_STS_COLLECT_PATH.override(stem):
+                worker._maybe_record_sts_collect(
+                    num_correct_drafts=torch.tensor([0], dtype=torch.int32),
+                    rids=["HEALTH_CHECK_WARMUP_test"],
+                )
+
+            self.assertEqual(list(Path(tmp).glob("*.pt")), [])
+            self.assertIsNone(worker._sts_recorder)
 
     def test_dflash_draft_block_uses_prefix_seq_lens_cpu(self):
         dst = torch.empty((2,), dtype=torch.int32)

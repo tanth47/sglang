@@ -70,6 +70,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     qo_indptr_device: torch.Tensor
     verify_lens_cpu: Optional[list[int]] = None
     total_verify_tokens: Optional[int] = None
+    is_full_width: Optional[bool] = None
     qo_indptr_host: Optional[torch.Tensor] = None
     kv_indptr_host: Optional[torch.Tensor] = None
     kv_lens_host: Optional[torch.Tensor] = None
@@ -109,16 +110,13 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         graph_num_tokens: int,
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
+        is_full_width: Optional[bool] = None,
     ) -> RaggedVerifyLayout:
         from sglang.srt.speculative.dspark_components.kernels.qo_indptr import (
             BuildQoIndptr,
         )
 
         verify_lens = verify_lens.to(torch.int32)
-        if total_verify_tokens is None:
-            total_verify_tokens = int(
-                verify_lens.to("cpu", non_blocking=False).sum().item()
-            )
         indptr = BuildQoIndptr.execute(verify_lens=verify_lens)
         return cls(
             verify_lens=verify_lens,
@@ -127,6 +125,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             qo_indptr_device=indptr.qo_indptr,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            is_full_width=is_full_width,
         )
 
     @classmethod
@@ -137,6 +136,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         total_verify_tokens: int,
         graph_num_tokens: int,
         device: torch.device,
+        is_full_width: Optional[bool] = None,
     ) -> RaggedVerifyLayout:
         verify_lens = torch.tensor(verify_lens_cpu, dtype=torch.int32, device=device)
         return cls._assemble_device(
@@ -144,6 +144,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=graph_num_tokens,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            is_full_width=is_full_width,
         )
 
     @classmethod
@@ -153,11 +154,13 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
         total_verify_tokens: Optional[int] = None,
+        is_full_width: Optional[bool] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             total_verify_tokens=total_verify_tokens,
+            is_full_width=is_full_width,
         )
 
     @classmethod
@@ -168,17 +171,24 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         device: torch.device,
         grid: Sequence[int],
         graph_num_tokens_floor: int = 0,
+        num_draft_tokens: Optional[int] = None,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
         total_verify_tokens = sum(verify_lens_list)
         bucket_input = max(total_verify_tokens, graph_num_tokens_floor)
         graph_num_tokens = round_up_grid(total=bucket_input, grid=grid)
+        is_full_width = (
+            all(v == int(num_draft_tokens) for v in verify_lens_list)
+            if num_draft_tokens is not None
+            else None
+        )
 
         return cls._assemble(
             verify_lens_cpu=verify_lens_list,
             total_verify_tokens=total_verify_tokens,
             graph_num_tokens=graph_num_tokens,
             device=device,
+            is_full_width=is_full_width,
         )
 
     @classmethod
@@ -194,6 +204,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens_cpu=[num_draft_tokens] * bs,
             device=device,
             grid=grid,
+            num_draft_tokens=num_draft_tokens,
         )
 
     def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:
@@ -212,6 +223,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=self.graph_num_tokens,
+            is_full_width=(
+                self.is_full_width
+                if padded_bs == self.bs
+                and self.total_verify_tokens == self.graph_num_tokens
+                else False
+            ),
         )
 
     def padded_to_graph_within_rows(
@@ -272,6 +289,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens=padded,
             graph_num_tokens=target_total,
             total_verify_tokens=target_total,
+            is_full_width=all(v == int(num_draft_tokens) for v in lens_cpu),
         )
 
 

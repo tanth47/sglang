@@ -5,6 +5,9 @@ from typing import Optional
 import torch
 
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    build_dspark_draft_probs,
+)
 from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
 from sglang.srt.speculative.dspark_components.kernels.accept_greedy import AcceptGreedy
 from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
@@ -13,7 +16,6 @@ from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
 from sglang.srt.speculative.dspark_components.kernels.mixed_accept_select import (
     SelectMixedAccept,
 )
-from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -40,10 +42,13 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
+    draft_probs = build_dspark_draft_probs(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
+        sampling_info=sampling_info,
+        bs=bs,
+        max_top_k=draft_input.max_top_k,
+        uniform_top_k_value=draft_input.uniform_top_k_value,
     ).view(bs, gamma_rows, vocab)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(

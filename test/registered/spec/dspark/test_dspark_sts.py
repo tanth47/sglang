@@ -143,6 +143,21 @@ class TestStsDataRecorder(CustomTestCase):
         self.assertTrue(torch.equal(shard["prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.equal(shard["logits"], confidence_raw.to(torch.float32)))
 
+    def test_optional_shard_tag_disambiguates_rank_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "shard")
+            recorder = StsDataRecorder(
+                path_stem=stem, gamma=2, flush_every=10, shard_tag="tp3-pid123"
+            )
+            recorder.record(
+                confidence_raw=torch.randn(1, 2),
+                num_correct_drafts=torch.tensor([1], dtype=torch.int32),
+            )
+            recorder.flush()
+
+            self.assertTrue(Path(f"{stem}.tp3-pid123.0.pt").exists())
+            self.assertFalse(Path(f"{stem}.0.pt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

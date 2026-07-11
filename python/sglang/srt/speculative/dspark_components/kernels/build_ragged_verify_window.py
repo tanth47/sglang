@@ -6,7 +6,10 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.speculative.dspark_components.dspark_info import RaggedVerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_info import (
+    RaggedVerifyWindow,
+    VerifyWindow,
+)
 from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
     compact_row_index,
     compact_row_index_triton,
@@ -122,6 +125,158 @@ def build_ragged_verify_window(
         device=device,
     )
 
+    return RaggedVerifyWindow(
+        positions=positions,
+        verify_cache_loc=verify_cache_loc,
+        verify_ids=verify_ids,
+    )
+
+
+def build_ragged_verify_window_from_strided(
+    *,
+    layout: RaggedVerifyLayout,
+    verify_ids_2d: torch.Tensor,
+    verify_window: VerifyWindow,
+    device: str,
+) -> RaggedVerifyWindow:
+    """Compact an already-built full verify window.
+
+    DSpark decode always builds the strided/full verify window before proposal.
+    Compact verify only needs the rows selected by ``layout.verify_lens``. Reusing
+    the strided window avoids recomputing cache locations and rebuilding ids from
+    the draft block on the critical path.
+    """
+    if _KERNEL_IMPL == "torch" or torch.device(device).type == "cpu":
+        return build_ragged_verify_window_from_strided_torch(
+            layout=layout,
+            verify_ids_2d=verify_ids_2d,
+            verify_window=verify_window,
+            device=device,
+        )
+    return build_ragged_verify_window_from_strided_triton(
+        layout=layout,
+        verify_ids_2d=verify_ids_2d,
+        verify_window=verify_window,
+        device=device,
+    )
+
+
+def build_ragged_verify_window_from_strided_torch(
+    *,
+    layout: RaggedVerifyLayout,
+    verify_ids_2d: torch.Tensor,
+    verify_window: VerifyWindow,
+    device: str,
+) -> RaggedVerifyWindow:
+    verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+    padded_total = layout.graph_num_tokens
+    bs = int(verify_lens.shape[0])
+    req_id, within, valid = compact_row_index(
+        verify_lens=verify_lens,
+        padded_total=padded_total,
+        device=device,
+    )
+    safe_req = req_id.clamp(max=bs - 1)
+    positions_2d = verify_window.positions_2d.to(device=device)
+    cache_2d = verify_window.verify_cache_loc_2d.to(device=device)
+    ids_2d = verify_ids_2d.to(device=device, dtype=torch.int64)
+    positions = positions_2d[safe_req, within]
+    verify_cache_loc = cache_2d[safe_req, within]
+    verify_ids = ids_2d[safe_req, within]
+    positions = torch.where(valid, positions, torch.zeros_like(positions))
+    verify_cache_loc = torch.where(
+        valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
+    )
+    verify_ids = torch.where(valid, verify_ids, torch.zeros_like(verify_ids))
+    return RaggedVerifyWindow(
+        positions=positions,
+        verify_cache_loc=verify_cache_loc,
+        verify_ids=verify_ids,
+    )
+
+
+@triton.jit
+def _ragged_window_from_strided_gather_kernel(
+    req_ptr,
+    within_ptr,
+    pos_2d_ptr,
+    cache_2d_ptr,
+    ids_2d_ptr,
+    pos_out_ptr,
+    cache_out_ptr,
+    ids_out_ptr,
+    bs,
+    n,
+    pos_stride0: tl.constexpr,
+    pos_stride1: tl.constexpr,
+    cache_stride0: tl.constexpr,
+    cache_stride1: tl.constexpr,
+    ids_stride0: tl.constexpr,
+    ids_stride1: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    req = tl.load(req_ptr + offs, mask=mask, other=0)
+    within = tl.load(within_ptr + offs, mask=mask, other=0)
+    valid = mask & (req < bs)
+    safe_req = tl.minimum(req, bs - 1)
+
+    pos_idx = safe_req * pos_stride0 + within * pos_stride1
+    cache_idx = safe_req * cache_stride0 + within * cache_stride1
+    ids_idx = safe_req * ids_stride0 + within * ids_stride1
+    pos = tl.load(pos_2d_ptr + pos_idx, mask=valid, other=0)
+    cache = tl.load(cache_2d_ptr + cache_idx, mask=valid, other=0)
+    ids = tl.load(ids_2d_ptr + ids_idx, mask=valid, other=0)
+
+    tl.store(pos_out_ptr + offs, pos, mask=mask)
+    tl.store(cache_out_ptr + offs, cache, mask=mask)
+    tl.store(ids_out_ptr + offs, ids.to(tl.int64), mask=mask)
+
+
+def build_ragged_verify_window_from_strided_triton(
+    *,
+    layout: RaggedVerifyLayout,
+    verify_ids_2d: torch.Tensor,
+    verify_window: VerifyWindow,
+    device: str,
+) -> RaggedVerifyWindow:
+    verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+    padded_total = layout.graph_num_tokens
+    bs = int(verify_lens.shape[0])
+    req_id, within, _valid = compact_row_index_triton(
+        verify_lens=verify_lens,
+        padded_total=padded_total,
+        device=device,
+    )
+    positions_2d = verify_window.positions_2d.to(device=device)
+    cache_2d = verify_window.verify_cache_loc_2d.to(device=device)
+    ids_2d = verify_ids_2d.to(device=device, dtype=torch.int64)
+    positions = torch.empty(padded_total, dtype=positions_2d.dtype, device=device)
+    verify_cache_loc = torch.empty(padded_total, dtype=cache_2d.dtype, device=device)
+    verify_ids = torch.empty(padded_total, dtype=torch.int64, device=device)
+    BLOCK = 256
+    grid = (triton.cdiv(padded_total, BLOCK),)
+    _ragged_window_from_strided_gather_kernel[grid](
+        req_id,
+        within,
+        positions_2d,
+        cache_2d,
+        ids_2d,
+        positions,
+        verify_cache_loc,
+        verify_ids,
+        bs,
+        padded_total,
+        positions_2d.stride(0),
+        positions_2d.stride(1),
+        cache_2d.stride(0),
+        cache_2d.stride(1),
+        ids_2d.stride(0),
+        ids_2d.stride(1),
+        BLOCK=BLOCK,
+    )
     return RaggedVerifyWindow(
         positions=positions,
         verify_cache_loc=verify_cache_loc,

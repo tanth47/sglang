@@ -304,6 +304,8 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
+    supports_ragged_verify_graph: bool = True
+
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
@@ -597,6 +599,7 @@ class DeepseekSparseAttnBackend(
             and next_n
             and next_n >= 2
             and is_sm100_supported()
+            and int(seqlens_expanded.numel()) == int(batch_size) * int(next_n)
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -1109,6 +1112,51 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+    def _target_verify_ragged_layout(self, forward_mode: ForwardMode, spec_info):
+        if not forward_mode.is_target_verify() or spec_info is None:
+            return None
+        return getattr(spec_info, "ragged_verify_layout", None)
+
+    def _cuda_graph_metadata_key(
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        layout = self._target_verify_ragged_layout(forward_mode, spec_info)
+        if layout is None:
+            return bs
+        return ("target_verify_ragged", int(layout.graph_num_tokens))
+
+    def _ragged_verify_lens_for_cuda_graph(
+        self,
+        *,
+        layout,
+        bs: int,
+    ) -> torch.Tensor:
+        from sglang.srt.speculative.dspark_components.kernels.padded_to_bucket import (
+            PadVerifyLensWithinRows,
+        )
+
+        raw_lens = layout.verify_lens.to(device=self.device, dtype=torch.int32)
+        raw_bs = int(raw_lens.numel())
+        if raw_bs > bs:
+            raise ValueError(
+                f"DSA ragged verify layout has {raw_bs} rows, but the captured "
+                f"graph tier only has {bs} slots."
+            )
+        verify_width = int(self.speculative_num_draft_tokens)
+        return PadVerifyLensWithinRows.execute(
+            verify_lens=raw_lens,
+            graph_num_tokens=int(layout.graph_num_tokens),
+            bs=raw_bs,
+            padded_bs=bs,
+            max_verify_len=verify_width,
+        )
+
+    def _ragged_verify_max_q_len_for_cuda_graph(self) -> int:
+        return int(self.speculative_num_draft_tokens)
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1120,6 +1168,7 @@ class DeepseekSparseAttnBackend(
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional[ForwardMode] = None,
+        metadata_key=None,
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
@@ -1158,7 +1207,113 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        elif forward_mode.is_target_verify():
+            layout = self._target_verify_ragged_layout(forward_mode, spec_info)
+            if layout is not None:
+                extend_seq_lens = self._ragged_verify_lens_for_cuda_graph(
+                    layout=layout, bs=bs
+                )
+                total_verify_tokens = int(layout.graph_num_tokens)
+                cache_seqlens_int32 = (seq_lens[:bs] + extend_seq_lens).to(
+                    torch.int32
+                )
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                max_seqlen_q = 1
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+                    :total_verify_tokens, :
+                ]
+                max_seqlen_k = page_table_1.shape[1]
+                cu_seqlens_q = torch.arange(
+                    0,
+                    total_verify_tokens + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens_int32,
+                    total_verify_tokens,
+                    self._ragged_verify_max_q_len_for_cuda_graph(),
+                )
+                dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+                    seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+                )
+                dsa_extend_seq_lens_list = [1] * total_verify_tokens
+
+                if self.dsa_decode_impl == "flashmla_kv":
+                    flashmla_metadata = self.decode_cuda_graph_metadata[
+                        "flashmla_metadata"
+                    ].slice(slice(0, total_verify_tokens + 1))
+                    flashmla_metadata.copy_(
+                        self._compute_flashmla_metadata(
+                            cache_seqlens=dsa_cache_seqlens_int32,
+                            seq_len_q=1,
+                        )
+                    )
+                else:
+                    flashmla_metadata = None
+            else:
+                cache_seqlens_int32 = (
+                    seq_lens + self.speculative_num_draft_tokens
+                ).to(torch.int32)
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                max_seqlen_q = 1
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+                    : bs * self.speculative_num_draft_tokens, :
+                ]
+                max_seqlen_k = page_table_1.shape[1]
+
+                cu_seqlens_q = torch.arange(
+                    0,
+                    bs * self.speculative_num_draft_tokens + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+
+                seqlens_int32_cpu = [
+                    self.speculative_num_draft_tokens + kv_len
+                    for kv_len in seq_lens.tolist()
+                ]
+                seqlens_expanded = torch.cat(
+                    [
+                        torch.arange(
+                            kv_len - qo_len + 1,
+                            kv_len + 1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for qo_len, kv_len in zip(
+                            extend_seq_lens_cpu,
+                            seqlens_int32_cpu,
+                            strict=True,
+                        )
+                    ]
+                )
+                dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+                    seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+                )
+                dsa_extend_seq_lens_list = [
+                    1
+                ] * bs * self.speculative_num_draft_tokens
+
+                if self.dsa_decode_impl == "flashmla_kv":
+                    flashmla_metadata = self.decode_cuda_graph_metadata[
+                        "flashmla_metadata"
+                    ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
+
+                    flashmla_metadata.copy_(
+                        self._compute_flashmla_metadata(
+                            cache_seqlens=dsa_cache_seqlens_int32,
+                            seq_len_q=1,
+                        )
+                    )
+                else:
+                    flashmla_metadata = None
+        elif forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -1253,7 +1408,9 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        if metadata_key is None:
+            metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        self.decode_cuda_graph_metadata[metadata_key] = metadata
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1273,7 +1430,8 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        if bs not in self.decode_cuda_graph_metadata:
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1284,6 +1442,7 @@ class DeepseekSparseAttnBackend(
                 spec_info,
                 out_cache_loc,
                 actual_forward_mode,
+                metadata_key=metadata_key,
             )
             return
 
@@ -1293,7 +1452,7 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
@@ -1312,35 +1471,58 @@ class DeepseekSparseAttnBackend(
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = metadata.page_table_1.shape[1]
+            layout = self._target_verify_ragged_layout(forward_mode, spec_info)
 
-            cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
-            metadata.cache_seqlens_int32.copy_(cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-            )
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+            if layout is not None:
+                extend_seq_lens = self._ragged_verify_lens_for_cuda_graph(
+                    layout=layout, bs=bs
+                )
+                total_verify_tokens = int(layout.graph_num_tokens)
+                cache_seqlens = (seq_lens + extend_seq_lens).to(torch.int32)
+                metadata.cache_seqlens_int32.copy_(cache_seqlens)
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+                )
+                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=extend_seq_lens, dim=0
+                )
+                metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens,
+                    total_verify_tokens,
+                    self._ragged_verify_max_q_len_for_cuda_graph(),
+                )
+            else:
+                cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
+                    torch.int32
+                )
+                metadata.cache_seqlens_int32.copy_(cache_seqlens)
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+                )
+                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+                metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
-            # Fill the constant per-req qo lengths (num_draft_tokens) on-device;
-            # torch.tensor(list, device=cuda) does a pageable H2D copy that
-            # blocks the host on the whole queued stream.
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seqlens_expanded = seqlens_expand_triton(
-                extend_seq_lens,
-                cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
-            )
+                # Fill the constant per-req qo lengths (num_draft_tokens)
+                # on-device; torch.tensor(list, device=cuda) does a pageable H2D
+                # copy that blocks the host on the whole queued stream.
+                extend_seq_lens = torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens,
+                    self.speculative_num_draft_tokens * bs,
+                    self.speculative_num_draft_tokens,
+                )
             metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
             dsa_cache_seqlens = compute_dsa_seqlens(
                 seqlens_expanded, self.dsa_index_topk

@@ -12,6 +12,7 @@ import msgspec
 import torch
 
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
+from sglang.srt.managers.overlap_utils import ConfidenceRelayStats
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,11 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_graph_key: int = -1
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
+    confidence_relay_status: Optional[str] = None
+    confidence_relay_attempts: Optional[int] = None
+    confidence_relay_hits: Optional[int] = None
+    confidence_relay_misses: Optional[int] = None
+    confidence_relay_ring_pos: Optional[int] = None
     step_cpu_ms: Optional[float] = None
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
@@ -101,6 +107,7 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_graph_key: int
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
+    confidence_relay_stats: Optional[ConfidenceRelayStats]
     verify_lens: Optional[torch.Tensor]
     confidence: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor
@@ -125,6 +132,7 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_graph_key: int
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
+    confidence_relay_stats: Optional[ConfidenceRelayStats]
     step_cpu_ms: Optional[float]
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
@@ -226,6 +234,7 @@ class DsparkInfoDumper:
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
+            confidence_relay_stats=obs.confidence_relay_stats,
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
             future=future,
@@ -325,6 +334,13 @@ class DsparkInfoDumper:
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
+            if pending.confidence_relay_stats is not None:
+                stats = pending.confidence_relay_stats
+                record.confidence_relay_status = stats.last_status
+                record.confidence_relay_attempts = stats.attempts
+                record.confidence_relay_hits = stats.hits
+                record.confidence_relay_misses = stats.misses
+                record.confidence_relay_ring_pos = stats.ring_pos
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -339,6 +355,8 @@ class DsparkInfoDumper:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
             )
+            if InfoComponent.CORE in self._components:
+                record.num_verify_tokens = sum(req.verify_len for req in record.reqs)
         elif pending.future is not None:
             pending.future.wait()
 

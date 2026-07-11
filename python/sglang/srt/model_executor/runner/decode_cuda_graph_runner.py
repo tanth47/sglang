@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import logging
 from types import SimpleNamespace
@@ -136,6 +137,7 @@ def build_replay_fb_view(
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
+    spec_info=None,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 
@@ -170,7 +172,7 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-        spec_info=forward_batch.spec_info,
+        spec_info=forward_batch.spec_info if spec_info is None else spec_info,
     )
 
 
@@ -441,9 +443,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _ragged_verify_layout(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
-        if spec_info is None:
+        layout = (
+            None
+            if spec_info is None
+            else getattr(spec_info, "ragged_verify_layout", None)
+        )
+        if layout is not None:
+            return layout
+        if (
+            not self.ragged_verify_mode
+            or not self._is_full_width_target_verify_without_layout(forward_batch)
+        ):
             return None
-        return getattr(spec_info, "ragged_verify_layout", None)
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        return RaggedVerifyLayout.uniform(
+            bs=int(forward_batch.batch_size),
+            num_draft_tokens=int(self.num_tokens_per_bs),
+            device=forward_batch.input_ids.device,
+            grid=self.capture_num_tokens,
+        )
+
+    def _is_full_width_target_verify_without_layout(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        if not forward_batch.forward_mode.is_target_verify():
+            return False
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is None:
+            return False
+        return int(input_ids.numel()) == (
+            int(forward_batch.batch_size) * int(self.num_tokens_per_bs)
+        )
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
@@ -486,7 +517,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
-            return False
+            if not self._is_full_width_target_verify_without_layout(forward_batch):
+                return False
 
         if (
             self.require_mlp_tp_gather
@@ -614,29 +646,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _attn_backend_supports_layout_ragged_verify_graph(
         self, forward_batch: ForwardBatch, ragged_layout
     ) -> bool:
-        if type(self.attn_backend).__name__ != "DeepseekSparseAttnBackend":
-            return True
-
-        # The current DSA graph metadata path expands TARGET_VERIFY as a
-        # full-width bs * verify_w block. Non-uniform or token-tier padded
-        # compact layouts must run eager metadata until DSA graph capture uses
-        # the ragged layout too.
-        expected_total = int(forward_batch.batch_size) * int(self.num_tokens_per_bs)
-        if int(ragged_layout.graph_num_tokens) != expected_total:
-            return False
-        if (
-            ragged_layout.total_verify_tokens is not None
-            and int(ragged_layout.total_verify_tokens) != expected_total
-        ):
-            return False
-        if ragged_layout.verify_lens_cpu is not None:
-            return all(
-                int(verify_len) == int(self.num_tokens_per_bs)
-                for verify_len in ragged_layout.verify_lens_cpu
-            )
-        return bool(
-            torch.all(ragged_layout.verify_lens == int(self.num_tokens_per_bs)).item()
-        )
+        return True
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
@@ -1171,6 +1181,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        replay_spec_info = forward_batch.spec_info
+        if (
+            is_ragged
+            and replay_spec_info is not None
+            and getattr(replay_spec_info, "ragged_verify_layout", None) is None
+        ):
+            replay_spec_info = copy.copy(replay_spec_info)
+            replay_spec_info.ragged_verify_layout = ragged_layout
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1180,6 +1198,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
+            spec_info=replay_spec_info,
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
 

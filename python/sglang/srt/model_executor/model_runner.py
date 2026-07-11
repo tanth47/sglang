@@ -340,6 +340,106 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+@dataclass(frozen=True)
+class DFlashOrDSparkCaptureSpec:
+    draft_num_layers: int
+    target_layer_ids: List[int]
+
+
+def _validate_dflash_or_dspark_target_layer_ids(
+    *, target_layer_ids: List[int], target_num_layers: int
+) -> None:
+    if len(target_layer_ids) <= 0:
+        raise ValueError("DFLASH/DSPARK target_layer_ids must be non-empty.")
+    for idx, val in enumerate(target_layer_ids):
+        if val < 0:
+            raise ValueError(
+                "DFLASH/DSPARK target_layer_ids contains an out-of-range layer id. "
+                f"target_layer_ids[{idx}]={val}, target_num_layers={target_num_layers}."
+            )
+        if val >= target_num_layers - 1:
+            raise ValueError(
+                "DFLASH/DSPARK target_layer_ids cannot include the final target "
+                "layer for SGLang aux hidden capture. SGLang captures the hidden "
+                "state after layer k by capturing before layer k + 1; got "
+                f"target_layer_ids[{idx}]={val}, target_num_layers={target_num_layers}."
+            )
+
+
+def _resolve_dflash_or_dspark_capture_spec(
+    *,
+    draft_hf_config: Any,
+    target_num_layers: int,
+    is_dspark: bool,
+) -> DFlashOrDSparkCaptureSpec:
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+    target_num_layers = int(target_num_layers)
+    if target_num_layers <= 0:
+        raise ValueError(
+            f"target_num_layers must be positive, got {target_num_layers}."
+        )
+
+    dflash_draft_config = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    draft_num_layers = int(dflash_draft_config.require_num_layers())
+    trained_target_layers = dflash_draft_config.num_target_layers
+
+    target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
+        target_num_layers=target_num_layers,
+        draft_num_layers=draft_num_layers,
+    )
+    has_explicit_layer_ids = dflash_draft_config.target_layer_ids is not None
+
+    if is_dspark:
+        from sglang.srt.speculative.dspark_components.dspark_utils import (
+            parse_dspark_draft_config,
+        )
+
+        dspark_draft_config = parse_dspark_draft_config(
+            draft_hf_config=draft_hf_config
+        )
+        if not dspark_draft_config.require_markov():
+            raise ValueError(
+                "DSPARK requires markov_rank > 0 in the draft config, "
+                f"got markov_rank={dspark_draft_config.markov_rank}."
+            )
+        if dspark_draft_config.target_layer_ids is not None:
+            target_layer_ids = list(dspark_draft_config.target_layer_ids)
+            has_explicit_layer_ids = True
+
+    _validate_dflash_or_dspark_target_layer_ids(
+        target_layer_ids=target_layer_ids,
+        target_num_layers=target_num_layers,
+    )
+
+    if trained_target_layers is not None and int(trained_target_layers) != int(
+        target_num_layers
+    ):
+        if has_explicit_layer_ids:
+            logger.warning(
+                "Draft config num_target_layers=%s differs from runtime target "
+                "num_hidden_layers=%s; using explicit target_layer_ids=%s from "
+                "the draft checkpoint/config contract.",
+                trained_target_layers,
+                target_num_layers,
+                target_layer_ids,
+            )
+        else:
+            raise ValueError(
+                f"Draft config num_target_layers={trained_target_layers} differs "
+                f"from runtime target num_hidden_layers={target_num_layers}, but "
+                "the draft config does not provide explicit target_layer_ids. "
+                "Refusing to rescale capture layers because the feature shape can "
+                "still match while the trained target layers shift. Add explicit "
+                "target_layer_ids to the draft checkpoint/config."
+            )
+
+    return DFlashOrDSparkCaptureSpec(
+        draft_num_layers=draft_num_layers,
+        target_layer_ids=target_layer_ids,
+    )
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -476,19 +576,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.eagle_aux_hidden_state_layer_ids = None
 
         if self.spec_algorithm.is_dflash_or_dspark() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
             draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
-            dflash_draft_config = parse_dflash_draft_config(
-                draft_hf_config=draft_model_config.hf_config
-            )
-            draft_num_layers = dflash_draft_config.require_num_layers()
-            trained_target_layers = dflash_draft_config.num_target_layers
 
             target_num_layers = getattr(
                 self.model_config.hf_text_config, "num_hidden_layers", None
@@ -499,42 +592,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"in config. Got target={target_num_layers}."
                 )
             target_num_layers = int(target_num_layers)
-
-            if (
-                trained_target_layers is not None
-                and trained_target_layers != target_num_layers
-            ):
-                logger.warning(
-                    "Draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
-                    "selecting capture layers based on the runtime target model.",
-                    trained_target_layers,
-                    target_num_layers,
-                )
-
-            target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                target_num_layers=int(target_num_layers),
-                draft_num_layers=int(draft_num_layers),
+            capture_spec = _resolve_dflash_or_dspark_capture_spec(
+                draft_hf_config=draft_model_config.hf_config,
+                target_num_layers=target_num_layers,
+                is_dspark=self.spec_algorithm.is_dspark(),
             )
 
-            if self.spec_algorithm.is_dspark():
-                from sglang.srt.speculative.dspark_components.dspark_utils import (
-                    parse_dspark_draft_config,
-                )
-
-                dspark_draft_config = parse_dspark_draft_config(
-                    draft_hf_config=draft_model_config.hf_config
-                )
-                if not dspark_draft_config.require_markov():
-                    raise ValueError(
-                        "DSPARK requires markov_rank > 0 in the draft config, "
-                        f"got markov_rank={dspark_draft_config.markov_rank}."
-                    )
-                if dspark_draft_config.target_layer_ids is not None:
-                    target_layer_ids = list(dspark_draft_config.target_layer_ids)
-
             self.dflash_or_dspark_use_aux_hidden_state = True
-            self.dflash_or_dspark_draft_num_layers = int(draft_num_layers)
-            self.dflash_or_dspark_target_layer_ids = target_layer_ids
+            self.dflash_or_dspark_draft_num_layers = int(
+                capture_spec.draft_num_layers
+            )
+            self.dflash_or_dspark_target_layer_ids = list(
+                capture_spec.target_layer_ids
+            )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:

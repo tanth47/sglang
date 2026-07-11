@@ -182,6 +182,8 @@ def apply_dflash_verify_logits_adjustments(
     """
     if sampling_info is None:
         return
+    if verify_logits_adjustments_are_noop(sampling_info):
+        return
     if next_token_logits.ndim != 2:
         raise ValueError(
             "next_token_logits must be 2D, "

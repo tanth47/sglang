@@ -11,6 +11,9 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     compute_verify_token_budget,
     schedule_verify_lens_topk_from_survival,
 )
+from sglang.srt.speculative.dspark_components.kernels import (
+    qo_indptr as _qo_indptr_mod,
+)
 from sglang.srt.speculative.dspark_components.dspark_sps_table import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -23,6 +26,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+_OLD_QO_INDPTR_KERNEL_IMPL = _qo_indptr_mod._KERNEL_IMPL
+
+
+def setup_module():
+    _qo_indptr_mod._KERNEL_IMPL = "torch"
+
+
+def teardown_module():
+    _qo_indptr_mod._KERNEL_IMPL = _OLD_QO_INDPTR_KERNEL_IMPL
 
 
 def _flat_table(
@@ -64,15 +77,21 @@ def _bruteforce_budget(
     cfg: DSparkScheduleConfig,
 ) -> int:
     num_requests = history_survival_probs.shape[0]
+    lower_bound = max(cfg.min_verify_len, 1)
     max_len = cfg.resolved_max_verify_len()
-    candidates = history_survival_probs[:, cfg.min_verify_len : max_len].flatten()
+    start_col = max(lower_bound - 1, 0)
+    end_col = min(max_len - 1, history_survival_probs.shape[1])
+    forced = history_survival_probs[:, :start_col]
+    candidates = history_survival_probs[:, start_col:end_col].flatten()
     candidates = [float(x) for x in candidates.tolist() if float(x) >= cfg.survival_eps]
     candidates.sort(reverse=True)
+    forced_gain = float(forced.to(torch.float64).sum().item())
+    base_batch_tokens = num_requests * lower_bound
 
     best_extra, best_theta = 0, float("-inf")
     for extra in range(len(candidates) + 1):
-        tau_star = num_requests + sum(candidates[:extra])
-        theta = tau_star * sps_table.lookup(num_requests + extra)
+        tau_star = num_requests + forced_gain + sum(candidates[:extra])
+        theta = tau_star * sps_table.lookup(base_batch_tokens + extra)
         if theta > best_theta:
             best_theta, best_extra = theta, extra
     return best_extra
@@ -88,13 +107,16 @@ def schedule_verify_lens_topk_vanilla(
     num_requests, _gamma = survival_probs.shape
     max_len = cfg.resolved_max_verify_len()
     device = survival_probs.device
+    lower_bound = max(cfg.min_verify_len, 1)
+    start_col = max(lower_bound - 1, 0)
+    end_col = min(max_len - 1, survival_probs.shape[1])
 
     valid_rows = (survival_probs >= cfg.survival_eps).tolist()
     survival_rows = survival_probs.to(torch.float64).tolist()
 
     candidates: list[tuple[float, int, int]] = []
     for request in range(num_requests):
-        for position in range(cfg.min_verify_len, max_len):
+        for position in range(start_col, end_col):
             if valid_rows[request][position]:
                 candidates.append((survival_rows[request][position], position, request))
 
@@ -104,9 +126,8 @@ def schedule_verify_lens_topk_vanilla(
     for _survival, _position, request in candidates[: max(int(budget), 0)]:
         selected_extra[request] += 1
 
-    lower_bound = max(cfg.min_verify_len, 1)
     verify_lens = [
-        min(max(cfg.min_verify_len + extra, lower_bound), max_len)
+        min(max(lower_bound + extra, lower_bound), max_len)
         for extra in selected_extra
     ]
     return torch.tensor(verify_lens, dtype=torch.int32, device=device)
@@ -156,7 +177,7 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             actual = compute_verify_token_budget(
                 history_survival_probs=survival, sps_table=table, cfg=cfg
             )
-            self.assertEqual(actual, expected)
+            self.assertEqual(actual.budget, expected)
 
     def test_budget_excludes_forced_min_positions(self):
         survival = torch.tensor([[0.9, 0.8, 0.7, 0.6]], dtype=torch.float32)
@@ -170,7 +191,7 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             history_survival_probs=survival, sps_table=table, cfg=cfg_min2
         ).budget
         self.assertEqual(budget_no_min, 4)
-        self.assertEqual(budget_min2, 2)
+        self.assertEqual(budget_min2, 3)
 
     def test_budget_drops_candidates_below_survival_eps(self):
         survival = torch.tensor([[0.9, 1e-9, 1e-12]], dtype=torch.float32)
@@ -221,6 +242,26 @@ def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     )
 
 
+class _RecordingOnlineProfiler:
+    def __init__(self, table=None):
+        self.observed = []
+        self.note_non_decode_calls = 0
+        self.table = table
+
+    def observe_step(self, *, batch_tokens: int):
+        self.observed.append(batch_tokens)
+        return self.table
+
+    def note_non_decode_step(self):
+        self.note_non_decode_calls += 1
+
+    def num_measured_bins(self):
+        return 1
+
+    def num_bins(self):
+        return 1
+
+
 class TestBudgetDecisionLifecycle(CustomTestCase):
     def test_take_last_decision_is_consume_once(self):
         planner = _make_budget_planner()
@@ -236,6 +277,86 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestOnlineSpsObservation(CustomTestCase):
+    def _planner_with_profiler(self, profiler, *, min_verify_len=1):
+        return HostConfidenceBudgetPlanner(
+            sps_table=_flat_table(),
+            cfg=DSparkScheduleConfig(gamma=4, min_verify_len=min_verify_len),
+            model_runner=None,
+            relay_lag_steps=999,
+            online_profiler=profiler,
+        )
+
+    def test_compute_budget_does_not_observe_until_effective_budget_is_known(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler)
+        confidence = torch.full((2, 4), 0.9, dtype=torch.float32)
+        generation = torch.ones(2, dtype=torch.int64)
+        current_generation = torch.ones(2, dtype=torch.int64)
+        req_pool_indices_cpu = torch.tensor([0, 1], dtype=torch.int64)
+
+        budget = planner.compute_budget(
+            confidence=confidence,
+            generation=generation,
+            current_generation=current_generation,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
+        self.assertEqual(profiler.observed, [])
+
+        planner.observe_budget_step(num_requests=2, budget=budget + 3)
+        self.assertEqual(profiler.observed, [2 + budget + 3])
+
+    def test_observe_budget_step_uses_min_verify_len_floor(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler, min_verify_len=2)
+        planner.observe_budget_step(num_requests=3, budget=5)
+        self.assertEqual(profiler.observed, [11])
+
+    def test_observe_budget_step_swaps_rebuilt_online_table(self):
+        new_table = _cliff_table()
+        profiler = _RecordingOnlineProfiler(table=new_table)
+        planner = self._planner_with_profiler(profiler)
+        planner.observe_budget_step(num_requests=2, budget=4)
+        self.assertIs(planner.sps_table, new_table)
+
+    def test_note_non_decode_step_reaches_online_profiler(self):
+        profiler = _RecordingOnlineProfiler()
+        planner = self._planner_with_profiler(profiler)
+        planner.note_non_decode_step()
+        self.assertEqual(profiler.note_non_decode_calls, 1)
+
+    def test_seq_lens_freshness_filters_stale_confidence(self):
+        planner = self._planner_with_profiler(_RecordingOnlineProfiler())
+        lagged_confidence = torch.tensor([[0.5, 0.25, 0.25, 0.25]])
+        lagged_generation = torch.ones(1, dtype=torch.int64)
+        current_generation = torch.ones(1, dtype=torch.int64)
+
+        fresh = planner._two_steps_prior_survival(
+            lagged_confidence=lagged_confidence,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+            lagged_seq_lens=torch.tensor([10], dtype=torch.int64),
+            current_seq_lens=torch.tensor(
+                [10 + planner.max_seq_lag_tokens], dtype=torch.int64
+            ),
+        )
+        torch.testing.assert_close(
+            fresh,
+            torch.cumprod(lagged_confidence, dim=1),
+        )
+
+        stale = planner._two_steps_prior_survival(
+            lagged_confidence=lagged_confidence,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+            lagged_seq_lens=torch.tensor([10], dtype=torch.int64),
+            current_seq_lens=torch.tensor(
+                [11 + planner.max_seq_lag_tokens], dtype=torch.int64
+            ),
+        )
+        torch.testing.assert_close(stale, torch.ones_like(lagged_confidence))
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
@@ -260,9 +381,9 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         num_requests, max_len, budget = 2, 4, 2
         cfg = DSparkScheduleConfig(gamma=max_len, min_verify_len=1)
         verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
-        actual_total = num_requests + int(verify_lens.to(torch.int64).sum().item())
+        actual_total = int(verify_lens.to(torch.int64).sum().item())
         admitted = budget
-        expected_total = num_requests + num_requests * cfg.min_verify_len + admitted
+        expected_total = num_requests * max(cfg.min_verify_len, 1) + admitted
         self.assertEqual(actual_total, expected_total)
 
     @_for_each_impl
@@ -275,10 +396,13 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         budget = 3
         verify_lens = impl(survival_probs=survival, budget=budget, cfg=cfg)
         num_requests, max_len = survival.shape[0], cfg.resolved_max_verify_len()
+        lower_bound = max(cfg.min_verify_len, 1)
+        start_col = max(lower_bound - 1, 0)
+        end_col = min(max_len - 1, survival.shape[1])
         flat = [
             (float(survival[r, p]), p, r)
             for r in range(num_requests)
-            for p in range(cfg.min_verify_len, max_len)
+            for p in range(start_col, end_col)
             if float(survival[r, p]) >= cfg.survival_eps
         ]
         flat.sort(key=lambda e: (-e[0], e[1], e[2]))
@@ -287,14 +411,14 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
             admitted_positions[request].append(position)
         for request in range(num_requests):
             positions = sorted(admitted_positions[request])
-            count = int(verify_lens[request].item()) - cfg.min_verify_len
+            count = int(verify_lens[request].item()) - lower_bound
             self.assertEqual(
                 len(positions),
                 count,
                 f"request {request}: verify_len count mismatch",
             )
             expected_prefix = list(
-                range(cfg.min_verify_len, cfg.min_verify_len + count)
+                range(start_col, start_col + count)
             )
             self.assertEqual(
                 positions,
@@ -311,7 +435,7 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         )
         cfg = DSparkScheduleConfig(gamma=4)
         verify_lens = impl(survival_probs=survival, budget=2, cfg=cfg)
-        extra = verify_lens.to(torch.int64) - cfg.min_verify_len
+        extra = verify_lens.to(torch.int64) - max(cfg.min_verify_len, 1)
         self.assertEqual(int(extra[0].item()), 2)
         self.assertEqual(int(extra[1].item()), 0)
 
@@ -348,7 +472,7 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         survival = torch.tensor([[0.9, 0.8, 0.7]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=3)
         verify_lens = impl(survival_probs=survival, budget=1000, cfg=cfg)
-        self.assertEqual(int(verify_lens[0].item()), 3)
+        self.assertEqual(int(verify_lens[0].item()), 4)
 
     @_for_each_impl
     def test_tie_break_is_deterministic(self, impl):
@@ -527,7 +651,11 @@ class TestVerifyLensComposition(CustomTestCase):
         high_history = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
         sort_survival = torch.tensor([[0.95, 0.90, 0.85]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(gamma=3)
-        sps_table = _cliff_table()
+        sps_table = SpsCostTable(
+            sample_batch_tokens=[1, 2, 3, 4],
+            sample_steps_per_sec=[1.0, 1.0, 1.0, 0.8],
+            max_batch_tokens=64,
+        )
         low_budget = compute_verify_token_budget(
             history_survival_probs=low_history, sps_table=sps_table, cfg=cfg
         ).budget
@@ -556,11 +684,11 @@ class TestDSparkScheduleConfig(CustomTestCase):
 
     def test_validate_rejects_max_greater_than_gamma(self):
         with self.assertRaises(ValueError):
-            DSparkScheduleConfig(gamma=4, max_verify_len=5).validate()
+            DSparkScheduleConfig(gamma=4, max_verify_len=6).validate()
 
     def test_zero_max_resolves_to_gamma(self):
         cfg = DSparkScheduleConfig(gamma=7)
-        self.assertEqual(cfg.resolved_max_verify_len(), 7)
+        self.assertEqual(cfg.resolved_max_verify_len(), 8)
 
 
 class TestGraphTierFillBudget(CustomTestCase):

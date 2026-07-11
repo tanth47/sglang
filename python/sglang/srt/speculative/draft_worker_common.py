@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -65,6 +66,50 @@ def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
 
 
+def _draft_config_declares_quantization(
+    *, draft_server_args: ServerArgs, draft_hf_config: Optional[Any]
+) -> bool:
+    if draft_hf_config is None:
+        return False
+
+    for attr in ("quantization_config", "compression_config"):
+        if getattr(draft_hf_config, attr, None) is not None:
+            return True
+
+    draft_model_path = draft_server_args.speculative_draft_model_path
+    return bool(
+        draft_model_path
+        and os.path.exists(draft_model_path)
+        and os.path.exists(os.path.join(draft_model_path, "hf_quant_config.json"))
+    )
+
+
+def _sanitize_draft_quantization_for_config(
+    *,
+    draft_server_args: ServerArgs,
+    draft_hf_config: Optional[Any],
+    algo_label: str,
+) -> None:
+    if (
+        draft_server_args.speculative_draft_model_quantization == "quark"
+        and not _draft_config_declares_quantization(
+            draft_server_args=draft_server_args,
+            draft_hf_config=draft_hf_config,
+        )
+    ):
+        logger.warning(
+            "%s draft model does not declare a quantization config; "
+            "ignoring inherited quark quantization for the draft worker. "
+            "Use --speculative-draft-model-quantization to override this.",
+            algo_label,
+        )
+        draft_server_args.speculative_draft_model_quantization = None
+
+    draft_server_args.quantization = (
+        draft_server_args.speculative_draft_model_quantization
+    )
+
+
 def _select_draft_attention_backend(
     *, draft_hf_config: Optional[Any], draft_server_args: ServerArgs, algo_label: str
 ) -> str:
@@ -112,8 +157,16 @@ def build_draft_tp_worker(
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     draft_server_args.skip_tokenizer_init = True
-    draft_backend = _resolve_draft_attention_backend(
-        draft_server_args=draft_server_args, algo_label=algo_label
+    draft_hf_config = _load_draft_hf_config(draft_server_args=draft_server_args)
+    _sanitize_draft_quantization_for_config(
+        draft_server_args=draft_server_args,
+        draft_hf_config=draft_hf_config,
+        algo_label=algo_label,
+    )
+    draft_backend = _select_draft_attention_backend(
+        draft_hf_config=draft_hf_config,
+        draft_server_args=draft_server_args,
+        algo_label=algo_label,
     )
     draft_server_args.speculative_draft_attention_backend = None
     draft_server_args.prefill_attention_backend = None

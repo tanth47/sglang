@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Optional
 
@@ -12,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
+    ConfidenceRelayStats,
     FutureMap,
     ResolvedConfidence,
 )
@@ -61,6 +63,17 @@ from sglang.srt.utils.async_probe import maybe_assert_async
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
+
+
+def _callable_accepts_keyword(fn, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class DSparkVerifyPlanner:
@@ -126,8 +139,22 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma,
+            min_verify_len=(
+                1
+                if server_args.speculative_dspark_min_verify_len is None
+                else int(server_args.speculative_dspark_min_verify_len)
+            ),
+            max_verify_len=(
+                0
+                if server_args.speculative_dspark_max_verify_len is None
+                else int(server_args.speculative_dspark_max_verify_len)
+            ),
+            survival_eps=float(server_args.speculative_dspark_survival_eps),
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
+        self._last_confidence_relay_stats: Optional[ConfidenceRelayStats] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
@@ -142,6 +169,7 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
+            self._require_compact_backend_support(allow_missing=True)
             self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
@@ -233,6 +261,26 @@ class DSparkVerifyPlanner:
                         "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE=1."
                     )
 
+    def validate_attention_backend_support(self) -> None:
+        self._require_compact_backend_support(allow_missing=False)
+
+    def _require_compact_backend_support(self, *, allow_missing: bool = False) -> None:
+        if self._ragged_verify_mode is not RaggedVerifyMode.COMPACT:
+            return
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        if getattr(attn_backend, "supports_ragged_verify_graph", False):
+            return
+        if attn_backend is None and allow_missing:
+            return
+        backend_name = type(attn_backend).__name__ if attn_backend is not None else None
+        raise ValueError(
+            "DSpark compact ragged verify requires an attention backend that "
+            "supports ragged target-verify layouts. The current backend "
+            f"{backend_name or '<missing>'} does not advertise "
+            "supports_ragged_verify_graph. Run SGLANG_RAGGED_VERIFY_MODE=static "
+            "or use a backend with ragged verify support."
+        )
+
     def _require_prep_in_cuda_graph(self) -> None:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             return
@@ -288,6 +336,10 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.lag_steps
 
+    @property
+    def last_confidence_relay_stats(self) -> Optional[ConfidenceRelayStats]:
+        return self._last_confidence_relay_stats
+
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
         if self._budget_planner is None:
             return None
@@ -295,7 +347,9 @@ class DSparkVerifyPlanner:
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
-            self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
+            self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and layout is not None
+            and layout.is_full_width is not True
         )
 
     def compute_confidence_tensor(
@@ -305,6 +359,7 @@ class DSparkVerifyPlanner:
         anchor_tokens: torch.Tensor,
         draft_tokens: torch.Tensor,
         confidence_tap: Optional[torch.Tensor] = None,
+        raw_out: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self._confidence_head is None:
             return None
@@ -314,11 +369,24 @@ class DSparkVerifyPlanner:
                 confidence_tap is not None
             ), "dsv4 compute_confidence needs the compute_base_logits tap"
             with torch.inference_mode():
-                return compute_confidence_hook(
-                    anchor_tokens=anchor_tokens,
-                    sampled_tokens=draft_tokens,
-                    x_post_hc=confidence_tap,
+                hook_kwargs = {
+                    "anchor_tokens": anchor_tokens,
+                    "sampled_tokens": draft_tokens,
+                    "x_post_hc": confidence_tap,
+                }
+                hook_accepts_raw_out = _callable_accepts_keyword(
+                    compute_confidence_hook, "raw_out"
                 )
+                if raw_out is not None and hook_accepts_raw_out:
+                    hook_kwargs["raw_out"] = raw_out
+                confidence = compute_confidence_hook(**hook_kwargs)
+                if raw_out is not None and not hook_accepts_raw_out:
+                    confidence_raw = self.last_confidence_raw
+                    if confidence_raw is not None:
+                        raw_out[
+                            : confidence_raw.shape[0], : confidence_raw.shape[1]
+                        ].copy_(confidence_raw.to(dtype=raw_out.dtype))
+                return confidence
         assert draft_hidden is not None
         return compute_confidence(
             draft_hidden=draft_hidden,
@@ -327,6 +395,7 @@ class DSparkVerifyPlanner:
             confidence_head=self._confidence_head,
             markov_head=self.draft_model.markov_head,
             gamma=self.gamma,
+            raw_out=raw_out,
         )
 
     def prepare_verify_budget(
@@ -346,8 +415,11 @@ class DSparkVerifyPlanner:
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
+        self._last_confidence_relay_stats = future_map.confidence_relay_stats()
         draft_input.verify_token_budget = self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            current_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
@@ -402,9 +474,12 @@ class DSparkVerifyPlanner:
         resolved = ResolvedConfidence(
             confidence=confidence.to("cpu"),
             generation=generation,
+            seq_lens=prefix_lens.to("cpu"),
         )
         return self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            current_seq_lens_cpu=prefix_lens.to("cpu"),
         )
 
     def _budget_from_resolved(
@@ -412,6 +487,7 @@ class DSparkVerifyPlanner:
         *,
         resolved: Optional[ResolvedConfidence],
         req_pool_indices_cpu: torch.Tensor,
+        current_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> Optional[int]:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
@@ -424,6 +500,8 @@ class DSparkVerifyPlanner:
                 confidence=resolved.confidence,
                 generation=resolved.generation,
                 current_generation=current_generation,
+                seq_lens=resolved.seq_lens,
+                current_seq_lens=current_seq_lens_cpu,
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
         )
@@ -441,17 +519,22 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        self._observe_online_budget(
+            req_pool_indices=req_pool_indices,
+            budget=aligned_budget,
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -516,6 +599,7 @@ class DSparkVerifyPlanner:
             device=device,
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
+            num_draft_tokens=self.verify_num_draft_tokens,
         )
 
     def _budget_aligned_to_graph_tier(
@@ -569,6 +653,19 @@ class DSparkVerifyPlanner:
             bs=int(req_pool_indices.shape[0]),
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+
+    def _observe_online_budget(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        budget: Optional[int],
+    ) -> None:
+        if self._budget_planner is None:
+            return
+        self._budget_planner.observe_budget_step(
+            num_requests=int(req_pool_indices.shape[0]),
+            budget=budget,
         )
 
     def _schedule_verify_lens(

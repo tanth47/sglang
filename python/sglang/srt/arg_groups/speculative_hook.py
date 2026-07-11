@@ -161,6 +161,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DFLASH speculative decoding only supports CUDA device.")
 
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "DFLASH speculative decoding does not support "
+            "--enable-two-batch-overlap yet because TBO can bypass auxiliary "
+            "target hidden-state capture."
+        )
+
     if server_args.enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
@@ -303,6 +310,13 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "DSpark speculative decoding does not support "
+            "--enable-two-batch-overlap yet because TBO can bypass auxiliary "
+            "target hidden-state capture."
+        )
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:

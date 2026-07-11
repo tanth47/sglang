@@ -100,6 +100,9 @@ class SpsRow(msgspec.Struct, frozen=True):
     num_running_reqs: int
     num_verify_tokens: int
     step_time: float
+    verify_tokens_local: int = -1
+    verify_tokens_dp_synced: int = -1
+    verify_tokens_graph_key: int = -1
 
 
 class RecordSource(msgspec.Struct, frozen=True):
@@ -913,6 +916,13 @@ def fetch_rank_rows(
                     num_running_reqs=int(record["num_running_reqs"]),
                     num_verify_tokens=int(record["num_verify_tokens"]),
                     step_time=step_time,
+                    verify_tokens_local=int(record.get("verify_tokens_local", -1)),
+                    verify_tokens_dp_synced=int(
+                        record.get("verify_tokens_dp_synced", -1)
+                    ),
+                    verify_tokens_graph_key=int(
+                        record.get("verify_tokens_graph_key", -1)
+                    ),
                 )
             )
         rank_rows.append(rows)
@@ -983,6 +993,14 @@ def postprocess_round(
                     )
                 aligned_verify_tokens.add(row.num_verify_tokens)
             aligned_cts.append(ct)
+
+    if not offdiag and len(aligned_verify_tokens) != 1:
+        raise RuntimeError(
+            f"Round bs={batch_size} aligned steps ran at differing "
+            f"num_verify_tokens {sorted(aligned_verify_tokens)} across ranks/steps; "
+            "the static SPS table needs a single replayed graph tier for this "
+            "probe. Inspect the raw records."
+        )
 
     if len(aligned_cts) < ROUND_WARMUP_STEPS + min_steady_steps:
         raise RuntimeError(
@@ -1299,6 +1317,9 @@ def append_round_files(
                             "forward_ct": row.forward_ct,
                             "num_running_reqs": row.num_running_reqs,
                             "num_verify_tokens": row.num_verify_tokens,
+                            "verify_tokens_local": row.verify_tokens_local,
+                            "verify_tokens_dp_synced": row.verify_tokens_dp_synced,
+                            "verify_tokens_graph_key": row.verify_tokens_graph_key,
                             "step_time": row.step_time,
                         }
                     )

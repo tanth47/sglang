@@ -2017,6 +2017,8 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_new_tokens": max_new_tokens,
         },
     }
+    if request_name == "/generate":
+        json_data["rid"] = f"{HEALTH_CHECK_RID_PREFIX}_WARMUP_{uuid.uuid4().hex}"
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
@@ -2031,6 +2033,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         # Only use chat completions format for generation models, not embedding models
         json_data = {
             "model": _global_state.tokenizer_manager.served_model_name,
+            "rid": f"{HEALTH_CHECK_RID_PREFIX}_WARMUP_{uuid.uuid4().hex}",
             "messages": [
                 {
                     "role": "user",
@@ -2084,6 +2087,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             logger.info(f"Start of pd disaggregation warmup ...")
             request_name = "/generate"
             json_data = {
+                "rid": f"{HEALTH_CHECK_RID_PREFIX}_WARMUP_{uuid.uuid4().hex}",
                 "sampling_params": {
                     "temperature": 0.0,
                     "max_new_tokens": 8,

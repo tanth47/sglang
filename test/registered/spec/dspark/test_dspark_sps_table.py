@@ -169,44 +169,36 @@ class TestProfileSpsTable(CustomTestCase):
         self.assertEqual(table.max_batch_tokens, 256)
 
 
-def _make_bench_result(*, batch_size: int, output_throughput: float):
-    from sglang.benchmark.one_batch_server import BenchOneCaseResult
-
-    output_len = 1024
-    return BenchOneCaseResult(
-        run_name="test",
-        batch_size=batch_size,
-        input_len=512,
-        output_len=output_len,
-        latency=1.0,
-        input_throughput=1.0,
-        output_throughput=output_throughput,
-        overall_throughput=1.0,
-        last_ttft=0.1,
-        last_gen_throughput=output_throughput,
-        acc_length=-1.0,
-    )
+def _make_round_summary(*, batch_tokens: int, steps_per_sec: float):
+    return {
+        "batch_size": batch_tokens,
+        "batch_size_per_rank": batch_tokens,
+        "batch_tokens": batch_tokens,
+        "steps_per_sec": steps_per_sec,
+        "num_steady_steps": 32,
+        "match_fraction": 1.0,
+    }
 
 
 class TestProfilerConversion(CustomTestCase):
-    def _table_from_results(self, results):
+    def _table_from_summaries(self, summaries):
         from sglang.benchmark import dspark_sps_profiler
 
-        outcome = dspark_sps_profiler.build_sps_table(
-            results=results, max_batch_tokens=None
+        table = dspark_sps_profiler.build_table_from_summaries(
+            summaries=summaries, max_batch_tokens=None, offdiag=False
         )
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "sps.json"
-            out_path.write_text(outcome.table.to_json(), encoding="utf-8")
-            dspark_sps_profiler.run_self_check(out_path=out_path)
+            out_path.write_text(table.to_json(), encoding="utf-8")
+            dspark_sps_profiler.run_self_check(out_path=out_path, offdiag=False)
             return load_sps_table_from_path(str(out_path))
 
     def test_conversion_sets_batch_tokens_and_steps_per_sec(self):
-        table = self._table_from_results(
+        table = self._table_from_summaries(
             [
-                _make_bench_result(batch_size=2, output_throughput=1000.0),
-                _make_bench_result(batch_size=4, output_throughput=1600.0),
-                _make_bench_result(batch_size=8, output_throughput=2400.0),
+                _make_round_summary(batch_tokens=2, steps_per_sec=500.0),
+                _make_round_summary(batch_tokens=4, steps_per_sec=400.0),
+                _make_round_summary(batch_tokens=8, steps_per_sec=300.0),
             ]
         )
         self.assertEqual(table.sample_batch_tokens, [2, 4, 8])
@@ -215,36 +207,45 @@ class TestProfilerConversion(CustomTestCase):
         self.assertAlmostEqual(table.sample_steps_per_sec[2], 300.0, places=6)
 
     def test_conversion_medians_across_repeats(self):
-        table = self._table_from_results(
+        table = self._table_from_summaries(
             [
-                _make_bench_result(batch_size=4, output_throughput=1000.0),
-                _make_bench_result(batch_size=4, output_throughput=800.0),
-                _make_bench_result(batch_size=4, output_throughput=1200.0),
+                _make_round_summary(batch_tokens=4, steps_per_sec=250.0),
+                _make_round_summary(batch_tokens=4, steps_per_sec=200.0),
+                _make_round_summary(batch_tokens=4, steps_per_sec=300.0),
             ]
         )
         self.assertEqual(table.sample_batch_tokens, [4])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 250.0, places=6)
 
     def test_conversion_keeps_non_monotone_samples_without_crashing(self):
-        table = self._table_from_results(
+        table = self._table_from_summaries(
             [
-                _make_bench_result(batch_size=4, output_throughput=1000.0),
-                _make_bench_result(batch_size=8, output_throughput=8000.0),
+                _make_round_summary(batch_tokens=4, steps_per_sec=250.0),
+                _make_round_summary(batch_tokens=8, steps_per_sec=1000.0),
             ]
         )
         self.assertEqual(table.sample_batch_tokens, [4, 8])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 250.0, places=6)
         self.assertAlmostEqual(table.sample_steps_per_sec[1], 1000.0, places=6)
 
-    def test_conversion_skips_degenerate_output_throughput(self):
-        table = self._table_from_results(
-            [
-                _make_bench_result(batch_size=4, output_throughput=0.0),
-                _make_bench_result(batch_size=8, output_throughput=2400.0),
-            ]
+    def test_self_check_rejects_degenerate_steps_per_sec(self):
+        from sglang.benchmark import dspark_sps_profiler
+
+        table = dspark_sps_profiler.build_table_from_summaries(
+            summaries=[
+                _make_round_summary(batch_tokens=4, steps_per_sec=0.0),
+                _make_round_summary(batch_tokens=8, steps_per_sec=300.0),
+            ],
+            max_batch_tokens=None,
+            offdiag=False,
         )
-        self.assertEqual(table.sample_batch_tokens, [8])
-        self.assertAlmostEqual(table.sample_steps_per_sec[0], 300.0, places=6)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "sps.json"
+            out_path.write_text(table.to_json(), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "non-positive SPS"):
+                dspark_sps_profiler.run_self_check(
+                    out_path=out_path, offdiag=False
+                )
 
 
 def _build_sps_cost_table_for(*, sps_table_path):

@@ -116,7 +116,11 @@ class DFlashVerifyInput(SpecInput):
         else:
             qo_indptr = layout.qo_indptr_device
             verify_lens = layout.verify_lens
-            kv_indices_extra = layout.total_verify_tokens
+            kv_indices_extra = (
+                layout.total_verify_tokens
+                if layout.total_verify_tokens is not None
+                else layout.graph_num_tokens
+            )
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         paged_kernel_lens = paged_kernel_lens + verify_lens

@@ -29,7 +29,9 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +41,19 @@ from typing import Any
 
 DEFAULT_DATASET = "mgoin/GLM-5.2-FP8-magpie-ultrachat"
 DEFAULT_MODEL = "zai-org/GLM-5.2-FP8"
+MANIFEST_ENV_PREFIXES = ("SGLANG_",)
+MANIFEST_ENV_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "PYTHONPATH",
+)
+MANIFEST_SECRET_ENV_SUBSTRINGS = (
+    "API_KEY",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+)
 
 
 def stable_json(data: Any) -> str:
@@ -51,6 +66,94 @@ def sha256_text(text: str) -> str:
 
 def sha256_json(data: Any) -> str:
     return sha256_text(stable_json(data))
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def git_metadata(root: str | Path | None = None) -> dict[str, Any]:
+    root = Path(root) if root is not None else repo_root()
+
+    def run_git(*args: str) -> str | None:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        except Exception:
+            return None
+
+    status = run_git("status", "--porcelain")
+    return {
+        "repo": str(root),
+        "commit": run_git("rev-parse", "HEAD"),
+        "branch": run_git("branch", "--show-current"),
+        "dirty": bool(status),
+        "status_porcelain": status.splitlines() if status else [],
+    }
+
+
+def selected_environment() -> dict[str, str]:
+    selected = {}
+    for key, value in os.environ.items():
+        if any(secret in key.upper() for secret in MANIFEST_SECRET_ENV_SUBSTRINGS):
+            continue
+        if key in MANIFEST_ENV_KEYS or key.startswith(MANIFEST_ENV_PREFIXES):
+            selected[key] = value
+    return dict(sorted(selected.items()))
+
+
+def artifact_entry(path: str | Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"path": None, "exists": False}
+    path = Path(path)
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def jsonable_args(args) -> dict[str, Any]:
+    result = {}
+    for key, value in vars(args).items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            result[key] = value
+        else:
+            result[key] = repr(value)
+    return result
+
+
+def build_collect_manifest(args, summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "sglang-dspark-accuracy-harness-manifest-v1",
+        "created_unix_s": time.time(),
+        "command": "collect",
+        "args": jsonable_args(args),
+        "git": git_metadata(),
+        "environment": selected_environment(),
+        "artifacts": {
+            "prompts": artifact_entry(args.prompts),
+            "collect_output": artifact_entry(args.output),
+            "server_info": artifact_entry(args.server_info_output),
+        },
+        "summary": summary,
+    }
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -84,6 +187,47 @@ def to_messages(conversations: list[dict[str, Any]]) -> list[dict[str, str]]:
         elif role in ("gpt", "assistant"):
             break
     return messages
+
+
+def split_prompt_messages_and_gold(
+    conversations: list[dict[str, Any]],
+) -> tuple[list[dict[str, str]], str | None]:
+    messages = []
+    for turn in conversations:
+        role = turn.get("from")
+        content = turn.get("value", "")
+        if role == "human":
+            messages.append({"role": "user", "content": content})
+        elif role in ("gpt", "assistant"):
+            return messages, content
+    return messages, None
+
+
+def encode_without_special_tokens(tokenizer, text: str) -> list[int]:
+    try:
+        return tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
+def tokenize_prompt_and_gold(tokenizer, prompt_text: str, gold_text: str) -> dict[str, Any]:
+    prompt_ids = tokenizer.encode(prompt_text)
+    full_ids = tokenizer.encode(prompt_text + gold_text)
+    boundary_exact = full_ids[: len(prompt_ids)] == prompt_ids
+    if boundary_exact:
+        gold_ids = full_ids[len(prompt_ids) :]
+        tokenization_mode = "full_text_suffix"
+    else:
+        gold_ids = encode_without_special_tokens(tokenizer, gold_text)
+        tokenization_mode = "gold_text_standalone_fallback"
+    return {
+        "prompt_ids": prompt_ids,
+        "gold_ids": gold_ids,
+        "prompt_token_count_offline": len(prompt_ids),
+        "gold_token_count_offline": len(gold_ids),
+        "prompt_gold_boundary_exact": boundary_exact,
+        "gold_tokenization_mode": tokenization_mode,
+    }
 
 
 def load_ultrachat_prompts(args) -> list[dict[str, Any]]:
@@ -121,6 +265,76 @@ def load_ultrachat_prompts(args) -> list[dict[str, Any]]:
     return rows
 
 
+def load_ultrachat_gold(args) -> list[dict[str, Any]]:
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, trust_remote_code=args.trust_remote_code
+    )
+    ds = load_dataset(args.dataset, split=args.split, streaming=args.streaming)
+    rows = []
+    skipped_no_gold = 0
+    skipped_short_gold = 0
+    skipped_long_prompt = 0
+    for source_idx, row in enumerate(ds):
+        messages, gold_text = split_prompt_messages_and_gold(row["conversations"])
+        if not messages or not gold_text:
+            skipped_no_gold += 1
+            continue
+        template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if args.disable_thinking:
+            template_kwargs["enable_thinking"] = False
+        prompt_text = tokenizer.apply_chat_template(messages, **template_kwargs)
+        tokenized = tokenize_prompt_and_gold(tokenizer, prompt_text, gold_text)
+        if tokenized["gold_token_count_offline"] < args.min_gold_tokens:
+            skipped_short_gold += 1
+            continue
+        if (
+            args.max_prompt_tokens is not None
+            and tokenized["prompt_token_count_offline"] > args.max_prompt_tokens
+        ):
+            skipped_long_prompt += 1
+            continue
+
+        gold_ids = tokenized["gold_ids"]
+        if args.max_gold_tokens is not None:
+            gold_ids = gold_ids[: args.max_gold_tokens]
+        prepared = {
+            "idx": len(rows),
+            "source_idx": source_idx,
+            "id": row.get("id"),
+            "source": row.get("source"),
+            "dataset": args.dataset,
+            "prompt_mode": "chat_no_thinking"
+            if args.disable_thinking
+            else "chat_default",
+            "prompt_ids": tokenized["prompt_ids"],
+            "gold_ids": gold_ids,
+            "prompt_tokens_offline": tokenized["prompt_token_count_offline"],
+            "gold_tokens_offline": len(gold_ids),
+            "prompt_ids_sha256": sha256_json(tokenized["prompt_ids"]),
+            "gold_ids_sha256": sha256_json(gold_ids),
+            "prompt_gold_boundary_exact": tokenized["prompt_gold_boundary_exact"],
+            "gold_tokenization_mode": tokenized["gold_tokenization_mode"],
+        }
+        if args.include_text:
+            prepared["text"] = prompt_text
+            prepared["gold_text"] = gold_text
+        rows.append(prepared)
+        if len(rows) >= args.num_samples:
+            break
+
+    if len(rows) < args.num_samples:
+        raise RuntimeError(
+            f"Only prepared {len(rows)} prompt/gold rows, requested "
+            f"{args.num_samples}. skipped_no_gold={skipped_no_gold}, "
+            f"skipped_short_gold={skipped_short_gold}, "
+            f"skipped_long_prompt={skipped_long_prompt}."
+        )
+    return rows
+
+
 def command_prepare(args) -> None:
     rows = load_ultrachat_prompts(args)
     if len(rows) < args.num_samples:
@@ -141,16 +355,72 @@ def command_prepare(args) -> None:
     print(json.dumps(summary, sort_keys=True))
 
 
+def command_prepare_gold(args) -> None:
+    rows = load_ultrachat_gold(args)
+    write_jsonl(args.output, rows)
+    summary = {
+        "output": args.output,
+        "dataset": args.dataset,
+        "num_rows": len(rows),
+        "min_prompt_tokens": min(r["prompt_tokens_offline"] for r in rows),
+        "max_prompt_tokens": max(r["prompt_tokens_offline"] for r in rows),
+        "mean_prompt_tokens": statistics.fmean(
+            r["prompt_tokens_offline"] for r in rows
+        ),
+        "min_gold_tokens": min(r["gold_tokens_offline"] for r in rows),
+        "max_gold_tokens": max(r["gold_tokens_offline"] for r in rows),
+        "mean_gold_tokens": statistics.fmean(r["gold_tokens_offline"] for r in rows),
+        "boundary_exact_rows": sum(
+            1 for r in rows if r.get("prompt_gold_boundary_exact")
+        ),
+    }
+    print(json.dumps(summary, sort_keys=True))
+
+
 def post_generate(base_url: str, text: str, args) -> dict[str, Any]:
     body = make_generate_payload(text, args)
+    return post_json(base_url.rstrip("/") + "/generate", body, timeout_s=args.timeout_s)
+
+
+def post_json(url: str, body: dict[str, Any], *, timeout_s: int) -> Any:
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
+        url,
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=args.timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def get_json(url: str, *, timeout_s: int) -> Any:
+    with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def write_json(path: str | Path, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def set_internal_state(base_url: str, server_args: dict[str, Any], args) -> Any:
+    response = post_json(
+        base_url.rstrip("/") + "/set_internal_state",
+        {"server_args": server_args},
+        timeout_s=args.timeout_s,
+    )
+    accepted = bool(response)
+    if isinstance(response, list):
+        accepted = bool(response) and all(
+            item is True
+            or (isinstance(item, dict) and item.get("updated") is not False)
+            for item in response
+        )
+    elif isinstance(response, dict):
+        accepted = response.get("updated") is not False
+    if not accepted:
+        raise RuntimeError(f"set_internal_state rejected update: {response}")
+    return response
 
 
 def make_generate_payload(text: str, args) -> dict[str, Any]:
@@ -209,22 +479,45 @@ def command_collect(args) -> None:
 
     started = time.perf_counter()
     pending_prompts = [row for row in prompts if row["idx"] not in done]
-    if args.concurrency <= 1:
-        for row in pending_prompts:
-            record = collect_one(row, args)
-            append_jsonl(output_path, record)
-            print_collect_record(record, args)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.concurrency
-        ) as executor:
-            futures = [
-                executor.submit(collect_one, row, args) for row in pending_prompts
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                record = future.result()
+    force_budget_applied = False
+    try:
+        if args.dspark_force_budget_frac is not None:
+            set_internal_state(
+                args.base_url,
+                {"dspark_force_budget_frac": args.dspark_force_budget_frac},
+                args,
+            )
+            force_budget_applied = True
+        if args.dspark_clear_info_records:
+            set_internal_state(
+                args.base_url,
+                {"dspark_clear_info_records": True},
+                args,
+            )
+        if args.concurrency <= 1:
+            for row in pending_prompts:
+                record = collect_one(row, args)
                 append_jsonl(output_path, record)
                 print_collect_record(record, args)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.concurrency
+            ) as executor:
+                futures = [
+                    executor.submit(collect_one, row, args) for row in pending_prompts
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    record = future.result()
+                    append_jsonl(output_path, record)
+                    print_collect_record(record, args)
+        if args.server_info_output:
+            server_info = get_json(
+                args.base_url.rstrip("/") + "/server_info", timeout_s=args.timeout_s
+            )
+            write_json(args.server_info_output, server_info)
+    finally:
+        if force_budget_applied and args.dspark_reset_force_budget:
+            set_internal_state(args.base_url, {"dspark_force_budget_frac": None}, args)
 
     rows = read_jsonl(output_path)
     summary = summarize_run(rows)
@@ -233,8 +526,13 @@ def command_collect(args) -> None:
             "run_label": args.run_label,
             "output": str(output_path),
             "elapsed_s": time.perf_counter() - started,
+            "dspark_force_budget_frac": args.dspark_force_budget_frac,
+            "server_info_output": args.server_info_output,
+            "manifest_output": args.manifest_output,
         }
     )
+    if args.manifest_output:
+        write_json(args.manifest_output, build_collect_manifest(args, summary))
     print(json.dumps(summary, sort_keys=True))
 
 
@@ -319,6 +617,450 @@ def print_collect_record(record: dict[str, Any], args) -> None:
         )
 
 
+def longest_prefix_match(a: list[int], b: list[int]) -> int:
+    count = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        count += 1
+    return count
+
+
+def make_teacher_forced_payload(window: dict[str, Any], args) -> dict[str, Any]:
+    sampling_params = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "max_new_tokens": args.max_new_tokens,
+        "ignore_eos": args.ignore_eos,
+    }
+    if args.sampling_seed is not None:
+        sampling_params["sampling_seed"] = args.sampling_seed
+    return {
+        "rid": window["rid"],
+        "input_ids": window["input_ids"],
+        "sampling_params": sampling_params,
+        "return_meta_info": True,
+        "return_logprob": False,
+        "return_prompt_token_ids": False,
+    }
+
+
+def iter_teacher_forced_windows(
+    rows: list[dict[str, Any]], args
+) -> list[dict[str, Any]]:
+    windows = []
+    for row in rows:
+        prompt_ids = row["prompt_ids"]
+        gold_ids = row["gold_ids"]
+        max_gold = len(gold_ids)
+        if args.max_gold_tokens is not None:
+            max_gold = min(max_gold, args.max_gold_tokens)
+        offsets = range(0, max_gold, args.stride)
+        per_sample = 0
+        for offset in offsets:
+            anchor_id = gold_ids[offset] if offset < max_gold else None
+            # SGLang's DSpark debug dump records draft slots after the
+            # target-generated anchor/bonus token, not the anchor itself.
+            expected = gold_ids[offset + 1 : offset + 1 + args.gamma]
+            if args.drop_short_windows and len(expected) < args.gamma:
+                continue
+            if anchor_id is None or not expected:
+                continue
+            rid = f"{args.run_label}-tf-{row['idx']}-{offset}"
+            windows.append(
+                {
+                    "rid": rid,
+                    "idx": row["idx"],
+                    "id": row.get("id"),
+                    "source": row.get("source"),
+                    "dataset": row.get("dataset"),
+                    "prompt_mode": row.get("prompt_mode"),
+                    "prompt_tokens_offline": row.get("prompt_tokens_offline"),
+                    "gold_tokens_offline": row.get("gold_tokens_offline"),
+                    "gold_offset": offset,
+                    "anchor_id": int(anchor_id),
+                    "expected_ids": expected,
+                    "input_ids": prompt_ids + gold_ids[:offset],
+                    "input_ids_sha256": sha256_json(prompt_ids + gold_ids[:offset]),
+                }
+            )
+            per_sample += 1
+            if (
+                args.max_windows_per_sample is not None
+                and per_sample >= args.max_windows_per_sample
+            ):
+                break
+    if args.limit_windows is not None:
+        windows = windows[: args.limit_windows]
+    return windows
+
+
+def collect_teacher_forced_one(window: dict[str, Any], args) -> dict[str, Any]:
+    started = time.perf_counter()
+    payload = make_teacher_forced_payload(window, args)
+    record = {
+        "run_label": args.run_label,
+        "rid": window["rid"],
+        "idx": window["idx"],
+        "id": window.get("id"),
+        "source": window.get("source"),
+        "dataset": window.get("dataset"),
+        "prompt_mode": window.get("prompt_mode"),
+        "prompt_tokens_offline": window.get("prompt_tokens_offline"),
+        "gold_tokens_offline": window.get("gold_tokens_offline"),
+        "gold_offset": window["gold_offset"],
+        "anchor_id": window["anchor_id"],
+        "expected_ids": window["expected_ids"],
+        "expected_len": len(window["expected_ids"]),
+        "input_token_count": len(window["input_ids"]),
+        "input_ids_sha256": window["input_ids_sha256"],
+        "payload_sha256": sha256_json(payload),
+    }
+    for attempt in range(args.retries + 1):
+        try:
+            obj = post_json(
+                args.base_url.rstrip("/") + "/generate",
+                payload,
+                timeout_s=args.timeout_s,
+            )
+            meta = obj.get("meta_info") or {}
+            output_ids = obj.get("output_ids") or []
+            anchor_output_id = int(output_ids[0]) if output_ids else None
+            record.update(
+                {
+                    "ok": True,
+                    "elapsed_s": time.perf_counter() - started,
+                    "server_rid": meta.get("id"),
+                    "output_ids": output_ids,
+                    "anchor_output_id": anchor_output_id,
+                    "anchor_matches_gold": anchor_output_id == window["anchor_id"],
+                    "meta_info": meta,
+                }
+            )
+            break
+        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+            record.update(
+                {
+                    "ok": False,
+                    "elapsed_s": time.perf_counter() - started,
+                    "error": repr(e),
+                    "attempt": attempt,
+                }
+            )
+            if attempt >= args.retries:
+                break
+            time.sleep(args.retry_sleep_s)
+    return record
+
+
+def iter_dspark_request_records(obj: Any):
+    for dump in iter_dspark_info_records(obj):
+        gamma = dump.get("gamma")
+        mode = dump.get("mode")
+        verify_width = dump.get("verify_num_draft_tokens")
+        for record in dump.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            for req in record.get("reqs") or []:
+                if not isinstance(req, dict):
+                    continue
+                item = dict(req)
+                item["dump_gamma"] = gamma
+                item["dump_mode"] = mode
+                item["dump_verify_num_draft_tokens"] = verify_width
+                item["forward_ct"] = record.get("forward_ct")
+                item["record_mode"] = record.get("mode")
+                item["record_bs"] = record.get("bs")
+                item["record_num_verify_tokens"] = record.get("num_verify_tokens")
+                yield item
+
+
+def dspark_request_records_by_rid(server_info: Any) -> dict[str, list[dict[str, Any]]]:
+    records: dict[str, list[dict[str, Any]]] = {}
+    for req in iter_dspark_request_records(server_info):
+        rid = req.get("rid")
+        if rid is not None:
+            records.setdefault(str(rid), []).append(req)
+    return records
+
+
+def attach_teacher_forced_dspark_records(
+    rows: list[dict[str, Any]], server_info: Any, args
+) -> list[dict[str, Any]]:
+    by_rid = dspark_request_records_by_rid(server_info)
+    attached = []
+    for row in rows:
+        rid = row.get("server_rid") or row.get("rid")
+        candidates = by_rid.get(str(rid), [])
+        dspark_req = candidates[0] if candidates else None
+        result = dict(row)
+        result["dspark_info_records_for_rid"] = len(candidates)
+        if dspark_req is None:
+            result["teacher_forced_ok"] = False
+            result["teacher_forced_error"] = "missing_dspark_info_record"
+            attached.append(result)
+            continue
+        draft_tokens = [int(t) for t in dspark_req.get("draft_tokens") or []]
+        expected = [int(t) for t in row.get("expected_ids") or []]
+        compare_width = min(len(expected), len(draft_tokens), args.gamma)
+        anchor_matches_gold = bool(row.get("anchor_matches_gold"))
+        correct_len = None
+        if anchor_matches_gold:
+            correct_len = longest_prefix_match(
+                draft_tokens[:compare_width], expected[:compare_width]
+            )
+        result.update(
+            {
+                "teacher_forced_ok": bool(row.get("ok")),
+                "gold_compare_ok": bool(row.get("ok"))
+                and anchor_matches_gold
+                and compare_width > 0,
+                "draft_tokens": draft_tokens,
+                "compare_width": compare_width,
+                "correct_len": correct_len,
+                "accepted_with_bonus": (
+                    correct_len + 1 if correct_len is not None else None
+                ),
+                "confidence": dspark_req.get("confidence"),
+                "server_correct_drafts": dspark_req.get("correct_drafts"),
+                "server_verify_len": dspark_req.get("verify_len"),
+                "server_acc_len": dspark_req.get("acc_len"),
+                "server_bonus_token": dspark_req.get("bonus_token"),
+                "dspark_info": dspark_req,
+            }
+        )
+        attached.append(result)
+    return attached
+
+
+def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[str, Any]:
+    http_ok_rows = [r for r in rows if r.get("ok")]
+    dspark_rows = [
+        r
+        for r in rows
+        if r.get("ok") and r.get("teacher_forced_ok") and r.get("dspark_info")
+    ]
+    gold_rows = [
+        r
+        for r in dspark_rows
+        if r.get("gold_compare_ok") and r.get("compare_width")
+    ]
+    missing = [
+        r
+        for r in rows
+        if r.get("ok") and int(r.get("dspark_info_records_for_rid") or 0) == 0
+    ]
+    anchor_mismatch = [
+        r for r in dspark_rows if not bool(r.get("anchor_matches_gold"))
+    ]
+    errors = [r for r in rows if not r.get("ok")]
+    correct = sum(int(r.get("correct_len") or 0) for r in gold_rows)
+    proposed = sum(int(r.get("compare_width") or 0) for r in gold_rows)
+    hist = [0] * (gamma + 1)
+    for row in gold_rows:
+        correct_len = min(int(row.get("correct_len") or 0), gamma)
+        if correct_len >= len(hist):
+            hist.extend([0] * (correct_len + 1 - len(hist)))
+        hist[correct_len] += 1
+    server_rows = [
+        r for r in dspark_rows if r.get("server_correct_drafts") is not None
+    ]
+    server_hist = [0] * (gamma + 1)
+    for row in server_rows:
+        server_correct_len = min(int(row.get("server_correct_drafts") or 0), gamma)
+        if server_correct_len >= len(server_hist):
+            server_hist.extend([0] * (server_correct_len + 1 - len(server_hist)))
+        server_hist[server_correct_len] += 1
+    server_correct = sum(int(r.get("server_correct_drafts") or 0) for r in server_rows)
+    server_proposed = gamma * len(server_rows)
+    server_acc_lens = [
+        int(r["server_acc_len"]) for r in server_rows if r.get("server_acc_len") is not None
+    ]
+    summary = {
+        "windows": len(rows),
+        "http_ok_windows": len(http_ok_rows),
+        "ok_windows": len(gold_rows),
+        "dspark_info_windows": len(dspark_rows),
+        "gold_evaluable_windows": len(gold_rows),
+        "anchor_matched_windows": len(gold_rows),
+        "anchor_mismatch_windows": len(anchor_mismatch),
+        "request_error_windows": len(errors),
+        "missing_dspark_info_windows": len(missing),
+        "gamma": gamma,
+        "correct_drafts": correct,
+        "proposed_drafts": proposed,
+        "accept_len_histogram": hist,
+        "per_position_acceptance": per_position_acceptance_from_histogram(hist),
+        "server_accept_len_histogram": server_hist,
+        "server_per_position_acceptance": per_position_acceptance_from_histogram(
+            server_hist
+        ),
+    }
+    if proposed:
+        summary["accept_rate"] = correct / proposed
+    if gold_rows:
+        summary["draft_accept_length"] = correct / len(gold_rows)
+        summary["accept_length_including_bonus"] = (
+            correct + len(gold_rows)
+        ) / len(gold_rows)
+        summary["mean_compare_width"] = proposed / len(gold_rows)
+    if server_proposed:
+        summary["server_accept_rate"] = server_correct / server_proposed
+    if server_rows:
+        summary["server_draft_accept_length"] = server_correct / len(server_rows)
+    if server_acc_lens:
+        summary["server_accept_length_including_bonus"] = statistics.fmean(
+            server_acc_lens
+        )
+    return summary
+
+
+def print_teacher_forced_record(record: dict[str, Any], args) -> None:
+    if args.quiet_records:
+        return
+    if args.print_records:
+        print(json.dumps(record, sort_keys=True), flush=True)
+    else:
+        print(
+            json.dumps(
+                {
+                    "rid": record.get("rid"),
+                    "ok": record.get("ok"),
+                    "teacher_forced_ok": record.get("teacher_forced_ok"),
+                    "anchor_matches_gold": record.get("anchor_matches_gold"),
+                    "gold_offset": record.get("gold_offset"),
+                    "correct_len": record.get("correct_len"),
+                    "compare_width": record.get("compare_width"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def command_teacher_forced_probe(args) -> None:
+    if args.gamma <= 0:
+        raise ValueError("--gamma must be positive")
+    rows = read_jsonl(args.gold)
+    if args.start_idx is not None:
+        rows = [row for row in rows if row["idx"] >= args.start_idx]
+    if args.end_idx is not None:
+        rows = [row for row in rows if row["idx"] < args.end_idx]
+    if args.limit is not None:
+        rows = rows[: args.limit]
+
+    windows = iter_teacher_forced_windows(rows, args)
+    if not windows:
+        raise RuntimeError("No teacher-forced windows were selected.")
+    output_path = Path(args.output)
+    if output_path.exists() and not args.resume:
+        output_path.unlink()
+
+    done = set()
+    if output_path.exists() and args.resume:
+        done = {r["rid"] for r in read_jsonl(output_path) if r.get("ok")}
+    pending = [window for window in windows if window["rid"] not in done]
+    started = time.perf_counter()
+
+    if args.dspark_clear_info_records:
+        set_internal_state(args.base_url, {"dspark_clear_info_records": True}, args)
+
+    raw_rows = []
+    if args.resume and output_path.exists():
+        raw_rows.extend(read_jsonl(output_path))
+    if args.concurrency <= 1:
+        for window in pending:
+            record = collect_teacher_forced_one(window, args)
+            raw_rows.append(record)
+            append_jsonl(output_path, record)
+            print_teacher_forced_record(record, args)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            futures = [
+                ex.submit(collect_teacher_forced_one, window, args)
+                for window in pending
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                record = future.result()
+                raw_rows.append(record)
+                append_jsonl(output_path, record)
+                print_teacher_forced_record(record, args)
+
+    server_info = get_json(
+        args.base_url.rstrip("/") + "/server_info", timeout_s=args.timeout_s
+    )
+    if args.server_info_output:
+        write_json(args.server_info_output, server_info)
+    attached_rows = attach_teacher_forced_dspark_records(raw_rows, server_info, args)
+    if args.attached_output:
+        write_jsonl(args.attached_output, attached_rows)
+    summary = summarize_teacher_forced(attached_rows, gamma=args.gamma)
+    summary.update(
+        {
+            "run_label": args.run_label,
+            "gold": args.gold,
+            "output": args.output,
+            "attached_output": args.attached_output,
+            "server_info_output": args.server_info_output,
+            "elapsed_s": time.perf_counter() - started,
+            "stride": args.stride,
+            "drop_short_windows": args.drop_short_windows,
+            "max_windows_per_sample": args.max_windows_per_sample,
+            "limit_windows": args.limit_windows,
+        }
+    )
+    failures = []
+    if (
+        args.min_accept_rate is not None
+        and summary.get("accept_rate", 0.0) < args.min_accept_rate
+    ):
+        failures.append(
+            f"accept_rate {summary.get('accept_rate')} is below {args.min_accept_rate}"
+        )
+    if (
+        args.min_accept_length is not None
+        and summary.get("accept_length_including_bonus", 0.0)
+        < args.min_accept_length
+    ):
+        failures.append(
+            "accept_length_including_bonus "
+            f"{summary.get('accept_length_including_bonus')} is below "
+            f"{args.min_accept_length}"
+        )
+    if args.require_no_missing_dspark_info and summary["missing_dspark_info_windows"]:
+        failures.append(
+            f"{summary['missing_dspark_info_windows']} windows lack DSpark info"
+        )
+    summary["verdict"] = {"passed": not failures, "failures": failures}
+    if args.summary_output:
+        write_json(args.summary_output, summary)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.fail_on_verdict and failures:
+        raise SystemExit(1)
+
+
+def sum_histogram(metas: list[dict[str, Any]], key: str) -> list[int]:
+    total: list[int] = []
+    for meta in metas:
+        hist = meta.get(key) or []
+        if len(hist) > len(total):
+            total.extend([0] * (len(hist) - len(total)))
+        for idx, value in enumerate(hist):
+            total[idx] += int(value)
+    return total
+
+
+def per_position_acceptance_from_histogram(hist: list[int]) -> list[float]:
+    total = sum(hist)
+    if total == 0:
+        return []
+    # hist[k] counts verify steps that accepted exactly k draft tokens.
+    # Position j survives when accepted_len >= j.
+    return [sum(hist[pos:]) / total for pos in range(1, len(hist))]
+
+
 def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ok = [r for r in rows if r.get("ok")]
     metas = [r.get("meta_info") or {} for r in ok]
@@ -328,6 +1070,8 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     verify = sum(m.get("spec_verify_ct") or 0 for m in spec_metas)
     correct = sum(m.get("spec_num_correct_drafts") or 0 for m in spec_metas)
     proposed = sum(m.get("spec_num_proposed_drafts") or 0 for m in spec_metas)
+    accept_len_histogram = sum_histogram(spec_metas, "spec_accept_histogram")
+    cap_lens_histogram = sum_histogram(spec_metas, "spec_cap_lens_histogram")
     accept_lengths = [
         m["spec_accept_length"] for m in metas if m.get("spec_accept_length") is not None
     ]
@@ -344,8 +1088,17 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if verify:
         summary["aggregate_accept_length"] = spec_completion / verify
+        summary["aggregate_accept_length_including_bonus"] = spec_completion / verify
+        summary["aggregate_draft_accept_length"] = correct / verify
     if proposed:
         summary["aggregate_accept_rate"] = correct / proposed
+    if accept_len_histogram:
+        summary["accept_len_histogram"] = accept_len_histogram
+        summary["per_position_acceptance"] = per_position_acceptance_from_histogram(
+            accept_len_histogram
+        )
+    if cap_lens_histogram:
+        summary["cap_lens_histogram"] = cap_lens_histogram
     if accept_lengths:
         summary["mean_accept_length"] = statistics.fmean(accept_lengths)
         summary["min_accept_length"] = min(accept_lengths)
@@ -689,6 +1442,8 @@ def command_trace_summary(args) -> None:
     folded_count = 0
     non_uniform_count = 0
     non_greedy_count = 0
+    non_greedy_accept_covered_count = 0
+    non_greedy_accept_uncovered_count = 0
     seeded_count = 0
     sampling_backends = {}
     simulated_count = 0
@@ -696,6 +1451,8 @@ def command_trace_summary(args) -> None:
     request_rows = 0
     max_bs = 0
     verify_lens_sums = []
+    full_verify_token_sum = 0
+    scheduled_verify_token_sum = 0
     graph_token_counts = []
     graph_padding_tokens = []
     for i, row in enumerate(rows):
@@ -729,6 +1486,11 @@ def command_trace_summary(args) -> None:
             non_uniform_count += 1
         if not row.get("all_greedy", True):
             non_greedy_count += 1
+            coverage = row.get("coverage") or {}
+            if coverage.get("non_greedy_accept") == "accept_sampling_reference":
+                non_greedy_accept_covered_count += 1
+            else:
+                non_greedy_accept_uncovered_count += 1
         sampling = row.get("sampling") or {}
         if sampling.get("seed_present"):
             seeded_count += 1
@@ -743,6 +1505,10 @@ def command_trace_summary(args) -> None:
         if row.get("verify_lens_sum") is not None:
             verify_lens_sum = int(row["verify_lens_sum"])
             verify_lens_sums.append(verify_lens_sum)
+            scheduled_verify_token_sum += verify_lens_sum
+            verify_num_draft_tokens = row.get("verify_num_draft_tokens")
+            if verify_num_draft_tokens is not None:
+                full_verify_token_sum += req_count * int(verify_num_draft_tokens)
             layout_graph_num_tokens = row.get("layout_graph_num_tokens")
             if layout_graph_num_tokens is not None:
                 graph_num_tokens = int(layout_graph_num_tokens)
@@ -767,10 +1533,29 @@ def command_trace_summary(args) -> None:
         gate_failures.append("no non-greedy records were observed")
     if args.require_seeded_sampling and seeded_count == 0:
         gate_failures.append("no seeded sampling records were observed")
+    if (
+        args.require_non_greedy_accept_coverage
+        and non_greedy_accept_uncovered_count
+    ):
+        gate_failures.append(
+            f"{non_greedy_accept_uncovered_count} non-greedy records did not "
+            "have accept-sampling reference coverage"
+        )
     if args.require_no_skipped and skipped_count:
         gate_failures.append(f"{skipped_count} skipped records were observed")
     if args.require_padded_graph and padded_graph_count == 0:
         gate_failures.append("no padded graph records were observed")
+    saved_verify_tokens = full_verify_token_sum - scheduled_verify_token_sum
+    if args.require_trimmed_verify_tokens and saved_verify_tokens <= 0:
+        gate_failures.append("no verify tokens were trimmed")
+    if (
+        args.min_saved_verify_tokens is not None
+        and saved_verify_tokens < args.min_saved_verify_tokens
+    ):
+        gate_failures.append(
+            f"saved_verify_tokens {saved_verify_tokens} is below "
+            f"{args.min_saved_verify_tokens}"
+        )
 
     summary = {
         "trace": args.trace,
@@ -783,10 +1568,20 @@ def command_trace_summary(args) -> None:
         "folded_accept_records": folded_count,
         "non_uniform_verify_lens_records": non_uniform_count,
         "non_greedy_records": non_greedy_count,
+        "non_greedy_accept_covered_records": non_greedy_accept_covered_count,
+        "non_greedy_accept_uncovered_records": non_greedy_accept_uncovered_count,
         "seeded_sampling_records": seeded_count,
         "sampling_backends": sampling_backends,
         "simulated_accept_records": simulated_count,
         "padded_graph_records": padded_graph_count,
+        "full_verify_token_sum": full_verify_token_sum,
+        "scheduled_verify_token_sum": scheduled_verify_token_sum,
+        "saved_verify_tokens": saved_verify_tokens,
+        "scheduled_verify_token_ratio": (
+            scheduled_verify_token_sum / full_verify_token_sum
+            if full_verify_token_sum
+            else None
+        ),
         "max_bs": max_bs,
         "min_verify_lens_sum": min(verify_lens_sums) if verify_lens_sums else None,
         "max_verify_lens_sum": max(verify_lens_sums) if verify_lens_sums else None,
@@ -815,6 +1610,176 @@ def command_trace_summary(args) -> None:
         raise SystemExit(1)
 
 
+def read_json_or_jsonl(path: str | Path) -> Any:
+    path = Path(path)
+    if path.suffix == ".jsonl":
+        return read_jsonl(path)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def iter_dspark_info_records(obj: Any):
+    if isinstance(obj, list):
+        for item in obj:
+            yield from iter_dspark_info_records(item)
+        return
+    if not isinstance(obj, dict):
+        return
+    if "records" in obj and "verify_num_draft_tokens" in obj:
+        yield obj
+        return
+    if "dspark_info_record" in obj:
+        yield from iter_dspark_info_records(obj["dspark_info_record"])
+    for state in obj.get("internal_states") or []:
+        if isinstance(state, dict) and "dspark_info_record" in state:
+            yield from iter_dspark_info_records(state["dspark_info_record"])
+
+
+def summarize_timing(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    values = [float(r[key]) for r in records if r.get(key) is not None]
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "p50": quantile(values, 50),
+        "p90": quantile(values, 90),
+        "max": max(values),
+    }
+
+
+def command_info_summary(args) -> None:
+    dumps = list(iter_dspark_info_records(read_json_or_jsonl(args.input)))
+    records_with_cfg = [
+        (dump, record)
+        for dump in dumps
+        for record in dump.get("records", [])
+        if isinstance(record, dict)
+    ]
+    records = [record for _dump, record in records_with_cfg]
+    failures = []
+    compact_count = 0
+    non_uniform_count = 0
+    padded_graph_count = 0
+    graph_key_counts: dict[str, int] = {}
+    full_verify_token_sum = 0
+    scheduled_verify_token_sum = 0
+    graph_token_sum = 0
+    request_rows = 0
+    max_bs = 0
+    verify_len_histogram: dict[str, int] = {}
+
+    for dump, record in records_with_cfg:
+        mode = record.get("mode") or dump.get("mode")
+        if mode == "compact":
+            compact_count += 1
+        verify_width = int(dump.get("verify_num_draft_tokens") or 0)
+        reqs = record.get("reqs") or []
+        bs = int(record.get("bs") or len(reqs) or 0)
+        max_bs = max(max_bs, bs)
+        request_rows += len(reqs)
+        verify_lens = [
+            int(req["verify_len"])
+            for req in reqs
+            if isinstance(req, dict) and req.get("verify_len") is not None
+        ]
+        if verify_lens:
+            if len(set(verify_lens)) > 1:
+                non_uniform_count += 1
+            for value in verify_lens:
+                key = str(value)
+                verify_len_histogram[key] = verify_len_histogram.get(key, 0) + 1
+        num_verify_tokens = record.get("num_verify_tokens")
+        scheduled_tokens = (
+            int(num_verify_tokens)
+            if num_verify_tokens is not None and int(num_verify_tokens) >= 0
+            else sum(verify_lens)
+        )
+        graph_key = record.get("verify_tokens_graph_key")
+        graph_tokens = (
+            int(graph_key)
+            if graph_key is not None and int(graph_key) >= 0
+            else scheduled_tokens
+        )
+        graph_token_key = str(graph_tokens)
+        graph_key_counts[graph_token_key] = (
+            graph_key_counts.get(graph_token_key, 0) + 1
+        )
+        if graph_tokens > scheduled_tokens:
+            padded_graph_count += 1
+        if verify_width and bs:
+            full_verify_token_sum += bs * verify_width
+        scheduled_verify_token_sum += scheduled_tokens
+        graph_token_sum += graph_tokens
+
+    saved_verify_tokens = full_verify_token_sum - scheduled_verify_token_sum
+    graph_padding_tokens = graph_token_sum - scheduled_verify_token_sum
+
+    gate_failures = []
+    if args.require_records_min is not None and len(records) < args.require_records_min:
+        gate_failures.append(
+            f"records {len(records)} is below {args.require_records_min}"
+        )
+    if args.require_compact and compact_count == 0:
+        gate_failures.append("no compact records were observed")
+    if args.require_non_uniform_verify_lens and non_uniform_count == 0:
+        gate_failures.append("no non-uniform verify_lens records were observed")
+    if args.require_padded_graph and padded_graph_count == 0:
+        gate_failures.append("no padded graph records were observed")
+    if args.require_trimmed_verify_tokens and saved_verify_tokens <= 0:
+        gate_failures.append("no verify tokens were trimmed")
+    if (
+        args.min_saved_verify_tokens is not None
+        and saved_verify_tokens < args.min_saved_verify_tokens
+    ):
+        gate_failures.append(
+            f"saved_verify_tokens {saved_verify_tokens} is below "
+            f"{args.min_saved_verify_tokens}"
+        )
+
+    summary = {
+        "input": args.input,
+        "dumps": len(dumps),
+        "records": len(records),
+        "request_rows": request_rows,
+        "compact_records": compact_count,
+        "non_uniform_verify_lens_records": non_uniform_count,
+        "padded_graph_records": padded_graph_count,
+        "full_verify_token_sum": full_verify_token_sum,
+        "scheduled_verify_token_sum": scheduled_verify_token_sum,
+        "saved_verify_tokens": saved_verify_tokens,
+        "scheduled_verify_token_ratio": (
+            scheduled_verify_token_sum / full_verify_token_sum
+            if full_verify_token_sum
+            else None
+        ),
+        "graph_token_sum": graph_token_sum,
+        "graph_padding_tokens": graph_padding_tokens,
+        "max_bs": max_bs,
+        "verify_len_histogram": verify_len_histogram,
+        "graph_key_counts": graph_key_counts,
+        "timing_ms": {
+            "step_cpu": summarize_timing(records, "step_cpu_ms"),
+            "step_gpu": summarize_timing(records, "step_gpu_ms"),
+            "draft_gpu": summarize_timing(records, "draft_gpu_ms"),
+            "target_verify_gpu": summarize_timing(
+                records, "target_verify_gpu_ms"
+            ),
+        },
+        "verdict": {
+            "passed": not failures and not gate_failures,
+            "failures": failures,
+            "gate_failures": gate_failures,
+        },
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.summary_output:
+        with open(args.summary_output, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+    if args.fail_on_verdict and (failures or gate_failures):
+        raise SystemExit(1)
+
+
 def add_prepare(subparsers) -> None:
     parser = subparsers.add_parser("prepare")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
@@ -826,6 +1791,23 @@ def add_prepare(subparsers) -> None:
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-thinking", action="store_true")
     parser.set_defaults(func=command_prepare)
+
+
+def add_prepare_gold(subparsers) -> None:
+    parser = subparsers.add_parser("prepare-gold")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--num-samples", type=int, default=256)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--disable-thinking", action="store_true")
+    parser.add_argument("--min-gold-tokens", type=int, default=8)
+    parser.add_argument("--max-gold-tokens", type=int)
+    parser.add_argument("--max-prompt-tokens", type=int)
+    parser.add_argument("--include-text", action=argparse.BooleanOptionalAction, default=True)
+    parser.set_defaults(func=command_prepare_gold)
 
 
 def add_collect(subparsers) -> None:
@@ -853,7 +1835,56 @@ def add_collect(subparsers) -> None:
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-sleep-s", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dspark-force-budget-frac", type=float)
+    parser.add_argument(
+        "--dspark-reset-force-budget",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--dspark-clear-info-records", action="store_true")
+    parser.add_argument("--server-info-output")
+    parser.add_argument("--manifest-output")
     parser.set_defaults(func=command_collect)
+
+
+def add_teacher_forced_probe(subparsers) -> None:
+    parser = subparsers.add_parser("teacher-forced-probe")
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--gold", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--attached-output")
+    parser.add_argument("--server-info-output")
+    parser.add_argument("--summary-output")
+    parser.add_argument("--run-label", default="teacher_forced")
+    parser.add_argument("--gamma", type=int, default=7)
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--max-windows-per-sample", type=int)
+    parser.add_argument("--limit-windows", type=int)
+    parser.add_argument("--max-gold-tokens", type=int)
+    parser.add_argument("--drop-short-windows", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--sampling-seed", type=int)
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--start-idx", type=int)
+    parser.add_argument("--end-idx", type=int)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--timeout-s", type=int, default=600)
+    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--retry-sleep-s", type=float, default=5.0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--print-records", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--quiet-records", action="store_true")
+    parser.add_argument("--dspark-clear-info-records", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--min-accept-rate", type=float)
+    parser.add_argument("--min-accept-length", type=float)
+    parser.add_argument("--require-no-missing-dspark-info", action="store_true")
+    parser.add_argument("--fail-on-verdict", action="store_true")
+    parser.set_defaults(func=command_teacher_forced_probe)
 
 
 def add_compare(subparsers) -> None:
@@ -893,20 +1924,40 @@ def add_trace_summary(subparsers) -> None:
     parser.add_argument("--require-folded-accept", action="store_true")
     parser.add_argument("--require-non-greedy", action="store_true")
     parser.add_argument("--require-seeded-sampling", action="store_true")
+    parser.add_argument("--require-non-greedy-accept-coverage", action="store_true")
     parser.add_argument("--require-padded-graph", action="store_true")
+    parser.add_argument("--require-trimmed-verify-tokens", action="store_true")
+    parser.add_argument("--min-saved-verify-tokens", type=int)
     parser.add_argument("--require-no-skipped", action="store_true")
     parser.add_argument("--fail-on-verdict", action="store_true")
     parser.set_defaults(func=command_trace_summary)
+
+
+def add_info_summary(subparsers) -> None:
+    parser = subparsers.add_parser("info-summary")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--summary-output")
+    parser.add_argument("--require-records-min", type=int)
+    parser.add_argument("--require-compact", action="store_true")
+    parser.add_argument("--require-non-uniform-verify-lens", action="store_true")
+    parser.add_argument("--require-padded-graph", action="store_true")
+    parser.add_argument("--require-trimmed-verify-tokens", action="store_true")
+    parser.add_argument("--min-saved-verify-tokens", type=int)
+    parser.add_argument("--fail-on-verdict", action="store_true")
+    parser.set_defaults(func=command_info_summary)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_prepare(subparsers)
+    add_prepare_gold(subparsers)
     add_collect(subparsers)
+    add_teacher_forced_probe(subparsers)
     add_compare(subparsers)
     add_run_summary(subparsers)
     add_trace_summary(subparsers)
+    add_info_summary(subparsers)
     args = parser.parse_args()
     args.func(args)
 

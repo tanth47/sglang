@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dspark_components.dspark_utils import (
@@ -57,8 +61,23 @@ def normalize_dspark_draft_config(config: Any) -> Any:
             _cfg_set(config, key, value)
 
     aux_layer_ids = _cfg_get(config, "aux_hidden_state_layer_ids", None)
-    if _cfg_get(config, "num_target_layers", None) is None and aux_layer_ids is not None:
-        parsed = [int(x) for x in aux_layer_ids]
+    dspark_target_layer_ids = _cfg_get(config, "dspark_target_layer_ids", None)
+    if (
+        _cfg_get(config, "target_layer_ids", None) is None
+        and dspark_target_layer_ids is not None
+    ):
+        _cfg_set(config, "target_layer_ids", [int(x) for x in dspark_target_layer_ids])
+
+    target_layer_ids_for_num_target = (
+        dspark_target_layer_ids
+        if dspark_target_layer_ids is not None
+        else aux_layer_ids
+    )
+    if (
+        _cfg_get(config, "num_target_layers", None) is None
+        and target_layer_ids_for_num_target is not None
+    ):
+        parsed = [int(x) for x in target_layer_ids_for_num_target]
         if parsed:
             _cfg_set(config, "num_target_layers", max(parsed) + 1)
 
@@ -70,6 +89,27 @@ def gather_and_crop_vocab(
 ) -> torch.Tensor:
     full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
+
+
+def build_step_local_torch(
+    *, bias: torch.Tensor, base_local: torch.Tensor
+) -> torch.Tensor:
+    per_partition = base_local.shape[-1]
+    pad = per_partition - bias.shape[-1]
+    padded = (
+        F.pad(bias.to(torch.float32), (0, pad)) if pad > 0 else bias.to(torch.float32)
+    )
+    return base_local + padded
+
+
+def build_step_local(*, bias: torch.Tensor, base_local: torch.Tensor) -> torch.Tensor:
+    if base_local.device.type == "cpu":
+        return build_step_local_torch(bias=bias, base_local=base_local)
+    from sglang.srt.speculative.dspark_components.kernels.build_step_local import (
+        BuildStepLocal,
+    )
+
+    return BuildStepLocal.execute(bias=bias, base_local=base_local)
 
 
 def run_markov_block(
@@ -105,6 +145,15 @@ def run_markov_block(
     )
 
 
+@dataclass(frozen=True)
+class MarkovW2ShardGeometry:
+    tp_size: int
+    org_vocab_start: int
+    org_vocab_end: int
+    num_embeddings_per_partition: int
+    num_embeddings_padded: int
+
+
 class VanillaMarkov(nn.Module):
 
     markov_head_type = "vanilla"
@@ -118,21 +167,91 @@ class VanillaMarkov(nn.Module):
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
+        self._opt_markov_w2_tp_shard = (
+            envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        )
+        markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
+        self.markov_w2 = nn.Linear(
+            self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
+        )
+        self._tp_shard: Optional[MarkovW2ShardGeometry] = None
+
+    @property
+    def uses_tp_sharded_markov_w2(self) -> bool:
+        return self._tp_shard is not None
+
+    def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
+        if not self._opt_markov_w2_tp_shard:
+            return
+        if int(lm_head.org_vocab_size) != self.vocab_size:
+            raise ValueError(
+                "DSpark markov_w2 TP-shard requires lm_head.org_vocab_size == "
+                f"markov vocab_size, got {int(lm_head.org_vocab_size)} vs "
+                f"{self.vocab_size}."
+            )
+        tp_size = int(lm_head.tp_size)
+        per_partition = int(lm_head.num_embeddings_per_partition)
+        num_padded = int(lm_head.num_embeddings_padded)
+        if per_partition * tp_size != num_padded:
+            raise ValueError(
+                "DSpark markov_w2 TP-shard could not align to the lm_head partition: "
+                f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
+                f"num_embeddings_padded({num_padded})."
+            )
+        attn_tp_size = get_attention_tp_group().world_size
+        if attn_tp_size != tp_size:
+            raise ValueError(
+                "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
+                f"all-gather) to equal the lm_head shard group, got attn_tp_size="
+                f"{attn_tp_size} vs lm_head tp_size={tp_size}. This config (e.g. DP "
+                "attention without --enable-dp-lm-head, where lm_head shards over the "
+                "global TP group) is unsupported; disable "
+                "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
+            )
+        self._tp_shard = MarkovW2ShardGeometry(
+            tp_size=tp_size,
+            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
+            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
+            num_embeddings_per_partition=per_partition,
+            num_embeddings_padded=num_padded,
+        )
+        logger.info(
+            "DSpark markov_w2 TP-shard enabled for %s: vocab=[%d, %d), "
+            "per_partition=%d, tp_size=%d, bf16=%s.",
+            type(self).__name__,
+            self._tp_shard.org_vocab_start,
+            self._tp_shard.org_vocab_end,
+            self._tp_shard.num_embeddings_per_partition,
+            self._tp_shard.tp_size,
+            self._opt_markov_w2_bf16,
+        )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
 
-    def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
-        return self.markov_w2(latent_states)
+    def project_bias(
+        self, latent_states: torch.Tensor, *, weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        weight = self.markov_w2.weight if weight is None else weight
+        if self._opt_markov_w2_bf16:
+            return F.linear(latent_states.to(weight.dtype), weight).float()
+        return F.linear(latent_states.float(), weight)
+
+    def compute_step_latent(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        del hidden_states
+        return self.get_prev_embeddings(token_ids)
 
     def compute_step_bias(
         self,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
+        return self.project_bias(self.compute_step_latent(token_ids, hidden_states))
 
     def apply_step_logits(
         self,
@@ -141,7 +260,48 @@ class VanillaMarkov(nn.Module):
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self._tp_shard is not None:
+            return self._apply_step_logits_sharded(
+                base_local=logits,
+                token_ids=token_ids,
+                hidden_states=hidden_states,
+            )
         return logits + self.compute_step_bias(token_ids, hidden_states)
+
+    def _apply_step_logits_sharded(
+        self,
+        *,
+        base_local: torch.Tensor,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        latent = self.compute_step_latent(token_ids, hidden_states)
+        return self._apply_step_logits_sharded_from_latent(
+            base_local=base_local, latent_states=latent
+        )
+
+    def _apply_step_logits_sharded_from_latent(
+        self, *, base_local: torch.Tensor, latent_states: torch.Tensor
+    ) -> torch.Tensor:
+        shard = self._tp_shard
+        if shard is None:
+            raise RuntimeError("DSpark markov_w2 TP-shard is not configured.")
+        if base_local.shape[-1] != shard.num_embeddings_per_partition:
+            raise RuntimeError(
+                "DSpark markov_w2 TP-shard expected base local logits with "
+                f"{shard.num_embeddings_per_partition} columns, got "
+                f"{base_local.shape[-1]}."
+            )
+        weight_local = self.markov_w2.weight[
+            shard.org_vocab_start : shard.org_vocab_end
+        ]
+        bias = self.project_bias(latent_states, weight=weight_local)
+        step_local = build_step_local(bias=bias, base_local=base_local)
+        if shard.tp_size > 1:
+            full = get_attention_tp_group().all_gather(step_local, dim=-1)
+        else:
+            full = step_local
+        return full[..., : self.vocab_size]
 
     def apply_block_logits(
         self,
@@ -152,6 +312,18 @@ class VanillaMarkov(nn.Module):
     ) -> torch.Tensor:
         if base_logits.size(-2) == 0:
             return base_logits
+        if self._tp_shard is not None:
+            output_logits = []
+            for k in range(base_logits.size(-2)):
+                step_hidden = None if hidden_states is None else hidden_states[..., k, :]
+                output_logits.append(
+                    self.apply_step_logits(
+                        base_logits[..., k, :],
+                        token_ids=token_ids[..., k],
+                        hidden_states=step_hidden,
+                    )
+                )
+            return torch.stack(output_logits, dim=-2)
         return base_logits + self.compute_step_bias(token_ids, hidden_states)
 
     def sample_block(
@@ -190,7 +362,7 @@ class GatedMarkovHead(VanillaMarkov):
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
 
-    def compute_step_bias(
+    def compute_step_latent(
         self,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
@@ -199,7 +371,7 @@ class GatedMarkovHead(VanillaMarkov):
         gate = self.compute_gate(token_ids, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
-        return self.project_bias(gate * prev_embeddings)
+        return gate * prev_embeddings
 
 
 class RNNHead(VanillaMarkov):
@@ -212,7 +384,7 @@ class RNNHead(VanillaMarkov):
         self.state_size = markov_rank
         self.joint_proj = nn.Linear(2 * markov_rank + self.hidden_size, 3 * markov_rank)
 
-    def _rnn_step(
+    def _rnn_step_latent(
         self,
         state: torch.Tensor,
         prev_embeddings: torch.Tensor,
@@ -223,8 +395,30 @@ class RNNHead(VanillaMarkov):
         gate = torch.sigmoid(gate_raw)
         candidate = torch.tanh(candidate_raw)
         new_state = gate * state + (1.0 - gate) * candidate
-        bias = self.project_bias(torch.tanh(output_raw))
-        return new_state, bias
+        return new_state, torch.tanh(output_raw)
+
+    def _rnn_step(
+        self,
+        state: torch.Tensor,
+        prev_embeddings: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        new_state, latent = self._rnn_step_latent(
+            state, prev_embeddings, hidden_states
+        )
+        return new_state, self.project_bias(latent)
+
+    def compute_step_latent(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if hidden_states is None:
+            raise ValueError("RNNHead requires hidden_states.")
+        prev_embeddings = self.get_prev_embeddings(token_ids)
+        state = torch.zeros_like(prev_embeddings)
+        _, latent = self._rnn_step_latent(state, prev_embeddings, hidden_states)
+        return latent
 
     def compute_step_bias(
         self,
@@ -260,8 +454,17 @@ class RNNHead(VanillaMarkov):
         output_logits = []
         for k in range(block_size):
             prev_emb = self.get_prev_embeddings(token_ids[..., k])
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[..., k, :])
-            output_logits.append(base_logits[..., k, :] + bias)
+            state, latent = self._rnn_step_latent(
+                state, prev_emb, hidden_states[..., k, :]
+            )
+            if self._tp_shard is not None:
+                output_logits.append(
+                    self._apply_step_logits_sharded_from_latent(
+                        base_local=base_logits[..., k, :], latent_states=latent
+                    )
+                )
+            else:
+                output_logits.append(base_logits[..., k, :] + self.project_bias(latent))
         return torch.stack(output_logits, dim=-2)
 
     def sample_block(
@@ -292,8 +495,15 @@ class RNNHead(VanillaMarkov):
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
             prev_emb = self.get_prev_embeddings(prev_tokens)
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
-            step_logits = base_logits[:, step_idx, :] + bias
+            state, latent = self._rnn_step_latent(
+                state, prev_emb, hidden_states[:, step_idx, :]
+            )
+            if self._tp_shard is not None:
+                step_logits = self._apply_step_logits_sharded_from_latent(
+                    base_local=base_logits[:, step_idx, :], latent_states=latent
+                )
+            else:
+                step_logits = base_logits[:, step_idx, :] + self.project_bias(latent)
             next_tokens = sampler(step_logits, step_idx)
             sampled_tokens.append(next_tokens)
             corrected_logits.append(step_logits.unsqueeze(1))
@@ -372,7 +582,13 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    confidence_enabled = bool(getattr(config, "enable_confidence_head", True))
+    if not confidence_enabled:
+        return None
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(
@@ -422,6 +638,7 @@ class DSparkDraftMixin:
     ) -> None:
         del embed_tokens
         self.lm_head = lm_head
+        self.markov_head.configure_tp_shard(lm_head=lm_head)
 
     def compute_base_logits(
         self, hidden: torch.Tensor
@@ -435,6 +652,8 @@ class DSparkDraftMixin:
         if hidden.dtype != weight.dtype:
             hidden = hidden.to(weight.dtype)
         local_logits = torch.matmul(hidden, weight.T)
+        if self.markov_head.uses_tp_sharded_markov_w2:
+            return local_logits, None
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 

@@ -37,6 +37,12 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if algo.is_dspark():
+        # DSpark's draft/verify path still consumes the host-side sequence
+        # length mirror to build TARGET_VERIFY metadata. Letting backends opt
+        # out here pushes draft ranks into ad hoc seq_lens.cpu() fallbacks,
+        # which can desynchronize TP ranks on ROCm.
+        return True
     if algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
@@ -123,6 +129,16 @@ class ResolvedConfidence(msgspec.Struct):
 
     confidence: torch.Tensor
     generation: torch.Tensor
+    seq_lens: Optional[torch.Tensor] = None
+
+
+class ConfidenceRelayStats(msgspec.Struct):
+
+    attempts: int = 0
+    hits: int = 0
+    misses: int = 0
+    last_status: str = "never"
+    ring_pos: int = 0
 
 
 @dataclass
@@ -154,17 +170,31 @@ class ConfidenceRelay(msgspec.Struct):
     req_pool_size: int
     pool: Any
     confidence_buf: Optional[torch.Tensor] = None
+    seq_lens_buf: Optional[torch.Tensor] = None
+    seq_lens_valid_buf: Optional[torch.Tensor] = None
     conf_ring: Optional[torch.Tensor] = None
+    seq_lens_ring: Optional[torch.Tensor] = None
+    seq_lens_valid_ring: Optional[torch.Tensor] = None
     gen_ring: Optional[torch.Tensor] = None
     copy_done: Optional[list] = None
     ring_pos: int = 0
     initialized: bool = False
+    resolve_attempts: int = 0
+    resolve_hits: int = 0
+    resolve_misses: int = 0
+    last_resolve_status: str = "never"
 
     def _lazy_init(self, confidence: torch.Tensor) -> None:
         self.initialized = True
         gamma = confidence.shape[-1]
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
+        )
+        self.seq_lens_buf = torch.zeros(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
+        self.seq_lens_valid_buf = torch.zeros(
+            (self.req_pool_size,), dtype=torch.bool, device=self.device
         )
         if _is_cuda:
             depth = CONFIDENCE_RELAY_RING_DEPTH
@@ -173,15 +203,31 @@ class ConfidenceRelay(msgspec.Struct):
                 dtype=torch.float32,
                 pin_memory=True,
             )
+            self.seq_lens_ring = torch.zeros(
+                (depth, self.req_pool_size), dtype=torch.int64, pin_memory=True
+            )
+            self.seq_lens_valid_ring = torch.zeros(
+                (depth, self.req_pool_size), dtype=torch.bool, pin_memory=True
+            )
             self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
             self.copy_done = [
                 torch.get_device_module(self.device).Event() for _ in range(depth)
             ]
 
-    def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
+    def scatter(
+        self,
+        indices: torch.Tensor,
+        confidence: torch.Tensor,
+        seq_lens: Optional[torch.Tensor] = None,
+    ) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
+        if seq_lens is not None:
+            self.seq_lens_buf[indices] = seq_lens.to(self.seq_lens_buf.dtype)
+            self.seq_lens_valid_buf[indices] = True
+        else:
+            self.seq_lens_valid_buf[indices] = False
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
         if not self.initialized or stream is None or publish_ready is None:
@@ -190,40 +236,80 @@ class ConfidenceRelay(msgspec.Struct):
         stream.wait_event(publish_ready)
         with torch.get_device_module(self.device).stream(stream):
             self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
+            self.seq_lens_ring[slot].copy_(self.seq_lens_buf, non_blocking=True)
+            self.seq_lens_valid_ring[slot].copy_(
+                self.seq_lens_valid_buf, non_blocking=True
+            )
             self.copy_done[slot].record()
         self.gen_ring[slot].copy_(self.pool.req_generation)
         self.ring_pos += 1
+
+    def _record_resolve(self, *, status: str, hit: bool) -> None:
+        self.resolve_attempts += 1
+        if hit:
+            self.resolve_hits += 1
+        else:
+            self.resolve_misses += 1
+        self.last_resolve_status = status
+
+    def snapshot_stats(self) -> ConfidenceRelayStats:
+        return ConfidenceRelayStats(
+            attempts=int(self.resolve_attempts),
+            hits=int(self.resolve_hits),
+            misses=int(self.resolve_misses),
+            last_status=self.last_resolve_status,
+            ring_pos=int(self.ring_pos),
+        )
 
     def resolve(
         self, batch: ScheduleBatch, *, stream, publish_ready
     ) -> Optional[ResolvedConfidence]:
         if not self.initialized:
+            self._record_resolve(status="uninitialized", hit=False)
             return None
         draft_input = batch.spec_info
         if draft_input is None:
+            self._record_resolve(status="no_spec_info", hit=False)
             return None
         fi = draft_input.future_indices
         if fi is None or fi.shape[0] == 0:
+            self._record_resolve(status="empty_future_indices", hit=False)
             return None
 
         if stream is None or publish_ready is None:
             idx = batch.req_pool_indices
             idx_cpu = batch.req_pool_indices_cpu
+            self._record_resolve(status="direct", hit=True)
+            seq_lens = None
+            if self.seq_lens_buf is not None and self.seq_lens_valid_buf is not None:
+                valid = self.seq_lens_valid_buf[idx].cpu()
+                if bool(torch.all(valid).item()):
+                    seq_lens = self.seq_lens_buf[idx].cpu()
             return ResolvedConfidence(
                 confidence=self.confidence_buf[idx].cpu(),
                 generation=self.pool.req_generation[idx_cpu].clone(),
+                seq_lens=seq_lens,
             )
 
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
+            self._record_resolve(status="ring_warmup", hit=False)
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
         if not self.copy_done[slot].query():
+            self._record_resolve(status="copy_not_ready", hit=False)
             return None
 
         idx_cpu = batch.req_pool_indices_cpu
+        self._record_resolve(status="ring", hit=True)
+        seq_lens = None
+        if self.seq_lens_ring is not None and self.seq_lens_valid_ring is not None:
+            valid = self.seq_lens_valid_ring[slot][idx_cpu]
+            if bool(torch.all(valid).item()):
+                seq_lens = self.seq_lens_ring[slot][idx_cpu]
         return ResolvedConfidence(
             confidence=self.conf_ring[slot][idx_cpu],
             generation=self.gen_ring[slot][idx_cpu],
+            seq_lens=seq_lens,
         )
 
 
@@ -339,6 +425,11 @@ class FutureMap:
             publish_ready=self.publish_ready,
         )
 
+    def confidence_relay_stats(self) -> ConfidenceRelayStats:
+        if not self.needs_confidence_relay:
+            return ConfidenceRelayStats(last_status="disabled")
+        return self.confidence_relay.snapshot_stats()
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -436,10 +527,11 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        del confidence_seq_lens
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
-            self.confidence_relay.scatter(indices, confidence)
+            self.confidence_relay.scatter(
+                indices, confidence, seq_lens=confidence_seq_lens
+            )
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
             if self.publish_ready is None:

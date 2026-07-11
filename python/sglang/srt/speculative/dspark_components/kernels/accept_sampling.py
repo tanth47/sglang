@@ -18,8 +18,16 @@ from sglang.srt.speculative.dspark_components.kernels.cap_correct_len import (
 )
 from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+from sglang.srt.utils import is_hip
 
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_ACCEPT_SAMPLING.get()
+
+
+def _sampling_trace_assert_enabled() -> bool:
+    # The reference sampler is intentionally slow and synchronizing. Keep it
+    # separate from verify trace assertions, which are expected to be usable
+    # during serving-scale verifier trace collection.
+    return envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get()
 
 
 def _hash_uniform(
@@ -158,6 +166,66 @@ def _reference_chain_accept(
     return expected_correct, expected_bonus, expected_cap_trim
 
 
+def _sample_cdf_token_batched(probs: torch.Tensor, coins: torch.Tensor) -> torch.Tensor:
+    cdf = torch.cumsum(probs.float(), dim=-1)
+    total = cdf[:, -1].clamp_min(torch.finfo(cdf.dtype).tiny)
+    target = coins.to(cdf.dtype) * total
+    tokens = torch.sum(cdf <= target[:, None], dim=-1)
+    return torch.clamp(tokens, max=probs.shape[-1] - 1).to(torch.int64)
+
+
+def _vectorized_chain_accept(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_final: torch.Tensor,
+    gamma: int,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs = candidates.shape[0]
+    device = candidates.device
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    cur_prob_row = torch.zeros((bs,), dtype=torch.long, device=device)
+    raw_correct = torch.zeros((bs,), dtype=torch.long, device=device)
+    active = torch.ones((bs,), dtype=torch.bool, device=device)
+
+    for step in range(1, gamma + 1):
+        draft_token = candidates[:, step].to(torch.long)
+        p = target_probs[row_ids, cur_prob_row, draft_token]
+        q = draft_probs[row_ids, cur_prob_row, draft_token]
+        accepted = active & (uniform_samples[:, step - 1] * q < p)
+        raw_correct += accepted.to(raw_correct.dtype)
+        cur_prob_row = torch.where(
+            accepted,
+            torch.full_like(cur_prob_row, step),
+            cur_prob_row,
+        )
+        active &= accepted
+
+    target_final = target_probs[row_ids, cur_prob_row]
+    draft_final = draft_probs[row_ids, torch.clamp(cur_prob_row, max=gamma - 1)]
+    rejection_final = torch.clamp_min(target_final - draft_final, 0.0)
+    final_probs = torch.where(active[:, None], target_final, rejection_final)
+    final_token = _sample_cdf_token_batched(
+        final_probs, uniform_samples_final[row_ids, cur_prob_row]
+    )
+
+    capped_correct = raw_correct
+    if cutoff_verify_lens is not None:
+        cap_limit = torch.clamp_min(cutoff_verify_lens.to(torch.long) - 1, 0)
+        capped_correct = torch.minimum(raw_correct, cap_limit)
+        cap_trim_lens = (raw_correct - capped_correct).to(torch.int32)
+    else:
+        cap_trim_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+    candidate_bonus_pos = torch.clamp(capped_correct + 1, max=gamma)
+    accepted_bonus = candidates[row_ids, candidate_bonus_pos].to(torch.int64)
+    bonus = torch.where(capped_correct < raw_correct, accepted_bonus, final_token)
+    return capped_correct.to(torch.int32), bonus, cap_trim_lens
+
+
 def _assert_accept_sampling_reference(
     *,
     candidates: torch.Tensor,
@@ -205,7 +273,7 @@ class AcceptSampling:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _KERNEL_IMPL == "torch":
+        if _KERNEL_IMPL == "torch" or is_hip():
             return cls.torch(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -223,7 +291,7 @@ class AcceptSampling:
         positions_2d: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return accept_sampling(
+        return accept_sampling_torch(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -262,6 +330,34 @@ class AcceptSampling:
         )
 
 
+def _build_target_probs(
+    *,
+    target_logits: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    if (
+        not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
+    ):
+        return SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        ).view(bs, verify_num_draft_tokens, -1)
+    return build_dflash_verify_target_probs(
+        next_token_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_token_num=verify_num_draft_tokens,
+        bs=bs,
+        max_top_k=draft_input.max_top_k,
+        uniform_top_k_value=draft_input.uniform_top_k_value,
+    )
+
+
 def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
@@ -282,25 +378,13 @@ def _accept_sampling_core(
 ]:
     bs = candidates.shape[0]
     device = candidates.device
-    if (
-        not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
-        and not sampling_info.need_min_p_sampling
-    ):
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
-    else:
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits,
-            sampling_info=sampling_info,
-            draft_token_num=verify_num_draft_tokens,
-            bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
-        )
+    target_probs = _build_target_probs(
+        target_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        bs=bs,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+    )
     (
         retrieve_index,
         retrieve_next_token,
@@ -345,7 +429,7 @@ def _accept_sampling_core(
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
     debug_tensors = None
-    if envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get():
+    if _sampling_trace_assert_enabled():
         debug_tensors = (
             target_probs,
             uniform_samples,
@@ -353,6 +437,60 @@ def _accept_sampling_core(
             cutoff_verify_lens,
         )
     return correct_len, cap_trim_lens, accept_index, predicts, debug_tensors
+
+
+def accept_sampling_torch(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_probs: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    positions_2d: Optional[torch.Tensor] = None,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs = candidates.shape[0]
+    device = candidates.device
+    target_probs = _build_target_probs(
+        target_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        bs=bs,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+    )
+    uniform_samples, uniform_samples_final = _chain_uniform_samples(
+        sampling_info=sampling_info,
+        positions_2d=positions_2d,
+        bs=bs,
+        gamma=gamma,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        device=device,
+    )
+    correct_len, bonus, cap_trim_lens = _vectorized_chain_accept(
+        candidates=candidates,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
+        gamma=gamma,
+        cutoff_verify_lens=cutoff_verify_lens,
+    )
+    if _sampling_trace_assert_enabled():
+        _assert_accept_sampling_reference(
+            candidates=candidates,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=uniform_samples,
+            uniform_samples_final=uniform_samples_final,
+            gamma=gamma,
+            cutoff_verify_lens=cutoff_verify_lens,
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+        )
+    return correct_len, bonus, cap_trim_lens
 
 
 def accept_sampling(

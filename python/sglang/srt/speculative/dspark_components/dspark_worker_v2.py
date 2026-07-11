@@ -1,9 +1,11 @@
 import logging
+import os
 from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -19,10 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_correct_drafts_and_bonus,
-    verify_logits_adjustments_are_noop,
-)
+from sglang.srt.speculative.dflash_utils import verify_logits_adjustments_are_noop
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -93,13 +92,11 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     FinalizeAcceptLens,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
-
-_STS_COLLECT_FLUSH_EVERY: int = 256
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -167,6 +164,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark draft requires markov_rank > 0; got "
                 f"markov_rank={dspark_config.markov_rank}."
             )
+        capture_layer_ids = getattr(
+            self.model_runner, "dflash_or_dspark_target_layer_ids", None
+        )
+        num_context_features = getattr(self.draft_model, "num_context_features", None)
+        if capture_layer_ids is not None and num_context_features is not None:
+            expected_features = len(capture_layer_ids)
+            if int(num_context_features) != expected_features:
+                raise ValueError(
+                    "DSpark draft target-hidden feature count mismatch: draft "
+                    f"expects num_context_features={num_context_features}, but "
+                    f"target capture is configured for {expected_features} layers "
+                    f"({capture_layer_ids}). Ensure DSpark target_layer_ids are "
+                    "canonicalized before DFlash draft initialization."
+                )
         if server_args.speculative_num_draft_tokens is None:
             gamma = int(dspark_config.resolve_gamma(default=None) or 0)
             if gamma < 1:
@@ -312,6 +323,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._forced_budget_frac: Optional[float] = None
+        self._warned_dsa_compact_batch_fallback = False
 
         self._sps_recorder: Optional[SpsDataRecorder] = None
         if envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get():
@@ -417,6 +429,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        self._verify_planner.validate_attention_backend_support()
         with self._draft_context():
             self._draft_worker.init_attention_backends()
 
@@ -485,16 +498,40 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
-    def _recorder_verify_tokens(self, *, bs: int, verify_ids_2d) -> int:
-        forced_frac = self._forced_budget_frac
-        if (
-            forced_frac is None
-            or self._verify_planner.mode_value == RaggedVerifyMode.STATIC.value
-        ):
-            return int(verify_ids_2d.numel())
-        max_len = int(verify_ids_2d.shape[1])
-        budget = int(float(forced_frac) * bs * max_len)
-        return bs + min(budget, bs * (max_len - 1))
+    def _scheduled_verify_tokens(
+        self,
+        *,
+        layout: Optional[RaggedVerifyLayout],
+        fallback: int,
+        local_tier: int,
+        run_compact: bool,
+    ) -> int:
+        if layout is None or not run_compact:
+            return int(fallback)
+        if layout.total_verify_tokens is not None:
+            return int(layout.total_verify_tokens)
+        if local_tier >= 0:
+            return int(local_tier)
+        return int(layout.graph_num_tokens)
+
+    def _should_run_compact_target_verify(
+        self, *, batch: ScheduleBatch, layout: Optional[RaggedVerifyLayout]
+    ) -> bool:
+        if not self._verify_planner.should_run_compact(layout=layout):
+            return False
+        if batch.batch_size() <= 1:
+            return True
+        if str(getattr(self.server_args, "attention_backend", "")).lower() != "dsa":
+            return True
+        if self.tp_rank == 0 and not self._warned_dsa_compact_batch_fallback:
+            logger.warning(
+                "DSpark compact target verify is temporarily disabled for "
+                "multi-request batches on the DSA attention backend. Falling "
+                "back to non-compact target verify while preserving variable "
+                "verify lengths for accept/cap semantics."
+            )
+            self._warned_dsa_compact_batch_fallback = True
+        return False
 
     def dump_sps_records(self) -> Optional[dict]:
         if self._sps_recorder is None:
@@ -519,6 +556,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
+
+    def flush_sts_records(self) -> None:
+        flush_error = None
+        self._sync_sts_collect_ranks()
+        try:
+            if self._sts_recorder is not None:
+                self._sts_recorder.flush()
+        except Exception as exc:
+            flush_error = exc
+        finally:
+            self._sync_sts_collect_ranks()
+        if flush_error is not None:
+            raise flush_error
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         if self._block_accept_recorder is None:
@@ -754,6 +804,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
+        confidence_raw = proposal.confidence_raw
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
@@ -761,6 +812,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
+            confidence_raw = self._verify_planner.last_confidence_raw
 
         verify_token_budget = self._resolve_verify_token_budget(
             batch=batch,
@@ -785,7 +837,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+        run_compact = self._should_run_compact_target_verify(
+            batch=batch, layout=layout
+        )
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -796,8 +850,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._sps_recorder.observe_decode_step(
                 forward_ct=int(batch.forward_iter),
                 num_running_reqs=bs,
-                num_verify_tokens=self._recorder_verify_tokens(
-                    bs=bs, verify_ids_2d=verify_ids_2d
+                num_verify_tokens=self._scheduled_verify_tokens(
+                    layout=layout,
+                    fallback=int(verify_ids_2d.numel()),
+                    local_tier=int(batch.spec_verify_tier_num_tokens),
+                    run_compact=run_compact,
                 ),
                 verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
                 verify_tokens_dp_synced=(
@@ -805,7 +862,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 verify_tokens_graph_key=(
                     layout.graph_num_tokens
-                    if layout is not None
+                    if layout is not None and run_compact
                     else int(verify_ids_2d.numel())
                 ),
             )
@@ -821,8 +878,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
                     layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
+                    verify_ids_2d=verify_ids_2d,
+                    verify_window=verify_window,
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,
@@ -834,6 +891,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_input=draft_input,
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
+                    layout=layout,
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None
@@ -901,6 +959,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidates=verify_ids_2d,
             draft_tokens=draft_tokens,
             target_logits=logits_output.next_token_logits,
+            greedy_mask=draft_block.greedy_mask,
             correct_len=correct_len,
             bonus=bonus,
             cap_trim_lens=cap_trim_lens,
@@ -933,20 +992,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
-        if not proposal.folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
-            self._confidence_probe.maybe_observe(
-                carries_confidence=self._verify_planner.carries_confidence,
-                is_compact_mode=self._verify_planner.is_compact_mode,
-                confidence_raw=self._verify_planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
+        self._maybe_record_sts_collect(
+            num_correct_drafts=correct_len,
+            confidence_raw=confidence_raw,
+            all_rows_greedy=self._sts_all_rows_greedy(batch=batch),
+            rids=[req.rid for req in batch.reqs],
+        )
+        self._confidence_probe.maybe_observe(
+            carries_confidence=self._verify_planner.carries_confidence,
+            is_compact_mode=self._verify_planner.is_compact_mode,
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            bs=bs,
+        )
         self._decision_dumper.maybe_dump(
             forward_ct=batch.forward_iter,
             bs=bs,
@@ -1013,10 +1072,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     mode=self._verify_planner.mode_value,
                     budget=verify_token_budget,
                     lag_steps=self._verify_planner.lag_steps,
-                    num_verify_tokens=(
-                        layout.graph_num_tokens
-                        if layout is not None
-                        else int(verify_ids_2d.numel())
+                    num_verify_tokens=self._scheduled_verify_tokens(
+                        layout=layout,
+                        fallback=int(verify_ids_2d.numel()),
+                        local_tier=int(batch.spec_verify_tier_num_tokens),
+                        run_compact=run_compact,
                     ),
                     verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
                     verify_tokens_dp_synced=(
@@ -1024,11 +1084,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     verify_tokens_graph_key=(
                         layout.graph_num_tokens
-                        if layout is not None
+                        if layout is not None and run_compact
                         else int(verify_ids_2d.numel())
                     ),
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
+                    confidence_relay_stats=(
+                        self._verify_planner.last_confidence_relay_stats
+                    ),
                     verify_lens=layout.verify_lens if layout is not None else None,
                     confidence=confidence,
                     req_pool_indices=batch.req_pool_indices,
@@ -1077,35 +1140,69 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _maybe_record_sts_collect(
         self,
         *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: torch.Tensor,
-        bs: int,
+        num_correct_drafts: Optional[torch.Tensor] = None,
+        confidence_raw: Optional[torch.Tensor] = None,
+        all_rows_greedy: bool = True,
+        rids: Optional[list[str]] = None,
     ) -> None:
         collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         if not collect_path:
             return
+        if self.tp_rank != 0 and not self._sts_collect_needs_rank_sync():
+            return
+        if rids is not None and all(
+            str(rid).startswith(HEALTH_CHECK_RID_PREFIX) for rid in rids
+        ):
+            return
+        if not all_rows_greedy:
+            return
+        if self._verify_planner.is_compact_mode:
+            raise RuntimeError(
+                "DSpark STS collection (SGLANG_DSPARK_STS_COLLECT_PATH) is not "
+                "supported under SGLANG_RAGGED_VERIFY_MODE=compact because compact "
+                "verify layouts can corrupt per-position prefix labels. Collect "
+                "STS data with cap-accept or static mode."
+            )
         if not self._verify_planner.carries_confidence:
             return
-        confidence_raw = self._verify_planner.last_confidence_raw
         if confidence_raw is None:
-            return
-        if self._sts_recorder is None:
-            self._sts_recorder = StsDataRecorder(
-                path_stem=collect_path,
-                gamma=self.gamma,
-                flush_every=_STS_COLLECT_FLUSH_EVERY,
-            )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self.verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
-        self._sts_recorder.record(
-            confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
-        )
+            confidence_raw = self._verify_planner.last_confidence_raw
+        try:
+            if (
+                self.tp_rank == 0
+                and confidence_raw is not None
+                and num_correct_drafts is not None
+            ):
+                if self._sts_recorder is None:
+                    self._sts_recorder = StsDataRecorder(
+                        path_stem=collect_path,
+                        gamma=self.gamma,
+                        flush_every=max(
+                            1, int(envs.SGLANG_DSPARK_STS_FLUSH_EVERY.get())
+                        ),
+                        shard_tag=f"tp{self.tp_rank}-pid{os.getpid()}",
+                    )
+                self._sts_recorder.record(
+                    confidence_raw=confidence_raw,
+                    num_correct_drafts=num_correct_drafts,
+                )
+        finally:
+            self._sync_sts_collect_ranks()
+
+    def _sts_collect_needs_rank_sync(self) -> bool:
+        server_args = self.__dict__.get("server_args")
+        return int(getattr(server_args, "tp_size", 1)) > 1
+
+    def _sync_sts_collect_ranks(self) -> None:
+        if self._sts_collect_needs_rank_sync():
+            get_attention_tp_group().barrier()
+
+    @staticmethod
+    def _sts_all_rows_greedy(*, batch: ScheduleBatch) -> bool:
+        for req in batch.reqs:
+            if int(req.sampling_params.top_k) > 1:
+                return False
+        return True
 
     def _resolve_verify_token_budget(
         self,

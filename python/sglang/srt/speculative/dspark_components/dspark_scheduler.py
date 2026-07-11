@@ -65,28 +65,39 @@ def compute_verify_token_budget(
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
 ) -> VerifyBudgetDecision:
+    cfg.validate()
     num_requests = history_survival_probs.shape[0]
-    max_len = cfg.resolved_max_verify_len()
+    lower_bound, _start_col, _end_col, forced, selectable = (
+        _split_survival_by_verify_len_floor(
+            survival_probs=history_survival_probs,
+            cfg=cfg,
+        )
+    )
 
-    candidates = history_survival_probs[:, :max_len].flatten()
+    candidates = selectable.flatten()
     candidates = candidates[candidates >= cfg.survival_eps].to(torch.float64)
     candidates_sorted = torch.sort(candidates, descending=True).values
     prefix_sum = torch.cumsum(candidates_sorted, dim=0)
+    forced_gain = forced.to(torch.float64).sum()
 
-    tau_star = num_requests + torch.cat(
+    tau_star = num_requests + forced_gain + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+    base_batch_tokens = int(num_requests) * int(lower_bound)
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
             num_budgets=int(tau_star.numel()),
+            base_batch_tokens=base_batch_tokens,
         )
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
+        batch_tokens = base_batch_tokens + torch.arange(
+            tau_star.numel(), dtype=torch.int64
+        )
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
         idx = int(torch.argmax(theta))
@@ -110,14 +121,19 @@ def _lookup_sps_tensor(
 
 
 def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    num_budgets: int,
+    base_batch_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
     m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
     theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
+    base_batch_tokens = int(base_batch_tokens or num_requests)
+    m = (base_batch_tokens + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
@@ -126,6 +142,27 @@ def _additive_step_time_tensor(
     frac = (m - m_probes[lo]) / span
     theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
     return floor + theta_at_m
+
+
+def _split_survival_by_verify_len_floor(
+    *, survival_probs: torch.Tensor, cfg: DSparkScheduleConfig
+) -> tuple[int, int, int, torch.Tensor, torch.Tensor]:
+    """Split forced and budget-selectable draft survival columns.
+
+    ``verify_len`` counts the anchor plus a contiguous draft-token prefix. With
+    ``min_verify_len=1``, no draft token is forced and column 0 is the first
+    selectable draft token. With ``min_verify_len=2``, column 0 is already
+    forced and the budget starts at column 1.
+    """
+
+    lower_bound = max(int(cfg.min_verify_len), 1)
+    max_len = int(cfg.resolved_max_verify_len())
+    start_col = max(lower_bound - 1, 0)
+    end_col = min(max(max_len - 1, start_col), int(survival_probs.shape[1]))
+    forced_end = min(start_col, end_col)
+    forced = survival_probs[:, :forced_end]
+    selectable = survival_probs[:, start_col:end_col]
+    return lower_bound, start_col, end_col, forced, selectable
 
 
 class HostConfidenceBudgetPlanner:
@@ -152,8 +189,10 @@ class HostConfidenceBudgetPlanner:
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
         )
         self.carry_steps = max(self.lag_steps - int(relay_lag_steps), 0)
+        self.max_seq_lag_tokens = self.lag_steps * cfg.resolved_max_verify_len()
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
+        self._carry_seq_lens: Optional[torch.Tensor] = None
         self._carry_pos = 0
 
     def compute_budget(
@@ -162,21 +201,32 @@ class HostConfidenceBudgetPlanner:
         confidence: torch.Tensor,
         generation: torch.Tensor,
         current_generation: torch.Tensor,
+        seq_lens: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[torch.Tensor] = None,
         req_pool_indices_cpu: torch.Tensor,
     ) -> int:
-        lagged_confidence, lagged_generation = self._shift_to_lag(
+        lagged_confidence, lagged_generation, lagged_seq_lens = self._shift_to_lag(
             confidence=confidence,
             generation=generation,
+            seq_lens=seq_lens,
             req_pool_indices_cpu=req_pool_indices_cpu,
         )
         survival = self._two_steps_prior_survival(
             lagged_confidence=lagged_confidence,
             lagged_generation=lagged_generation,
             current_generation=current_generation,
+            lagged_seq_lens=lagged_seq_lens,
+            current_seq_lens=current_seq_lens,
         )
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
-            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            _lower_bound, _start_col, _end_col, _forced, selectable = (
+                _split_survival_by_verify_len_floor(
+                    survival_probs=survival,
+                    cfg=self.cfg,
+                )
+            )
+            full_budget = int(selectable.numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
@@ -186,16 +236,20 @@ class HostConfidenceBudgetPlanner:
             cfg=self.cfg,
         )
         self.last_decision = decision
-        if self._online_profiler is not None:
-            self._observe_online_step(
-                batch_tokens=int(survival.shape[0]) + decision.budget
-            )
         return decision.budget
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
         decision = self.last_decision
         self.last_decision = None
         return decision
+
+    def observe_budget_step(self, *, num_requests: int, budget: Optional[int]) -> None:
+        if self._online_profiler is None or budget is None:
+            return
+        lower_bound = max(int(self.cfg.min_verify_len), 1)
+        self._observe_online_step(
+            batch_tokens=int(num_requests) * lower_bound + int(budget)
+        )
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
@@ -223,19 +277,23 @@ class HostConfidenceBudgetPlanner:
         *,
         confidence: torch.Tensor,
         generation: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
         req_pool_indices_cpu: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if self.carry_steps == 0:
-            return confidence, generation
+            return confidence, generation, seq_lens
         self._ensure_carry(gamma=confidence.shape[-1])
         slot = self._carry_pos % self.carry_steps
         rows = req_pool_indices_cpu.to(torch.int64)
         lagged_confidence = self._carry_confidence[slot, rows].clone()
         lagged_generation = self._carry_generation[slot, rows].clone()
+        lagged_seq_lens = self._carry_seq_lens[slot, rows].clone()
         self._carry_confidence[slot, rows] = confidence.to(torch.float32)
         self._carry_generation[slot, rows] = generation.to(torch.int64)
+        if seq_lens is not None:
+            self._carry_seq_lens[slot, rows] = seq_lens.to(torch.int64)
         self._carry_pos += 1
-        return lagged_confidence, lagged_generation
+        return lagged_confidence, lagged_generation, lagged_seq_lens
 
     def _two_steps_prior_survival(
         self,
@@ -243,12 +301,23 @@ class HostConfidenceBudgetPlanner:
         lagged_confidence: torch.Tensor,
         lagged_generation: torch.Tensor,
         current_generation: torch.Tensor,
+        lagged_seq_lens: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         k_survival = torch.cumprod(lagged_confidence.to(torch.float32), dim=1)
         current_gen = current_generation.to(torch.int64)
         fresh = (
             (current_gen >= 1) & (lagged_generation.to(torch.int64) == current_gen)
-        ).view(-1, 1)
+        )
+        if lagged_seq_lens is not None and current_seq_lens is not None:
+            current_seq = current_seq_lens.to(torch.int64)
+            lagged_seq = lagged_seq_lens.to(torch.int64)
+            seq_delta = current_seq - lagged_seq
+            seq_fresh = (lagged_seq > 0) & (seq_delta >= 0) & (
+                seq_delta <= self.max_seq_lag_tokens
+            )
+            fresh = fresh & seq_fresh
+        fresh = fresh.view(-1, 1)
         return torch.where(fresh, k_survival, torch.ones_like(k_survival))
 
     def _ensure_carry(self, *, gamma: int) -> None:
@@ -259,6 +328,10 @@ class HostConfidenceBudgetPlanner:
             (self.carry_steps, req_pool_size, gamma), dtype=torch.float32
         )
         self._carry_generation = torch.zeros(
+            (self.carry_steps, req_pool_size),
+            dtype=torch.int64,
+        )
+        self._carry_seq_lens = torch.zeros(
             (self.carry_steps, req_pool_size),
             dtype=torch.int64,
         )
