@@ -4,12 +4,15 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.sampler import multinomial_with_seed
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
 from sglang.srt.speculative.dspark_components.kernels.sample_step_tokens import (
     SampleStepTokens,
 )
+from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -92,6 +95,74 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
+class _SamplingInfoTemperatureProxy:
+    def __init__(self, sampling_info, temperatures: torch.Tensor):
+        self._sampling_info = sampling_info
+        self.temperatures = temperatures
+
+    def __getattr__(self, name):
+        return getattr(self._sampling_info, name)
+
+
+def _clamped_temperatures(*, sampling_info, bs: int, device: torch.device):
+    if sampling_info is None:
+        return torch.ones(bs, dtype=torch.float32, device=device)
+    return sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+
+
+def _needs_filtered_sampling(sampling_info) -> bool:
+    if sampling_info is None:
+        return False
+    need_top_k = getattr(sampling_info, "need_top_k_sampling", None)
+    need_top_p = getattr(sampling_info, "need_top_p_sampling", None)
+    need_min_p = getattr(sampling_info, "need_min_p_sampling", None)
+    if need_top_k is not None or need_top_p is not None or need_min_p is not None:
+        return bool(need_top_k or need_top_p or need_min_p)
+
+    top_ks = getattr(sampling_info, "top_ks", None)
+    top_ps = getattr(sampling_info, "top_ps", None)
+    min_ps = getattr(sampling_info, "min_ps", None)
+    if top_ks is not None and bool(torch.any(top_ks != TOP_K_ALL).item()):
+        return True
+    if top_ps is not None and bool(torch.any(top_ps != 1.0).item()):
+        return True
+    if min_ps is not None and bool(torch.any(min_ps > 0.0).item()):
+        return True
+    return False
+
+
+def build_dspark_draft_probs(
+    *,
+    logits: torch.Tensor,
+    sampling_info,
+    rows_per_request: int,
+    bs: int,
+    max_top_k: int | None = None,
+    uniform_top_k_value: int | None = None,
+) -> torch.Tensor:
+    temperatures = _clamped_temperatures(
+        sampling_info=sampling_info, bs=bs, device=logits.device
+    )
+    if not _needs_filtered_sampling(sampling_info):
+        return SoftmaxTemp.execute(
+            logits=logits,
+            temperatures=temperatures,
+            rows_per_request=rows_per_request,
+        ).view(bs, rows_per_request, -1)
+
+    sampling_proxy = _SamplingInfoTemperatureProxy(
+        sampling_info, temperatures.view(bs, 1)
+    )
+    return build_dflash_verify_target_probs(
+        next_token_logits=logits,
+        sampling_info=sampling_proxy,
+        draft_token_num=rows_per_request,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+    )
+
+
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
@@ -110,9 +181,10 @@ def sample_draft_block(
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
     else:
-        temperatures = (
-            sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+        temperatures = _clamped_temperatures(
+            sampling_info=sampling_info, bs=bs, device=device
         )
+    filtered_sampling = _needs_filtered_sampling(sampling_info)
 
     if not any_sampling:
 
@@ -122,7 +194,11 @@ def sample_draft_block(
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            if fast_sampling and sampling_info.sampling_seed is None:
+            if (
+                fast_sampling
+                and sampling_info.sampling_seed is None
+                and not filtered_sampling
+            ):
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
@@ -133,9 +209,12 @@ def sample_draft_block(
                     exp_noise=exp_noise,
                 )
             else:
-                probs = torch.softmax(
-                    step_logits.float() / temperatures[:, None], dim=-1
-                )
+                probs = build_dspark_draft_probs(
+                    logits=step_logits,
+                    sampling_info=sampling_info,
+                    rows_per_request=1,
+                    bs=bs,
+                ).view(bs, -1)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 if sampling_info.sampling_seed is None:
                     sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(

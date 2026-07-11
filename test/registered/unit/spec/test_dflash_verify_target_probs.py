@@ -11,9 +11,14 @@ from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
     _reference_chain_accept,
     _vectorized_chain_accept,
 )
+from sglang.srt.speculative.dspark_components.dspark_accept import accept_draft_tokens
+from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
 from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
 from sglang.srt.speculative.dflash_utils import build_seeded_dflash_sampling_uniforms
-from sglang.srt.speculative.dspark_components.dspark_draft import sample_draft_block
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    build_dspark_draft_probs,
+    sample_draft_block,
+)
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -408,6 +413,158 @@ class TestDFlashVerifyTargetProbs(unittest.TestCase):
                 positions_2d=torch.tensor([[10, 11]], dtype=torch.int64),
                 draft_token_num=3,
             )
+
+    def test_dspark_draft_probs_apply_top_k_filter(self):
+        logits = torch.log(
+            torch.tensor(
+                [
+                    [0.50, 0.30, 0.19, 0.01],
+                    [0.40, 0.35, 0.20, 0.05],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        sampling_info = SimpleNamespace(
+            temperatures=torch.ones((1, 1), dtype=torch.float32),
+            top_ks=torch.tensor([2], dtype=torch.int32),
+            top_ps=torch.tensor([1.0], dtype=torch.float32),
+            min_ps=torch.tensor([0.0], dtype=torch.float32),
+            need_top_k_sampling=True,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+        )
+
+        probs = build_dspark_draft_probs(
+            logits=logits,
+            sampling_info=sampling_info,
+            rows_per_request=2,
+            bs=1,
+        )
+
+        expected = torch.tensor(
+            [
+                [
+                    [0.50 / 0.80, 0.30 / 0.80, 0.0, 0.0],
+                    [0.40 / 0.75, 0.35 / 0.75, 0.0, 0.0],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(probs, expected)
+
+    def test_dspark_draft_sampling_uses_filtered_probs(self):
+        device = torch.device("cpu")
+        base_logits = torch.log(
+            torch.tensor(
+                [
+                    [
+                        [0.50, 0.30, 0.19, 0.01],
+                        [0.40, 0.35, 0.20, 0.05],
+                    ]
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+        )
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            top_ks=torch.tensor([2], dtype=torch.int32, device=device),
+            top_ps=torch.tensor([1.0], dtype=torch.float32, device=device),
+            min_ps=torch.tensor([0.0], dtype=torch.float32, device=device),
+            temperatures=torch.ones((1, 1), dtype=torch.float32, device=device),
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+        )
+        captured_probs = []
+
+        def fake_multinomial(probs, num_samples):
+            captured_probs.append(probs.detach().clone())
+            return torch.zeros(
+                (probs.shape[0], num_samples), dtype=torch.int64, device=probs.device
+            )
+
+        with (
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_draft.envs."
+                "SGLANG_DSPARK_FAST_SAMPLING.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_draft.torch.multinomial",
+                side_effect=fake_multinomial,
+            ),
+        ):
+            result = sample_draft_block(
+                base_logits=base_logits,
+                anchor_tokens=torch.tensor([7], dtype=torch.int64, device=device),
+                draft_hidden=torch.zeros((1, 2, 1), dtype=torch.float32, device=device),
+                sampling_info=sampling_info,
+                markov_head=_FakeMarkovHead(),
+                device=device,
+            )
+
+        self.assertEqual(len(captured_probs), 2)
+        for probs in captured_probs:
+            torch.testing.assert_close(
+                probs[:, 2:], torch.zeros_like(probs[:, 2:])
+            )
+        torch.testing.assert_close(
+            result.draft_tokens, torch.zeros((1, 2), dtype=torch.int64)
+        )
+
+    def test_dspark_accept_uses_filtered_draft_probs(self):
+        logits = torch.log(
+            torch.tensor(
+                [[[0.50, 0.30, 0.19, 0.01], [0.40, 0.35, 0.20, 0.05]]],
+                dtype=torch.float32,
+            )
+        )
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            is_any_greedy=False,
+            top_ks=torch.tensor([2], dtype=torch.int32),
+            top_ps=torch.tensor([1.0], dtype=torch.float32),
+            min_ps=torch.tensor([0.0], dtype=torch.float32),
+            temperatures=torch.ones((1, 1), dtype=torch.float32),
+            need_top_k_sampling=True,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+        )
+        draft_block = DraftBlockResult(
+            draft_tokens=torch.tensor([[0, 1]], dtype=torch.int64),
+            corrected_logits=logits,
+            greedy_mask=torch.tensor([False]),
+            temperatures=torch.ones((1,), dtype=torch.float32),
+        )
+        captured = {}
+
+        def fake_accept_sampling_execute(**kwargs):
+            captured["draft_probs"] = kwargs["draft_probs"].detach().clone()
+            return (
+                torch.zeros((1,), dtype=torch.int32),
+                torch.zeros((1,), dtype=torch.int64),
+                torch.zeros((1,), dtype=torch.int32),
+            )
+
+        with patch.object(
+            AcceptSampling, "execute", side_effect=fake_accept_sampling_execute
+        ):
+            accept_draft_tokens(
+                candidates=torch.tensor([[9, 0, 1]], dtype=torch.int64),
+                target_logits=torch.zeros((3, 4), dtype=torch.float32),
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=SimpleNamespace(max_top_k=2, uniform_top_k_value=2),
+                gamma=2,
+                verify_num_draft_tokens=3,
+            )
+
+        torch.testing.assert_close(
+            captured["draft_probs"][:, :, 2:],
+            torch.zeros_like(captured["draft_probs"][:, :, 2:]),
+        )
 
     def test_seeded_draft_sampling_is_position_deterministic(self):
         if not torch.cuda.is_available():
