@@ -208,6 +208,13 @@ def test_dsa_ragged_metadata_key_uses_token_tier():
     ) == ("target_verify_ragged", 16)
 
 
+def test_dsa_ragged_graph_max_q_len_uses_static_width():
+    backend = object.__new__(RealDeepseekSparseAttnBackend)
+    backend.speculative_num_draft_tokens = 8
+
+    assert backend._ragged_verify_max_q_len_for_cuda_graph() == 8
+
+
 def test_dsa_ragged_metadata_padding_caps_each_row():
     backend = object.__new__(RealDeepseekSparseAttnBackend)
     backend.device = torch.device("cpu")

@@ -355,6 +355,8 @@ class DsparkInfoDumper:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
             )
+            if InfoComponent.CORE in self._components:
+                record.num_verify_tokens = sum(req.verify_len for req in record.reqs)
         elif pending.future is not None:
             pending.future.wait()
 

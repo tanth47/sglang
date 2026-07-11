@@ -92,7 +92,7 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     FinalizeAcceptLens,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -323,6 +323,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._forced_budget_frac: Optional[float] = None
+        self._warned_dsa_compact_batch_fallback = False
 
         self._sps_recorder: Optional[SpsDataRecorder] = None
         if envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get():
@@ -497,16 +498,40 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
-    def _recorder_verify_tokens(self, *, bs: int, verify_ids_2d) -> int:
-        forced_frac = self._forced_budget_frac
-        if (
-            forced_frac is None
-            or self._verify_planner.mode_value == RaggedVerifyMode.STATIC.value
-        ):
-            return int(verify_ids_2d.numel())
-        max_len = int(verify_ids_2d.shape[1])
-        budget = int(float(forced_frac) * bs * (max_len - 1))
-        return bs + min(budget, bs * (max_len - 1))
+    def _scheduled_verify_tokens(
+        self,
+        *,
+        layout: Optional[RaggedVerifyLayout],
+        fallback: int,
+        local_tier: int,
+        run_compact: bool,
+    ) -> int:
+        if layout is None or not run_compact:
+            return int(fallback)
+        if layout.total_verify_tokens is not None:
+            return int(layout.total_verify_tokens)
+        if local_tier >= 0:
+            return int(local_tier)
+        return int(layout.graph_num_tokens)
+
+    def _should_run_compact_target_verify(
+        self, *, batch: ScheduleBatch, layout: Optional[RaggedVerifyLayout]
+    ) -> bool:
+        if not self._verify_planner.should_run_compact(layout=layout):
+            return False
+        if batch.batch_size() <= 1:
+            return True
+        if str(getattr(self.server_args, "attention_backend", "")).lower() != "dsa":
+            return True
+        if self.tp_rank == 0 and not self._warned_dsa_compact_batch_fallback:
+            logger.warning(
+                "DSpark compact target verify is temporarily disabled for "
+                "multi-request batches on the DSA attention backend. Falling "
+                "back to non-compact target verify while preserving variable "
+                "verify lengths for accept/cap semantics."
+            )
+            self._warned_dsa_compact_batch_fallback = True
+        return False
 
     def dump_sps_records(self) -> Optional[dict]:
         if self._sps_recorder is None:
@@ -812,7 +837,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+        run_compact = self._should_run_compact_target_verify(
+            batch=batch, layout=layout
+        )
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -823,8 +850,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._sps_recorder.observe_decode_step(
                 forward_ct=int(batch.forward_iter),
                 num_running_reqs=bs,
-                num_verify_tokens=self._recorder_verify_tokens(
-                    bs=bs, verify_ids_2d=verify_ids_2d
+                num_verify_tokens=self._scheduled_verify_tokens(
+                    layout=layout,
+                    fallback=int(verify_ids_2d.numel()),
+                    local_tier=int(batch.spec_verify_tier_num_tokens),
+                    run_compact=run_compact,
                 ),
                 verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
                 verify_tokens_dp_synced=(
@@ -832,7 +862,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 verify_tokens_graph_key=(
                     layout.graph_num_tokens
-                    if layout is not None
+                    if layout is not None and run_compact
                     else int(verify_ids_2d.numel())
                 ),
             )
@@ -1042,10 +1072,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     mode=self._verify_planner.mode_value,
                     budget=verify_token_budget,
                     lag_steps=self._verify_planner.lag_steps,
-                    num_verify_tokens=(
-                        layout.graph_num_tokens
-                        if layout is not None
-                        else int(verify_ids_2d.numel())
+                    num_verify_tokens=self._scheduled_verify_tokens(
+                        layout=layout,
+                        fallback=int(verify_ids_2d.numel()),
+                        local_tier=int(batch.spec_verify_tier_num_tokens),
+                        run_compact=run_compact,
                     ),
                     verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
                     verify_tokens_dp_synced=(
@@ -1053,7 +1084,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                     verify_tokens_graph_key=(
                         layout.graph_num_tokens
-                        if layout is not None
+                        if layout is not None and run_compact
                         else int(verify_ids_2d.numel())
                     ),
                     predicted_step_ms=predicted_step_ms,

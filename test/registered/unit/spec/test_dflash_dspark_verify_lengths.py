@@ -23,6 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_target_verify import (
     TargetVerifyExecutor,
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     create_dummy_verify_input,
@@ -130,6 +131,92 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 worker._maybe_record_sts_collect(
                     num_correct_drafts=torch.tensor([0], dtype=torch.int32),
                 )
+
+    def test_dspark_scheduled_verify_tokens_use_layout_total_before_graph_key(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[3, 3],
+            device=torch.device("cpu"),
+            grid=[16],
+            num_draft_tokens=8,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=True,
+            ),
+            6,
+        )
+
+    def test_dspark_scheduled_verify_tokens_fall_back_to_local_tier(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([3, 3], dtype=torch.int32),
+            graph_num_tokens=16,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=True,
+            ),
+            6,
+        )
+
+    def test_dspark_scheduled_verify_tokens_use_fallback_without_compact(self):
+        worker = object.__new__(DSparkWorkerV2)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[3, 3],
+            device=torch.device("cpu"),
+            grid=[16],
+            num_draft_tokens=8,
+        )
+
+        self.assertEqual(
+            worker._scheduled_verify_tokens(
+                layout=layout,
+                fallback=16,
+                local_tier=6,
+                run_compact=False,
+            ),
+            16,
+        )
+
+    def test_dspark_dsa_multi_request_compact_verify_falls_back(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        self.assertFalse(
+            worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_dsa_single_request_keeps_compact_verify(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 1)
+
+        self.assertTrue(
+            worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        )
 
     def test_dspark_sts_collection_writes_static_shard(self):
         worker = object.__new__(DSparkWorkerV2)

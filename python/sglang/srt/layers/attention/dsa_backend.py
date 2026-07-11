@@ -1154,6 +1154,9 @@ class DeepseekSparseAttnBackend(
             max_verify_len=verify_width,
         )
 
+    def _ragged_verify_max_q_len_for_cuda_graph(self) -> int:
+        return int(self.speculative_num_draft_tokens)
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -1227,14 +1230,11 @@ class DeepseekSparseAttnBackend(
                     dtype=torch.int32,
                     device=self.device,
                 )
-                max_verify_len = (
-                    int(extend_seq_lens.max().item()) if extend_seq_lens.numel() else 1
-                )
                 seqlens_expanded = seqlens_expand_triton(
                     extend_seq_lens,
                     cache_seqlens_int32,
                     total_verify_tokens,
-                    max(max_verify_len, 1),
+                    self._ragged_verify_max_q_len_for_cuda_graph(),
                 )
                 dsa_cache_seqlens_int32 = compute_dsa_seqlens(
                     seqlens_expanded, dsa_index_topk=self.dsa_index_topk
@@ -1488,14 +1488,11 @@ class DeepseekSparseAttnBackend(
                     page_indices, repeats=extend_seq_lens, dim=0
                 )
                 metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-                max_verify_len = (
-                    int(extend_seq_lens.max().item()) if extend_seq_lens.numel() else 1
-                )
                 seqlens_expanded = seqlens_expand_triton(
                     extend_seq_lens,
                     cache_seqlens,
                     total_verify_tokens,
-                    max(max_verify_len, 1),
+                    self._ragged_verify_max_q_len_for_cuda_graph(),
                 )
             else:
                 cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
