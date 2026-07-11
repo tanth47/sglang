@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from typing import Optional
 
@@ -508,7 +509,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return int(verify_ids_2d.numel())
         max_len = int(verify_ids_2d.shape[1])
-        budget = int(float(forced_frac) * bs * max_len)
+        budget = int(float(forced_frac) * bs * (max_len - 1))
         return bs + min(budget, bs * (max_len - 1))
 
     def dump_sps_records(self) -> Optional[dict]:
@@ -1121,6 +1122,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 path_stem=collect_path,
                 gamma=self.gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
+                shard_tag=f"tp{self.tp_rank}-pid{os.getpid()}",
             )
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self.verify_num_draft_tokens

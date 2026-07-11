@@ -19,6 +19,9 @@ def _server_args():
     return types.SimpleNamespace(
         speculative_dspark_align_verify_tokens_to_graph_tier=False,
         speculative_dspark_confidence_sts_path=None,
+        speculative_dspark_min_verify_len=None,
+        speculative_dspark_max_verify_len=None,
+        speculative_dspark_survival_eps=1e-6,
     )
 
 
@@ -47,6 +50,26 @@ class TestDSparkVerifyPlanner(CustomTestCase):
 
         self.assertEqual(planner.mode_value, "static")
         self.assertFalse(planner.schedules_verify_budget)
+
+    def test_server_args_configure_schedule_knobs(self):
+        server_args = _server_args()
+        server_args.speculative_dspark_min_verify_len = 2
+        server_args.speculative_dspark_max_verify_len = 5
+        server_args.speculative_dspark_survival_eps = 0.05
+        with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}):
+            planner = DSparkVerifyPlanner(
+                draft_model=_draft_model(with_confidence_head=False),
+                gamma=7,
+                model_runner=types.SimpleNamespace(),
+                device=torch.device("cpu"),
+                tp_rank=0,
+                server_args=server_args,
+                verify_num_draft_tokens=8,
+            )
+
+        self.assertEqual(planner._schedule_cfg.min_verify_len, 2)
+        self.assertEqual(planner._schedule_cfg.max_verify_len, 5)
+        self.assertEqual(planner._schedule_cfg.survival_eps, 0.05)
 
     def test_compact_mode_rejects_backend_without_ragged_verify_graph_support(self):
         with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}):

@@ -40,6 +40,7 @@ class TestConfidenceRelayStats(CustomTestCase):
         relay.scatter(
             torch.tensor([0, 2], dtype=torch.int64),
             torch.tensor([[0.9, 0.8], [0.7, 0.6]], dtype=torch.float32),
+            seq_lens=torch.tensor([11, 17], dtype=torch.int64),
         )
         resolved = relay.resolve(self._batch(), stream=None, publish_ready=None)
 
@@ -52,11 +53,31 @@ class TestConfidenceRelayStats(CustomTestCase):
             resolved.generation,
             torch.tensor([0, 2], dtype=torch.int64),
         )
+        torch.testing.assert_close(
+            resolved.seq_lens,
+            torch.tensor([11, 17], dtype=torch.int64),
+        )
         stats = relay.snapshot_stats()
         self.assertEqual(stats.attempts, 2)
         self.assertEqual(stats.hits, 1)
         self.assertEqual(stats.misses, 1)
         self.assertEqual(stats.last_status, "direct")
+
+    def test_resolve_omits_seq_lens_when_not_published(self):
+        pool = types.SimpleNamespace(req_generation=torch.arange(4, dtype=torch.int64))
+        relay = ConfidenceRelay(
+            device=torch.device("cpu"),
+            req_pool_size=4,
+            pool=pool,
+        )
+        relay.scatter(
+            torch.tensor([0, 2], dtype=torch.int64),
+            torch.tensor([[0.9, 0.8], [0.7, 0.6]], dtype=torch.float32),
+        )
+        resolved = relay.resolve(self._batch(), stream=None, publish_ready=None)
+
+        self.assertIsNotNone(resolved)
+        self.assertIsNone(resolved.seq_lens)
 
 
 if __name__ == "__main__":

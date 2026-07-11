@@ -189,8 +189,10 @@ class HostConfidenceBudgetPlanner:
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
         )
         self.carry_steps = max(self.lag_steps - int(relay_lag_steps), 0)
+        self.max_seq_lag_tokens = self.lag_steps * cfg.resolved_max_verify_len()
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
+        self._carry_seq_lens: Optional[torch.Tensor] = None
         self._carry_pos = 0
 
     def compute_budget(
@@ -199,17 +201,22 @@ class HostConfidenceBudgetPlanner:
         confidence: torch.Tensor,
         generation: torch.Tensor,
         current_generation: torch.Tensor,
+        seq_lens: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[torch.Tensor] = None,
         req_pool_indices_cpu: torch.Tensor,
     ) -> int:
-        lagged_confidence, lagged_generation = self._shift_to_lag(
+        lagged_confidence, lagged_generation, lagged_seq_lens = self._shift_to_lag(
             confidence=confidence,
             generation=generation,
+            seq_lens=seq_lens,
             req_pool_indices_cpu=req_pool_indices_cpu,
         )
         survival = self._two_steps_prior_survival(
             lagged_confidence=lagged_confidence,
             lagged_generation=lagged_generation,
             current_generation=current_generation,
+            lagged_seq_lens=lagged_seq_lens,
+            current_seq_lens=current_seq_lens,
         )
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
@@ -270,19 +277,23 @@ class HostConfidenceBudgetPlanner:
         *,
         confidence: torch.Tensor,
         generation: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
         req_pool_indices_cpu: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if self.carry_steps == 0:
-            return confidence, generation
+            return confidence, generation, seq_lens
         self._ensure_carry(gamma=confidence.shape[-1])
         slot = self._carry_pos % self.carry_steps
         rows = req_pool_indices_cpu.to(torch.int64)
         lagged_confidence = self._carry_confidence[slot, rows].clone()
         lagged_generation = self._carry_generation[slot, rows].clone()
+        lagged_seq_lens = self._carry_seq_lens[slot, rows].clone()
         self._carry_confidence[slot, rows] = confidence.to(torch.float32)
         self._carry_generation[slot, rows] = generation.to(torch.int64)
+        if seq_lens is not None:
+            self._carry_seq_lens[slot, rows] = seq_lens.to(torch.int64)
         self._carry_pos += 1
-        return lagged_confidence, lagged_generation
+        return lagged_confidence, lagged_generation, lagged_seq_lens
 
     def _two_steps_prior_survival(
         self,
@@ -290,12 +301,23 @@ class HostConfidenceBudgetPlanner:
         lagged_confidence: torch.Tensor,
         lagged_generation: torch.Tensor,
         current_generation: torch.Tensor,
+        lagged_seq_lens: Optional[torch.Tensor] = None,
+        current_seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         k_survival = torch.cumprod(lagged_confidence.to(torch.float32), dim=1)
         current_gen = current_generation.to(torch.int64)
         fresh = (
             (current_gen >= 1) & (lagged_generation.to(torch.int64) == current_gen)
-        ).view(-1, 1)
+        )
+        if lagged_seq_lens is not None and current_seq_lens is not None:
+            current_seq = current_seq_lens.to(torch.int64)
+            lagged_seq = lagged_seq_lens.to(torch.int64)
+            seq_delta = current_seq - lagged_seq
+            seq_fresh = (lagged_seq > 0) & (seq_delta >= 0) & (
+                seq_delta <= self.max_seq_lag_tokens
+            )
+            fresh = fresh & seq_fresh
+        fresh = fresh.view(-1, 1)
         return torch.where(fresh, k_survival, torch.ones_like(k_survival))
 
     def _ensure_carry(self, *, gamma: int) -> None:
@@ -306,6 +328,10 @@ class HostConfidenceBudgetPlanner:
             (self.carry_steps, req_pool_size, gamma), dtype=torch.float32
         )
         self._carry_generation = torch.zeros(
+            (self.carry_steps, req_pool_size),
+            dtype=torch.int64,
+        )
+        self._carry_seq_lens = torch.zeros(
             (self.carry_steps, req_pool_size),
             dtype=torch.int64,
         )

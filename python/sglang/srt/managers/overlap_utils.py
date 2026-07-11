@@ -123,6 +123,7 @@ class ResolvedConfidence(msgspec.Struct):
 
     confidence: torch.Tensor
     generation: torch.Tensor
+    seq_lens: Optional[torch.Tensor] = None
 
 
 class ConfidenceRelayStats(msgspec.Struct):
@@ -163,7 +164,11 @@ class ConfidenceRelay(msgspec.Struct):
     req_pool_size: int
     pool: Any
     confidence_buf: Optional[torch.Tensor] = None
+    seq_lens_buf: Optional[torch.Tensor] = None
+    seq_lens_valid_buf: Optional[torch.Tensor] = None
     conf_ring: Optional[torch.Tensor] = None
+    seq_lens_ring: Optional[torch.Tensor] = None
+    seq_lens_valid_ring: Optional[torch.Tensor] = None
     gen_ring: Optional[torch.Tensor] = None
     copy_done: Optional[list] = None
     ring_pos: int = 0
@@ -179,6 +184,12 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
+        self.seq_lens_buf = torch.zeros(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
+        self.seq_lens_valid_buf = torch.zeros(
+            (self.req_pool_size,), dtype=torch.bool, device=self.device
+        )
         if _is_cuda:
             depth = CONFIDENCE_RELAY_RING_DEPTH
             self.conf_ring = torch.empty(
@@ -186,15 +197,31 @@ class ConfidenceRelay(msgspec.Struct):
                 dtype=torch.float32,
                 pin_memory=True,
             )
+            self.seq_lens_ring = torch.zeros(
+                (depth, self.req_pool_size), dtype=torch.int64, pin_memory=True
+            )
+            self.seq_lens_valid_ring = torch.zeros(
+                (depth, self.req_pool_size), dtype=torch.bool, pin_memory=True
+            )
             self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
             self.copy_done = [
                 torch.get_device_module(self.device).Event() for _ in range(depth)
             ]
 
-    def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
+    def scatter(
+        self,
+        indices: torch.Tensor,
+        confidence: torch.Tensor,
+        seq_lens: Optional[torch.Tensor] = None,
+    ) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
+        if seq_lens is not None:
+            self.seq_lens_buf[indices] = seq_lens.to(self.seq_lens_buf.dtype)
+            self.seq_lens_valid_buf[indices] = True
+        else:
+            self.seq_lens_valid_buf[indices] = False
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
         if not self.initialized or stream is None or publish_ready is None:
@@ -203,6 +230,10 @@ class ConfidenceRelay(msgspec.Struct):
         stream.wait_event(publish_ready)
         with torch.get_device_module(self.device).stream(stream):
             self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
+            self.seq_lens_ring[slot].copy_(self.seq_lens_buf, non_blocking=True)
+            self.seq_lens_valid_ring[slot].copy_(
+                self.seq_lens_valid_buf, non_blocking=True
+            )
             self.copy_done[slot].record()
         self.gen_ring[slot].copy_(self.pool.req_generation)
         self.ring_pos += 1
@@ -243,9 +274,15 @@ class ConfidenceRelay(msgspec.Struct):
             idx = batch.req_pool_indices
             idx_cpu = batch.req_pool_indices_cpu
             self._record_resolve(status="direct", hit=True)
+            seq_lens = None
+            if self.seq_lens_buf is not None and self.seq_lens_valid_buf is not None:
+                valid = self.seq_lens_valid_buf[idx].cpu()
+                if bool(torch.all(valid).item()):
+                    seq_lens = self.seq_lens_buf[idx].cpu()
             return ResolvedConfidence(
                 confidence=self.confidence_buf[idx].cpu(),
                 generation=self.pool.req_generation[idx_cpu].clone(),
+                seq_lens=seq_lens,
             )
 
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
@@ -258,9 +295,15 @@ class ConfidenceRelay(msgspec.Struct):
 
         idx_cpu = batch.req_pool_indices_cpu
         self._record_resolve(status="ring", hit=True)
+        seq_lens = None
+        if self.seq_lens_ring is not None and self.seq_lens_valid_ring is not None:
+            valid = self.seq_lens_valid_ring[slot][idx_cpu]
+            if bool(torch.all(valid).item()):
+                seq_lens = self.seq_lens_ring[slot][idx_cpu]
         return ResolvedConfidence(
             confidence=self.conf_ring[slot][idx_cpu],
             generation=self.gen_ring[slot][idx_cpu],
+            seq_lens=seq_lens,
         )
 
 
@@ -478,10 +521,11 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        del confidence_seq_lens
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
-            self.confidence_relay.scatter(indices, confidence)
+            self.confidence_relay.scatter(
+                indices, confidence, seq_lens=confidence_seq_lens
+            )
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
             if self.publish_ready is None:

@@ -127,7 +127,20 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma,
+            min_verify_len=(
+                1
+                if server_args.speculative_dspark_min_verify_len is None
+                else int(server_args.speculative_dspark_min_verify_len)
+            ),
+            max_verify_len=(
+                0
+                if server_args.speculative_dspark_max_verify_len is None
+                else int(server_args.speculative_dspark_max_verify_len)
+            ),
+            survival_eps=float(server_args.speculative_dspark_survival_eps),
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._last_confidence_relay_stats: Optional[ConfidenceRelayStats] = None
         self._dynamic_graph_tier = False
@@ -377,7 +390,9 @@ class DSparkVerifyPlanner:
         resolved = future_map.resolve_confidence_cpu(batch)
         self._last_confidence_relay_stats = future_map.confidence_relay_stats()
         draft_input.verify_token_budget = self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            current_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
@@ -432,9 +447,12 @@ class DSparkVerifyPlanner:
         resolved = ResolvedConfidence(
             confidence=confidence.to("cpu"),
             generation=generation,
+            seq_lens=prefix_lens.to("cpu"),
         )
         return self._budget_from_resolved(
-            resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
+            resolved=resolved,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            current_seq_lens_cpu=prefix_lens.to("cpu"),
         )
 
     def _budget_from_resolved(
@@ -442,6 +460,7 @@ class DSparkVerifyPlanner:
         *,
         resolved: Optional[ResolvedConfidence],
         req_pool_indices_cpu: torch.Tensor,
+        current_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> Optional[int]:
         if resolved is None:
             self._budget_planner.note_non_decode_step()
@@ -454,6 +473,8 @@ class DSparkVerifyPlanner:
                 confidence=resolved.confidence,
                 generation=resolved.generation,
                 current_generation=current_generation,
+                seq_lens=resolved.seq_lens,
+                current_seq_lens=current_seq_lens_cpu,
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
         )

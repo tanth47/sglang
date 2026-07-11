@@ -327,6 +327,37 @@ class TestOnlineSpsObservation(CustomTestCase):
         planner.note_non_decode_step()
         self.assertEqual(profiler.note_non_decode_calls, 1)
 
+    def test_seq_lens_freshness_filters_stale_confidence(self):
+        planner = self._planner_with_profiler(_RecordingOnlineProfiler())
+        lagged_confidence = torch.tensor([[0.5, 0.25, 0.25, 0.25]])
+        lagged_generation = torch.ones(1, dtype=torch.int64)
+        current_generation = torch.ones(1, dtype=torch.int64)
+
+        fresh = planner._two_steps_prior_survival(
+            lagged_confidence=lagged_confidence,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+            lagged_seq_lens=torch.tensor([10], dtype=torch.int64),
+            current_seq_lens=torch.tensor(
+                [10 + planner.max_seq_lag_tokens], dtype=torch.int64
+            ),
+        )
+        torch.testing.assert_close(
+            fresh,
+            torch.cumprod(lagged_confidence, dim=1),
+        )
+
+        stale = planner._two_steps_prior_survival(
+            lagged_confidence=lagged_confidence,
+            lagged_generation=lagged_generation,
+            current_generation=current_generation,
+            lagged_seq_lens=torch.tensor([10], dtype=torch.int64),
+            current_seq_lens=torch.tensor(
+                [11 + planner.max_seq_lag_tokens], dtype=torch.int64
+            ),
+        )
+        torch.testing.assert_close(stale, torch.ones_like(lagged_confidence))
+
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
     @_for_each_impl

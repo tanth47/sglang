@@ -1542,6 +1542,25 @@ class ServerArgs:
         "scheduler consumes. Omit to use identity (no calibration); losslessness is "
         "unaffected either way.",
     ] = None
+    speculative_dspark_min_verify_len: A[
+        Optional[int],
+        "DSPARK ragged-verify scheduler only. Minimum verify window length per "
+        "request, including the anchor token. Defaults to 1. Raising this forces "
+        "more draft tokens to be verified for every request before the confidence "
+        "top-k budget is applied.",
+    ] = None
+    speculative_dspark_max_verify_len: A[
+        Optional[int],
+        "DSPARK ragged-verify scheduler only. Maximum verify window length per "
+        "request, including the anchor token. Defaults to gamma + 1. Lowering this "
+        "is useful for MI350 perf sweeps when long-tail low-confidence positions "
+        "hurt throughput more than they help acceptance length.",
+    ] = None
+    speculative_dspark_survival_eps: A[
+        float,
+        "DSPARK ragged-verify scheduler only. Minimum survival probability for a "
+        "draft position to be selectable by confidence top-k scheduling.",
+    ] = 1e-6
     speculative_dspark_align_verify_tokens_to_graph_tier: A[
         bool,
         "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "

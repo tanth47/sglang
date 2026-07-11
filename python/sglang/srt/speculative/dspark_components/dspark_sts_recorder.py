@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 
 
 class StsDataRecorder:
-    def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
+    def __init__(
+        self,
+        *,
+        path_stem: str,
+        gamma: int,
+        flush_every: int,
+        shard_tag: Optional[str] = None,
+    ) -> None:
         self.path_stem = path_stem
         self.gamma = int(gamma)
         self.flush_every = int(flush_every)
+        self.shard_tag = shard_tag
         self._logits_buffer: list[torch.Tensor] = []
         self._prefix_mask_buffer: list[torch.Tensor] = []
         self._shard_ct = 0
@@ -31,7 +40,12 @@ class StsDataRecorder:
     def flush(self) -> None:
         if not self._logits_buffer:
             return
-        shard_path = Path(f"{self.path_stem}.{self._shard_ct}.pt")
+        suffix = (
+            f".{self._shard_ct}.pt"
+            if self.shard_tag is None
+            else f".{self.shard_tag}.{self._shard_ct}.pt"
+        )
+        shard_path = Path(f"{self.path_stem}{suffix}")
         shard_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
