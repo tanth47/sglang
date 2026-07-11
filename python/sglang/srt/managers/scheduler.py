@@ -3769,6 +3769,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "dspark_flush_sts_records",
             ]
         )
 
@@ -3810,6 +3811,15 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "dspark_flush_sts_records":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "flush_sts_records"
+                ):
+                    logging.warning(
+                        "dspark_flush_sts_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -3833,6 +3843,10 @@ class Scheduler(
                 if k == "dspark_clear_info_records":
                     if v:
                         self.draft_worker.clear_info_records()
+                    continue
+                if k == "dspark_flush_sts_records":
+                    if v:
+                        self.draft_worker.flush_sts_records()
                     continue
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")

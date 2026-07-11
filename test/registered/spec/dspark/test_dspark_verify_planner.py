@@ -32,6 +32,36 @@ def _draft_model(*, with_confidence_head=True):
 
 
 class TestDSparkVerifyPlanner(CustomTestCase):
+    def test_compute_confidence_hook_without_raw_out_fills_buffer_from_stash(self):
+        gamma = 3
+        raw = torch.tensor([[0.1, 0.2, 0.3], [1.1, 1.2, 1.3]])
+        head = types.SimpleNamespace(_last_confidence_raw=None)
+
+        class LegacyHookDraftModel:
+            confidence_head = head
+
+            def compute_confidence(self, *, anchor_tokens, sampled_tokens, x_post_hc):
+                del anchor_tokens, sampled_tokens, x_post_hc
+                head._last_confidence_raw = raw
+                return torch.sigmoid(raw)
+
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner.draft_model = LegacyHookDraftModel()
+        planner._confidence_head = head
+        planner.gamma = gamma
+        raw_out = torch.empty_like(raw)
+
+        confidence = planner.compute_confidence_tensor(
+            draft_hidden=None,
+            anchor_tokens=torch.tensor([10, 20]),
+            draft_tokens=torch.tensor([[11, 12, 13], [21, 22, 23]]),
+            confidence_tap=torch.empty(2, gamma, 4),
+            raw_out=raw_out,
+        )
+
+        torch.testing.assert_close(confidence, torch.sigmoid(raw))
+        torch.testing.assert_close(raw_out, raw)
+
     def test_static_mode_allows_backend_without_ragged_verify_graph_support(self):
         with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}):
             planner = DSparkVerifyPlanner(

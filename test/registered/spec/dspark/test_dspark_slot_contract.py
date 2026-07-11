@@ -99,6 +99,53 @@ class TestDSparkSlotContract(CustomTestCase):
             expected_tokens,
         )
 
+    def test_folded_sampler_exports_raw_confidence_when_supported(self):
+        gamma = 3
+        bs = 2
+        hidden_size = 4
+        model = _RecordingDraftModel(gamma=gamma, vocab_size=16)
+        expected_raw = torch.tensor(
+            [[0.25, 0.5, 0.75], [1.25, 1.5, 1.75]], dtype=torch.float32
+        )
+
+        def confidence_fn(
+            *,
+            draft_hidden,
+            anchor_tokens,
+            draft_tokens,
+            confidence_tap=None,
+            raw_out=None,
+        ):
+            del draft_hidden, anchor_tokens, draft_tokens, confidence_tap
+            self.assertIsNotNone(raw_out)
+            raw_out.copy_(expected_raw)
+            return torch.sigmoid(expected_raw)
+
+        sampler = DsparkDraftSampler(
+            model=model,
+            gamma=gamma,
+            max_bs=bs,
+            device=torch.device("cpu"),
+            confidence_fn=confidence_fn,
+        )
+        hidden_3d = torch.arange(
+            bs * (gamma + 1) * hidden_size, dtype=torch.float32
+        ).view(bs, gamma + 1, hidden_size)
+        ids_2d = torch.tensor(
+            [
+                [100, 11, 12, 13],
+                [200, 21, 22, 23],
+            ],
+            dtype=torch.int64,
+        )
+
+        sampler(hidden_3d.reshape(bs * (gamma + 1), hidden_size), ids_2d.reshape(-1))
+
+        torch.testing.assert_close(sampler.confidence_raw_out[:bs], expected_raw)
+        torch.testing.assert_close(
+            sampler.confidence_out[:bs], torch.sigmoid(expected_raw)
+        )
+
     def test_greedy_accept_compares_draft_slots_and_finalize_commits_bonus(self):
         candidates = torch.tensor(
             [

@@ -760,6 +760,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         anchor_tokens: torch.Tensor,
         sampled_tokens: torch.Tensor,
         x_post_hc: torch.Tensor,
+        raw_out: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         confidence_head = self.confidence_head
         if confidence_head is None:
@@ -774,6 +775,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         else:
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
+        if raw_out is not None:
+            raw_out[: confidence_raw.shape[0], : confidence_raw.shape[1]].copy_(
+                confidence_raw.to(dtype=raw_out.dtype)
+            )
         confidence = confidence_head.apply_sts(confidence_raw)
         maybe_detect_in_closed_range(
             confidence, 0.0, 1.0, "DSpark confidence must lie in [0, 1]."

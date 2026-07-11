@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import torch
 
 from sglang.srt.environ import envs
@@ -13,6 +15,17 @@ from sglang.srt.speculative.dspark_components.kernels.sample_step_tokens import 
     SampleStepTokens,
 )
 from sglang.srt.speculative.dspark_components.kernels.softmax_temp import SoftmaxTemp
+
+
+def _callable_accepts_raw_out(fn) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "raw_out" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -37,6 +50,14 @@ class DsparkDraftSampler:
         self.confidence_out = (
             torch.empty((int(max_bs), self.gamma), dtype=torch.float32, device=device)
             if confidence_fn is not None
+            else None
+        )
+        self._confidence_fn_accepts_raw_out = (
+            confidence_fn is not None and _callable_accepts_raw_out(confidence_fn)
+        )
+        self.confidence_raw_out = (
+            torch.empty((int(max_bs), self.gamma), dtype=torch.float32, device=device)
+            if self._confidence_fn_accepts_raw_out
             else None
         )
 
@@ -67,12 +88,15 @@ class DsparkDraftSampler:
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
-            confidence = self.confidence_fn(
-                draft_hidden=draft_hidden,
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_tap=confidence_tap,
-            )
+            confidence_kwargs = {
+                "draft_hidden": draft_hidden,
+                "anchor_tokens": anchor,
+                "draft_tokens": draft_tokens,
+                "confidence_tap": confidence_tap,
+            }
+            if self.confidence_raw_out is not None:
+                confidence_kwargs["raw_out"] = self.confidence_raw_out[:bs]
+            confidence = self.confidence_fn(**confidence_kwargs)
             self.confidence_out[:bs].copy_(confidence)
 
 

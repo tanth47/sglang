@@ -42,3 +42,4 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
+    confidence_raw: Optional[torch.Tensor] = None

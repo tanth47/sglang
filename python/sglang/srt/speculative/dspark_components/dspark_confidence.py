@@ -26,6 +26,7 @@ def compute_confidence(
     confidence_head,
     markov_head,
     gamma: int,
+    raw_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert confidence_head is not None
     if confidence_head.with_markov:
@@ -38,6 +39,10 @@ def compute_confidence(
     else:
         markov_embed_stack = None
     confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
+    if raw_out is not None:
+        raw_out[: confidence_raw.shape[0], : confidence_raw.shape[1]].copy_(
+            confidence_raw.to(dtype=raw_out.dtype)
+        )
     confidence = confidence_head.apply_sts(confidence_raw)
     maybe_detect_in_closed_range(confidence, 0.0, 1.0, "DSpark confidence")
     return confidence

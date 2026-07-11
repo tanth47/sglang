@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -20,10 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_correct_drafts_and_bonus,
-    verify_logits_adjustments_are_noop,
-)
+from sglang.srt.speculative.dflash_utils import verify_logits_adjustments_are_noop
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -99,8 +97,6 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
-
-_STS_COLLECT_FLUSH_EVERY: int = 256
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -536,6 +532,19 @@ class DSparkWorkerV2(BaseSpecWorker):
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
 
+    def flush_sts_records(self) -> None:
+        flush_error = None
+        self._sync_sts_collect_ranks()
+        try:
+            if self._sts_recorder is not None:
+                self._sts_recorder.flush()
+        except Exception as exc:
+            flush_error = exc
+        finally:
+            self._sync_sts_collect_ranks()
+        if flush_error is not None:
+            raise flush_error
+
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         if self._block_accept_recorder is None:
             return None
@@ -770,6 +779,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
+        confidence_raw = proposal.confidence_raw
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
@@ -777,6 +787,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
+            confidence_raw = self._verify_planner.last_confidence_raw
 
         verify_token_budget = self._resolve_verify_token_budget(
             batch=batch,
@@ -951,20 +962,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
-        if not proposal.folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
-            self._confidence_probe.maybe_observe(
-                carries_confidence=self._verify_planner.carries_confidence,
-                is_compact_mode=self._verify_planner.is_compact_mode,
-                confidence_raw=self._verify_planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
-                bs=bs,
-            )
+        self._maybe_record_sts_collect(
+            num_correct_drafts=correct_len,
+            confidence_raw=confidence_raw,
+            all_rows_greedy=self._sts_all_rows_greedy(batch=batch),
+            rids=[req.rid for req in batch.reqs],
+        )
+        self._confidence_probe.maybe_observe(
+            carries_confidence=self._verify_planner.carries_confidence,
+            is_compact_mode=self._verify_planner.is_compact_mode,
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            bs=bs,
+        )
         self._decision_dumper.maybe_dump(
             forward_ct=batch.forward_iter,
             bs=bs,
@@ -1098,12 +1109,21 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _maybe_record_sts_collect(
         self,
         *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: torch.Tensor,
-        bs: int,
+        num_correct_drafts: Optional[torch.Tensor] = None,
+        confidence_raw: Optional[torch.Tensor] = None,
+        all_rows_greedy: bool = True,
+        rids: Optional[list[str]] = None,
     ) -> None:
         collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         if not collect_path:
+            return
+        if self.tp_rank != 0 and not self._sts_collect_needs_rank_sync():
+            return
+        if rids is not None and all(
+            str(rid).startswith(HEALTH_CHECK_RID_PREFIX) for rid in rids
+        ):
+            return
+        if not all_rows_greedy:
             return
         if self._verify_planner.is_compact_mode:
             raise RuntimeError(
@@ -1114,27 +1134,44 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if not self._verify_planner.carries_confidence:
             return
-        confidence_raw = self._verify_planner.last_confidence_raw
         if confidence_raw is None:
-            return
-        if self._sts_recorder is None:
-            self._sts_recorder = StsDataRecorder(
-                path_stem=collect_path,
-                gamma=self.gamma,
-                flush_every=_STS_COLLECT_FLUSH_EVERY,
-                shard_tag=f"tp{self.tp_rank}-pid{os.getpid()}",
-            )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self.verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
-        self._sts_recorder.record(
-            confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
-        )
+            confidence_raw = self._verify_planner.last_confidence_raw
+        try:
+            if (
+                self.tp_rank == 0
+                and confidence_raw is not None
+                and num_correct_drafts is not None
+            ):
+                if self._sts_recorder is None:
+                    self._sts_recorder = StsDataRecorder(
+                        path_stem=collect_path,
+                        gamma=self.gamma,
+                        flush_every=max(
+                            1, int(envs.SGLANG_DSPARK_STS_FLUSH_EVERY.get())
+                        ),
+                        shard_tag=f"tp{self.tp_rank}-pid{os.getpid()}",
+                    )
+                self._sts_recorder.record(
+                    confidence_raw=confidence_raw,
+                    num_correct_drafts=num_correct_drafts,
+                )
+        finally:
+            self._sync_sts_collect_ranks()
+
+    def _sts_collect_needs_rank_sync(self) -> bool:
+        server_args = self.__dict__.get("server_args")
+        return int(getattr(server_args, "tp_size", 1)) > 1
+
+    def _sync_sts_collect_ranks(self) -> None:
+        if self._sts_collect_needs_rank_sync():
+            get_attention_tp_group().barrier()
+
+    @staticmethod
+    def _sts_all_rows_greedy(*, batch: ScheduleBatch) -> bool:
+        for req in batch.reqs:
+            if int(req.sampling_params.top_k) > 1:
+                return False
+        return True
 
     def _resolve_verify_token_budget(
         self,

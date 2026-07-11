@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Optional
 
@@ -62,6 +63,17 @@ from sglang.srt.utils.async_probe import maybe_assert_async
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
+
+
+def _callable_accepts_keyword(fn, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class DSparkVerifyPlanner:
@@ -347,6 +359,7 @@ class DSparkVerifyPlanner:
         anchor_tokens: torch.Tensor,
         draft_tokens: torch.Tensor,
         confidence_tap: Optional[torch.Tensor] = None,
+        raw_out: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self._confidence_head is None:
             return None
@@ -356,11 +369,24 @@ class DSparkVerifyPlanner:
                 confidence_tap is not None
             ), "dsv4 compute_confidence needs the compute_base_logits tap"
             with torch.inference_mode():
-                return compute_confidence_hook(
-                    anchor_tokens=anchor_tokens,
-                    sampled_tokens=draft_tokens,
-                    x_post_hc=confidence_tap,
+                hook_kwargs = {
+                    "anchor_tokens": anchor_tokens,
+                    "sampled_tokens": draft_tokens,
+                    "x_post_hc": confidence_tap,
+                }
+                hook_accepts_raw_out = _callable_accepts_keyword(
+                    compute_confidence_hook, "raw_out"
                 )
+                if raw_out is not None and hook_accepts_raw_out:
+                    hook_kwargs["raw_out"] = raw_out
+                confidence = compute_confidence_hook(**hook_kwargs)
+                if raw_out is not None and not hook_accepts_raw_out:
+                    confidence_raw = self.last_confidence_raw
+                    if confidence_raw is not None:
+                        raw_out[
+                            : confidence_raw.shape[0], : confidence_raw.shape[1]
+                        ].copy_(confidence_raw.to(dtype=raw_out.dtype))
+                return confidence
         assert draft_hidden is not None
         return compute_confidence(
             draft_hidden=draft_hidden,
@@ -369,6 +395,7 @@ class DSparkVerifyPlanner:
             confidence_head=self._confidence_head,
             markov_head=self.draft_model.markov_head,
             gamma=self.gamma,
+            raw_out=raw_out,
         )
 
     def prepare_verify_budget(

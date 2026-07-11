@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -77,6 +78,7 @@ class DraftBlockProposer:
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         folded_confidence = None
+        folded_confidence_raw = None
         confidence_tap = None
         folded = False
         if draft_sampler is not None and fwd.can_run_graph and all_greedy:
@@ -99,6 +101,8 @@ class DraftBlockProposer:
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
+            if getattr(draft_sampler, "confidence_raw_out", None) is not None:
+                folded_confidence_raw = draft_sampler.confidence_raw_out[:bs]
         else:
             with self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
@@ -119,6 +123,7 @@ class DraftBlockProposer:
             draft_block=draft_block,
             draft_hidden=fwd.draft_hidden_3d,
             confidence=folded_confidence,
+            confidence_raw=folded_confidence_raw,
             confidence_tap=confidence_tap,
             folded=folded,
         )
@@ -191,6 +196,17 @@ class DraftBlockProposer:
                 else int(batch.seq_lens_cpu.sum().item())
             )
         else:
+            tp_size = 1
+            try:
+                tp_size = int(get_tp_group().world_size)
+            except Exception:
+                pass
+            if tp_size > 1:
+                raise RuntimeError(
+                    "DSpark draft forward requires batch.seq_lens_cpu under TP>1. "
+                    "FutureMap/scheduler should publish the CPU mirror instead of "
+                    "falling back to prefix_lens.cpu() inside draft ranks."
+                )
             draft_seq_lens_cpu = prefix_lens.detach().to("cpu")
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum().item())
 

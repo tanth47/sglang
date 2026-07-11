@@ -582,7 +582,13 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    confidence_enabled = bool(getattr(config, "enable_confidence_head", True))
+    if not confidence_enabled:
+        return None
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        and not envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(

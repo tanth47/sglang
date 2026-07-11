@@ -37,6 +37,12 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if algo.is_dspark():
+        # DSpark's draft/verify path still consumes the host-side sequence
+        # length mirror to build TARGET_VERIFY metadata. Letting backends opt
+        # out here pushes draft ranks into ad hoc seq_lens.cpu() fallbacks,
+        # which can desynchronize TP ranks on ROCm.
+        return True
     if algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).

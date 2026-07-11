@@ -25,6 +25,7 @@ import dataclasses
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
@@ -231,6 +232,127 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 )
                 info = _call_server_info_with(args)
                 self.assertIsNone(info["kv_events"])
+
+
+class TestServerWarmup(CustomTestCase):
+    class _FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    def test_dspark_sts_collection_still_runs_server_warmup(self):
+        args = ServerArgs(model_path="dummy")
+        calls = []
+        stub_state = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(
+                server_status=http_server.ServerStatus.Starting
+            ),
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(stub_state)
+        try:
+            with patch.dict(
+                "os.environ",
+                {"SGLANG_DSPARK_STS_COLLECT_PATH": "/tmp/dspark-sts"},
+            ):
+                http_server._wait_and_warmup(
+                    args,
+                    execute_warmup_func=lambda _: (
+                        calls.append("warmup"),
+                        setattr(
+                            stub_state.tokenizer_manager,
+                            "server_status",
+                            http_server.ServerStatus.Up,
+                        ),
+                    )
+                    and True,
+                )
+        finally:
+            http_server._global_state = prior_state
+
+        self.assertEqual(calls, ["warmup"])
+        self.assertEqual(
+            stub_state.tokenizer_manager.server_status, http_server.ServerStatus.Up
+        )
+
+    def test_generation_warmup_uses_health_check_rid(self):
+        args = ServerArgs(model_path="dummy")
+        posted = []
+        stub_state = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(
+                server_status=http_server.ServerStatus.Starting
+            ),
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(stub_state)
+
+        def fake_get(*_args, **_kwargs):
+            return self._FakeResponse(
+                {"is_generation": True, "has_image_understanding": False}
+            )
+
+        def fake_post(url, json=None, **_kwargs):
+            posted.append((url, json))
+            return self._FakeResponse({})
+
+        try:
+            with patch.object(http_server.time, "sleep", lambda _: None), patch.object(
+                http_server.requests, "get", fake_get
+            ), patch.object(http_server.requests, "post", fake_post):
+                self.assertTrue(http_server._execute_server_warmup(args))
+        finally:
+            http_server._global_state = prior_state
+
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(posted[0][0].endswith("/generate"))
+        self.assertTrue(
+            posted[0][1]["rid"].startswith(
+                f"{http_server.HEALTH_CHECK_RID_PREFIX}_WARMUP_"
+            )
+        )
+
+    def test_vlm_chat_warmup_uses_health_check_rid(self):
+        args = ServerArgs(model_path="dummy")
+        posted = []
+        stub_state = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(
+                served_model_name="dummy",
+                server_status=http_server.ServerStatus.Starting,
+            ),
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(stub_state)
+
+        def fake_get(*_args, **_kwargs):
+            return self._FakeResponse(
+                {"is_generation": True, "has_image_understanding": True}
+            )
+
+        def fake_post(url, json=None, **_kwargs):
+            posted.append((url, json))
+            return self._FakeResponse({})
+
+        try:
+            with patch.object(http_server.time, "sleep", lambda _: None), patch.object(
+                http_server, "is_mps", lambda: False
+            ), patch.object(http_server.requests, "get", fake_get), patch.object(
+                http_server.requests, "post", fake_post
+            ):
+                self.assertTrue(http_server._execute_server_warmup(args))
+        finally:
+            http_server._global_state = prior_state
+
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(posted[0][0].endswith("/v1/chat/completions"))
+        self.assertTrue(
+            posted[0][1]["rid"].startswith(
+                f"{http_server.HEALTH_CHECK_RID_PREFIX}_WARMUP_"
+            )
+        )
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):

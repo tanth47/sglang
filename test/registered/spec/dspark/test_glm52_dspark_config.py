@@ -11,7 +11,11 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.model_runner import (
     _resolve_dflash_or_dspark_capture_spec,
 )
-from sglang.srt.models.dspark import EntryClass, normalize_dspark_draft_config
+from sglang.srt.models.dspark import (
+    EntryClass,
+    build_confidence_head,
+    normalize_dspark_draft_config,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_worker_common import (
     _resolve_draft_attention_backend,
@@ -80,6 +84,40 @@ def _make_draft_server_args() -> ServerArgs:
 
 
 class TestGLM52RedHatDSparkConfig(CustomTestCase):
+    def test_static_mode_skips_confidence_head_without_sts_collection(self):
+        config = normalize_dspark_draft_config(_glm52_redhat_dspark_config())
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_RAGGED_VERIFY_MODE": "static",
+                "SGLANG_DSPARK_STS_COLLECT_PATH": "",
+            },
+        ):
+            self.assertIsNone(build_confidence_head(config))
+
+    def test_static_mode_keeps_confidence_head_for_sts_collection(self):
+        config = normalize_dspark_draft_config(_glm52_redhat_dspark_config())
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_RAGGED_VERIFY_MODE": "static",
+                "SGLANG_DSPARK_STS_COLLECT_PATH": "/tmp/dspark-sts",
+            },
+        ):
+            self.assertIsNotNone(build_confidence_head(config))
+
+    def test_disabled_confidence_head_stays_disabled_for_sts_collection(self):
+        config = normalize_dspark_draft_config(_glm52_redhat_dspark_config())
+        config.enable_confidence_head = False
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_RAGGED_VERIFY_MODE": "static",
+                "SGLANG_DSPARK_STS_COLLECT_PATH": "/tmp/dspark-sts",
+            },
+        ):
+            self.assertIsNone(build_confidence_head(config))
+
     def test_model_config_normalizer_materializes_nested_transformer_config(self):
         config = PretrainedConfig(
             architectures=["DSparkDraftModel"],
