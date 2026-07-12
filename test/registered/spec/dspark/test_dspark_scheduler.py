@@ -230,6 +230,48 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         )
         self.assertGreater(decision.predicted_theta, 0.0)
 
+    def test_theta_tolerance_selects_smallest_near_optimal_budget(self):
+        survival = torch.tensor([[0.90, 0.09, 0.01]], dtype=torch.float32)
+        table = _flat_table()
+
+        exact = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=3),
+        )
+        near = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=3, theta_tolerance=0.995),
+        )
+
+        self.assertEqual(exact.budget, 3)
+        self.assertEqual(near.budget, 2)
+
+    def test_max_budget_frac_caps_budget_search_space(self):
+        survival = torch.tensor([[0.99, 0.98, 0.97, 0.96]], dtype=torch.float32)
+        table = _flat_table()
+
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=4, max_budget_frac=0.5),
+        )
+
+        self.assertEqual(decision.budget, 2)
+
+    def test_max_budget_frac_keeps_one_candidate_for_tiny_caps(self):
+        survival = torch.tensor([[0.99, 0.98, 0.97, 0.96]], dtype=torch.float32)
+        table = _flat_table()
+
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=4, max_budget_frac=0.01),
+        )
+
+        self.assertEqual(decision.budget, 1)
+
 
 def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     return HostConfidenceBudgetPlanner(
@@ -684,6 +726,18 @@ class TestDSparkScheduleConfig(CustomTestCase):
     def test_zero_max_resolves_to_gamma(self):
         cfg = DSparkScheduleConfig(gamma=7)
         self.assertEqual(cfg.resolved_max_verify_len(), 8)
+
+    def test_validate_rejects_invalid_max_budget_frac(self):
+        for value in (0.0, 1.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    DSparkScheduleConfig(gamma=4, max_budget_frac=value).validate()
+
+    def test_validate_rejects_invalid_theta_tolerance(self):
+        for value in (0.0, 1.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    DSparkScheduleConfig(gamma=4, theta_tolerance=value).validate()
 
 
 class TestGraphTierFillBudget(CustomTestCase):

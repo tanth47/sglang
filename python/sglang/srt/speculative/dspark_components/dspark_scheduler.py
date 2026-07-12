@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Union
 
 import msgspec
@@ -36,6 +37,8 @@ class DSparkScheduleConfig(msgspec.Struct):
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    max_budget_frac: Optional[float] = None
+    theta_tolerance: float = 1.0
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -51,6 +54,17 @@ class DSparkScheduleConfig(msgspec.Struct):
             )
         if self.survival_eps < 0:
             raise ValueError(f"survival_eps must be >= 0, got {self.survival_eps}.")
+        if self.max_budget_frac is not None and not (
+            0.0 < float(self.max_budget_frac) <= 1.0
+        ):
+            raise ValueError(
+                "max_budget_frac must be in (0, 1] when set, got "
+                f"{self.max_budget_frac}."
+            )
+        if not (0.0 < float(self.theta_tolerance) <= 1.0):
+            raise ValueError(
+                f"theta_tolerance must be in (0, 1], got {self.theta_tolerance}."
+            )
 
 
 class VerifyBudgetDecision(msgspec.Struct):
@@ -77,6 +91,11 @@ def compute_verify_token_budget(
     candidates = selectable.flatten()
     candidates = candidates[candidates >= cfg.survival_eps].to(torch.float64)
     candidates_sorted = torch.sort(candidates, descending=True).values
+    if cfg.max_budget_frac is not None:
+        num_candidates = int(candidates_sorted.numel())
+        if num_candidates:
+            max_budget = math.ceil(float(cfg.max_budget_frac) * num_candidates)
+            candidates_sorted = candidates_sorted[: max(1, max_budget)]
     prefix_sum = torch.cumsum(candidates_sorted, dim=0)
     forced_gain = forced.to(torch.float64).sum()
 
@@ -94,7 +113,7 @@ def compute_verify_token_budget(
             base_batch_tokens=base_batch_tokens,
         )
         theta = tau_star / step_time
-        idx = int(torch.argmax(theta))
+        idx = _select_budget_index(theta=theta, cfg=cfg)
         predicted_step_seconds = float(step_time[idx])
     else:
         batch_tokens = base_batch_tokens + torch.arange(
@@ -102,7 +121,7 @@ def compute_verify_token_budget(
         )
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
-        idx = int(torch.argmax(theta))
+        idx = _select_budget_index(theta=theta, cfg=cfg)
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
@@ -110,6 +129,17 @@ def compute_verify_token_budget(
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
     )
+
+
+def _select_budget_index(*, theta: torch.Tensor, cfg: DSparkScheduleConfig) -> int:
+    if float(cfg.theta_tolerance) >= 1.0:
+        return int(torch.argmax(theta))
+    best = torch.max(theta)
+    threshold = best * float(cfg.theta_tolerance)
+    eligible = torch.nonzero(theta >= threshold, as_tuple=False)
+    if eligible.numel() == 0:
+        return int(torch.argmax(theta))
+    return int(eligible[0].item())
 
 
 def _lookup_sps_tensor(

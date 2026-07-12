@@ -1561,6 +1561,20 @@ class ServerArgs:
         "DSPARK ragged-verify scheduler only. Minimum survival probability for a "
         "draft position to be selectable by confidence top-k scheduling.",
     ] = 1e-6
+    speculative_dspark_max_budget_frac: A[
+        Optional[float],
+        "DSPARK ragged-verify scheduler only. Optional cap on the confidence top-k "
+        "verify-token budget as a fraction of selectable draft-token positions. "
+        "This is useful for perf sweeps on flat SPS tables where the unconstrained "
+        "objective prefers nearly full verification.",
+    ] = None
+    speculative_dspark_theta_tolerance: A[
+        float,
+        "DSPARK ragged-verify scheduler only. Choose the smallest verify budget "
+        "whose predicted throughput objective is within this fraction of the best "
+        "candidate. Defaults to 1.0, which preserves argmax behavior. Values like "
+        "0.99 can reduce over-verification when the SPS table is nearly flat.",
+    ] = 1.0
     speculative_dspark_align_verify_tokens_to_graph_tier: A[
         bool,
         "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "
