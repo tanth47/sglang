@@ -20,7 +20,7 @@ try:
 except ModuleNotFoundError:
     from dspark_profile_artifacts import add_provenance_args, provenance_from_args
 
-SCHEMA = "sglang-dspark-launch-report-v5"
+SCHEMA = "sglang-dspark-launch-report-v6"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 START_RE = re.compile(
@@ -32,6 +32,8 @@ TIMESTAMP_RE = re.compile(
 LOAD_RE = re.compile(
     r"Load weight end\. elapsed=(?P<elapsed>[0-9.]+) s, type=(?P<type>[^,\n]+)"
 )
+LOAD_BEGIN_RE = re.compile(r"Load weight begin\.")
+GRAPH_BEGIN_RE = re.compile(r"Capture draft verify CUDA graph begin\.")
 GRAPH_RE = re.compile(
     r"Capture draft verify CUDA graph end\. elapsed=(?P<elapsed>[0-9.]+) s"
 )
@@ -130,6 +132,149 @@ def summarize_rank_seconds(values: dict[int, float]) -> dict[str, Any]:
     }
 
 
+def isoformat_timestamp(ts: datetime | None) -> str | None:
+    return ts.isoformat() if ts is not None else None
+
+
+def seconds_between(start: datetime | None, end: datetime | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds()
+
+
+def summarize_rank_timestamps(values: dict[int, datetime]) -> dict[str, Any]:
+    if not values:
+        return {
+            "by_rank": {},
+            "rank_count": 0,
+            "ranks": [],
+            "first_time": None,
+            "last_time": None,
+            "first_rank": None,
+            "last_rank": None,
+            "skew_s": None,
+        }
+    first_rank = min(values, key=lambda rank: values[rank])
+    last_rank = max(values, key=lambda rank: values[rank])
+    first_time = values[first_rank]
+    last_time = values[last_rank]
+    return {
+        "by_rank": {str(rank): values[rank].isoformat() for rank in sorted(values)},
+        "rank_count": len(values),
+        "ranks": sorted(values),
+        "first_time": first_time.isoformat(),
+        "last_time": last_time.isoformat(),
+        "first_rank": first_rank,
+        "last_rank": last_rank,
+        "skew_s": (last_time - first_time).total_seconds(),
+    }
+
+
+def timestamp_bounds(
+    values: dict[int, datetime],
+) -> tuple[datetime | None, datetime | None]:
+    if not values:
+        return None, None
+    return min(values.values()), max(values.values())
+
+
+def infer_load_post_shard_seconds(
+    load_summary: dict[str, Any], shard_summary: dict[str, Any]
+) -> float | None:
+    load_s = load_summary.get("max_s")
+    shard_s = shard_summary.get("elapsed_s_max")
+    if load_s is None or shard_s is None:
+        return None
+    return max(0.0, float(load_s) - float(shard_s))
+
+
+def build_phase_summary(
+    *,
+    start_ts: datetime | None,
+    server_args_ts: datetime | None,
+    target_begin: dict[int, datetime],
+    target_end: dict[int, datetime],
+    draft_begin: dict[int, datetime],
+    draft_end: dict[int, datetime],
+    graph_begin: dict[int, datetime],
+    graph_end: dict[int, datetime],
+    app_startup_ts: datetime | None,
+    uvicorn_running_ts: datetime | None,
+    ready_ts: datetime | None,
+    target_load: dict[str, Any],
+    draft_load: dict[str, Any],
+    draft_graph: dict[str, Any],
+    target_shard_progress: dict[str, Any],
+    draft_shard_progress: dict[str, Any],
+) -> dict[str, Any]:
+    first_target_begin, last_target_begin = timestamp_bounds(target_begin)
+    first_target_end, last_target_end = timestamp_bounds(target_end)
+    first_draft_begin, last_draft_begin = timestamp_bounds(draft_begin)
+    first_draft_end, last_draft_end = timestamp_bounds(draft_end)
+    first_graph_begin, last_graph_begin = timestamp_bounds(graph_begin)
+    first_graph_end, last_graph_end = timestamp_bounds(graph_end)
+
+    return {
+        "timestamps": {
+            "start": isoformat_timestamp(start_ts),
+            "server_args": isoformat_timestamp(server_args_ts),
+            "first_target_load_begin": isoformat_timestamp(first_target_begin),
+            "last_target_load_begin": isoformat_timestamp(last_target_begin),
+            "first_target_load_end": isoformat_timestamp(first_target_end),
+            "last_target_load_end": isoformat_timestamp(last_target_end),
+            "first_draft_load_begin": isoformat_timestamp(first_draft_begin),
+            "last_draft_load_begin": isoformat_timestamp(last_draft_begin),
+            "first_draft_load_end": isoformat_timestamp(first_draft_end),
+            "last_draft_load_end": isoformat_timestamp(last_draft_end),
+            "first_draft_graph_begin": isoformat_timestamp(first_graph_begin),
+            "last_draft_graph_begin": isoformat_timestamp(last_graph_begin),
+            "first_draft_graph_end": isoformat_timestamp(first_graph_end),
+            "last_draft_graph_end": isoformat_timestamp(last_graph_end),
+            "app_startup_complete": isoformat_timestamp(app_startup_ts),
+            "uvicorn_running": isoformat_timestamp(uvicorn_running_ts),
+            "ready": isoformat_timestamp(ready_ts),
+        },
+        "target_load_begin": summarize_rank_timestamps(target_begin),
+        "target_load_end": summarize_rank_timestamps(target_end),
+        "draft_load_begin": summarize_rank_timestamps(draft_begin),
+        "draft_load_end": summarize_rank_timestamps(draft_end),
+        "draft_graph_begin": summarize_rank_timestamps(graph_begin),
+        "draft_graph_end": summarize_rank_timestamps(graph_end),
+        "durations_s": {
+            "start_to_server_args": seconds_between(start_ts, server_args_ts),
+            "start_to_first_target_load_begin": seconds_between(
+                start_ts, first_target_begin
+            ),
+            "server_args_to_first_target_load_begin": seconds_between(
+                server_args_ts, first_target_begin
+            ),
+            "target_load_wall": seconds_between(first_target_begin, last_target_end),
+            "target_load_max": target_load.get("max_s"),
+            "target_shard_progress": target_shard_progress.get("elapsed_s_max"),
+            "target_load_post_shard_inferred": infer_load_post_shard_seconds(
+                target_load, target_shard_progress
+            ),
+            "target_to_draft_load_begin": seconds_between(
+                last_target_end, first_draft_begin
+            ),
+            "draft_load_wall": seconds_between(first_draft_begin, last_draft_end),
+            "draft_load_max": draft_load.get("max_s"),
+            "draft_shard_progress": draft_shard_progress.get("elapsed_s_max"),
+            "draft_load_post_shard_inferred": infer_load_post_shard_seconds(
+                draft_load, draft_shard_progress
+            ),
+            "draft_to_graph_begin": seconds_between(last_draft_end, first_graph_begin),
+            "draft_graph_wall": seconds_between(first_graph_begin, last_graph_end),
+            "draft_graph_max": draft_graph.get("max_s"),
+            "draft_graph_to_app_startup": seconds_between(
+                last_graph_end, app_startup_ts
+            ),
+            "app_startup_to_ready": seconds_between(app_startup_ts, ready_ts),
+            "uvicorn_running_to_ready": seconds_between(uvicorn_running_ts, ready_ts),
+        },
+    }
+
+
 def parse_shard_progress_line(line: str) -> dict[str, Any] | None:
     matches = list(SHARD_PROGRESS_RE.finditer(line))
     if not matches:
@@ -192,6 +337,16 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
     target_load: dict[int, float] = {}
     draft_load: dict[int, float] = {}
     draft_graph: dict[int, float] = {}
+    pending_load_begin: dict[int, datetime] = {}
+    target_load_begin: dict[int, datetime] = {}
+    target_load_end: dict[int, datetime] = {}
+    draft_load_begin: dict[int, datetime] = {}
+    draft_load_end: dict[int, datetime] = {}
+    draft_graph_begin: dict[int, datetime] = {}
+    draft_graph_end: dict[int, datetime] = {}
+    server_args_ts: datetime | None = None
+    app_startup_ts: datetime | None = None
+    uvicorn_running_ts: datetime | None = None
     aiter_imports: Counter[tuple[str, str]] = Counter()
     aiter_build_starts: Counter[tuple[str, str]] = Counter()
     aiter_build_events: list[dict[str, Any]] = []
@@ -208,8 +363,18 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
             ts, rank = parse_log_timestamp(line)
             if ts is not None and first_log_ts is None:
                 first_log_ts = ts
+            if "server_args=" in line and ts is not None:
+                server_args_ts = server_args_ts or ts
+            if "Application startup complete." in line and ts is not None:
+                app_startup_ts = app_startup_ts or ts
+            if "Uvicorn running on" in line and ts is not None:
+                uvicorn_running_ts = uvicorn_running_ts or ts
             if "The server is fired up and ready to roll!" in line and ts is not None:
                 ready_ts = ts
+
+            load_begin_match = LOAD_BEGIN_RE.search(line)
+            if load_begin_match and rank is not None and ts is not None:
+                pending_load_begin[rank] = ts
 
             load_match = LOAD_RE.search(line)
             if load_match and rank is not None:
@@ -217,9 +382,19 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
                 elapsed = float(load_match.group("elapsed"))
                 if load_type == "DSparkDraftModel":
                     draft_load[rank] = elapsed
+                    if ts is not None:
+                        draft_load_end[rank] = ts
+                    begin_ts = pending_load_begin.pop(rank, None)
+                    if begin_ts is not None:
+                        draft_load_begin[rank] = begin_ts
                     load_kind = "draft"
                 else:
                     target_load[rank] = elapsed
+                    if ts is not None:
+                        target_load_end[rank] = ts
+                    begin_ts = pending_load_begin.pop(rank, None)
+                    if begin_ts is not None:
+                        target_load_begin[rank] = begin_ts
                     load_kind = "target"
                 if pending_shard_progress is not None:
                     shard_progress_records.append(
@@ -232,9 +407,15 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
                     )
                     pending_shard_progress = None
 
+            graph_begin_match = GRAPH_BEGIN_RE.search(line)
+            if graph_begin_match and rank is not None and ts is not None:
+                draft_graph_begin[rank] = ts
+
             graph_match = GRAPH_RE.search(line)
             if graph_match and rank is not None:
                 draft_graph[rank] = float(graph_match.group("elapsed"))
+                if ts is not None:
+                    draft_graph_end[rank] = ts
 
             shard_progress = parse_shard_progress_line(line)
             if shard_progress is not None:
@@ -286,6 +467,33 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
         if effective_start is not None and ready_ts is not None
         else None
     )
+    target_load_summary = summarize_rank_seconds(target_load)
+    draft_load_summary = summarize_rank_seconds(draft_load)
+    draft_graph_summary = summarize_rank_seconds(draft_graph)
+    target_shard_progress_summary = summarize_shard_progress(
+        shard_progress_records, kind="target"
+    )
+    draft_shard_progress_summary = summarize_shard_progress(
+        shard_progress_records, kind="draft"
+    )
+    phase_summary = build_phase_summary(
+        start_ts=effective_start,
+        server_args_ts=server_args_ts,
+        target_begin=target_load_begin,
+        target_end=target_load_end,
+        draft_begin=draft_load_begin,
+        draft_end=draft_load_end,
+        graph_begin=draft_graph_begin,
+        graph_end=draft_graph_end,
+        app_startup_ts=app_startup_ts,
+        uvicorn_running_ts=uvicorn_running_ts,
+        ready_ts=ready_ts,
+        target_load=target_load_summary,
+        draft_load=draft_load_summary,
+        draft_graph=draft_graph_summary,
+        target_shard_progress=target_shard_progress_summary,
+        draft_shard_progress=draft_shard_progress_summary,
+    )
 
     return {
         "label": label,
@@ -293,18 +501,15 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
         "start_time": effective_start.isoformat() if effective_start else None,
         "ready_time": ready_ts.isoformat() if ready_ts else None,
         "start_to_ready_s": start_to_ready_s,
-        "target_weight_load": summarize_rank_seconds(target_load),
-        "draft_weight_load": summarize_rank_seconds(draft_load),
-        "draft_verify_graph_capture": summarize_rank_seconds(draft_graph),
+        "target_weight_load": target_load_summary,
+        "draft_weight_load": draft_load_summary,
+        "draft_verify_graph_capture": draft_graph_summary,
+        "phase_summary": phase_summary,
         "aiter_builds": summarize_aiter_builds(aiter_build_events),
         "aiter_build_events": aiter_build_events,
         "shard_loading_progress": shard_progress_records,
-        "target_shard_loading_progress": summarize_shard_progress(
-            shard_progress_records, kind="target"
-        ),
-        "draft_shard_loading_progress": summarize_shard_progress(
-            shard_progress_records, kind="draft"
-        ),
+        "target_shard_loading_progress": target_shard_progress_summary,
+        "draft_shard_loading_progress": draft_shard_progress_summary,
         "aiter_build_starts": [
             {"module": module, "path": build_path, "count": count}
             for (module, build_path), count in sorted(aiter_build_starts.items())
@@ -374,11 +579,20 @@ def sum_aiter_build_seconds(run: dict[str, Any], field: str) -> float:
 
 
 def observed_launch_stages(run: dict[str, Any]) -> list[dict[str, Any]]:
+    durations = (run.get("phase_summary") or {}).get("durations_s") or {}
     stage_specs = [
+        (
+            "start_to_first_target_load_begin",
+            durations.get("start_to_first_target_load_begin"),
+        ),
         ("target_weight_load", run["target_weight_load"].get("max_s")),
         (
             "target_shard_loading_progress",
             run["target_shard_loading_progress"].get("elapsed_s_max"),
+        ),
+        (
+            "target_load_post_shard_inferred",
+            durations.get("target_load_post_shard_inferred"),
         ),
         ("draft_weight_load", run["draft_weight_load"].get("max_s")),
         (
@@ -425,8 +639,18 @@ def summarize_launch_insight(run: dict[str, Any]) -> dict[str, Any]:
         "target_shard_progress_elapsed_s": run["target_shard_loading_progress"].get(
             "elapsed_s_max"
         ),
+        "target_load_post_shard_inferred_s": (
+            (run.get("phase_summary") or {})
+            .get("durations_s", {})
+            .get("target_load_post_shard_inferred")
+        ),
         "draft_shard_progress_elapsed_s": run["draft_shard_loading_progress"].get(
             "elapsed_s_max"
+        ),
+        "draft_load_post_shard_inferred_s": (
+            (run.get("phase_summary") or {})
+            .get("durations_s", {})
+            .get("draft_load_post_shard_inferred")
         ),
         "tuned_miss_action": (
             "generate_tuned_miss_inputs" if miss_events else "no_tuned_miss_action"
@@ -555,6 +779,48 @@ def render_markdown(report: dict[str, Any]) -> str:
                 miss_action=insight.get("tuned_miss_action", "-"),
             )
         )
+
+    phase_rows = [
+        (run, (run.get("phase_summary") or {}).get("durations_s") or {})
+        for run in report["runs"]
+        if (run.get("phase_summary") or {}).get("durations_s")
+    ]
+    if phase_rows:
+        lines.extend(
+            [
+                "",
+                "## Launch Phase Breakdown",
+                "",
+                "| run | start_to_target_begin_s | target_wall_s | target_shard_s | target_post_shard_inferred_s | target_to_draft_s | draft_wall_s | draft_to_graph_s | graph_wall_s | app_to_ready_s | uvicorn_to_ready_s |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for run, durations in phase_rows:
+            lines.append(
+                "| {label} | {start_to_target} | {target_wall} | {target_shard} | {target_post_shard} | {target_to_draft} | {draft_wall} | {draft_to_graph} | {graph_wall} | {app_to_ready} | {uvicorn_to_ready} |".format(
+                    label=run["label"],
+                    start_to_target=format_seconds(
+                        durations.get("start_to_first_target_load_begin")
+                    ),
+                    target_wall=format_seconds(durations.get("target_load_wall")),
+                    target_shard=format_seconds(durations.get("target_shard_progress")),
+                    target_post_shard=format_seconds(
+                        durations.get("target_load_post_shard_inferred")
+                    ),
+                    target_to_draft=format_seconds(
+                        durations.get("target_to_draft_load_begin")
+                    ),
+                    draft_wall=format_seconds(durations.get("draft_load_wall")),
+                    draft_to_graph=format_seconds(
+                        durations.get("draft_to_graph_begin")
+                    ),
+                    graph_wall=format_seconds(durations.get("draft_graph_wall")),
+                    app_to_ready=format_seconds(durations.get("app_startup_to_ready")),
+                    uvicorn_to_ready=format_seconds(
+                        durations.get("uvicorn_running_to_ready")
+                    ),
+                )
+            )
 
     shard_rows = [
         (run, record)
