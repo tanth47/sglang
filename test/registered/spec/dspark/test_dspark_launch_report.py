@@ -67,9 +67,7 @@ class TestDSparkLaunchReport(CustomTestCase):
                 run["target_shard_loading_progress"]["elapsed_s_max"], 22.0
             )
             self.assertEqual(run["draft_shard_loading_progress"]["event_count"], 1)
-            self.assertEqual(
-                run["draft_shard_loading_progress"]["total_shards_max"], 1
-            )
+            self.assertEqual(run["draft_shard_loading_progress"]["total_shards_max"], 1)
             self.assertEqual(run["draft_verify_graph_capture"]["rank_count"], 1)
             self.assertAlmostEqual(run["draft_weight_load"]["max_s"], 0.82)
             self.assertAlmostEqual(run["draft_verify_graph_capture"]["max_s"], 14.74)

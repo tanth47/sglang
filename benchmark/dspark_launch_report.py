@@ -165,11 +165,7 @@ def parse_shard_progress_line(line: str) -> dict[str, Any] | None:
 def summarize_shard_progress(
     records: list[dict[str, Any]], *, kind: str | None = None
 ) -> dict[str, Any]:
-    filtered = [
-        record
-        for record in records
-        if kind is None or record.get("kind") == kind
-    ]
+    filtered = [record for record in records if kind is None or record.get("kind") == kind]
     if not filtered:
         return {
             "event_count": 0,
