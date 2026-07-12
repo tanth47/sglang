@@ -29,14 +29,26 @@ class TestDSparkLaunchReport(CustomTestCase):
                 "\n".join(
                     [
                         "Sat Jul 11 19:03:15 UTC 2026",
+                        "[2026-07-11 19:03:20] server_args=ServerArgs(...)",
+                        "[2026-07-11 19:04:15 TP3] Load weight begin. avail mem=285.28 GB",
+                        "[2026-07-11 19:04:15 TP2] Load weight begin. avail mem=285.19 GB",
+                        "[2026-07-11 19:04:15 TP1] Load weight begin. avail mem=285.16 GB",
+                        "[2026-07-11 19:04:15 TP0] Load weight begin. avail mem=285.19 GB",
                         "Multi-thread loading shards:   0% Completed | 0/141 [00:00<?, ?it/s] Multi-thread loading shards: 100% Completed | 141/141 [00:22<00:00,  6.30it/s]",
                         "[2026-07-11 19:06:10 TP3] Load weight end. elapsed=114.88 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:06:11 TP2] Load weight end. elapsed=115.28 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:06:48 TP1] Load weight end. elapsed=152.65 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:07:02 TP0] Load weight end. elapsed=167.05 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
+                        "[2026-07-11 19:07:07 TP3] Load weight begin. avail mem=109.36 GB",
+                        "[2026-07-11 19:07:07 TP0] Load weight begin. avail mem=109.27 GB",
+                        "[2026-07-11 19:07:07 TP2] Load weight begin. avail mem=109.27 GB",
+                        "[2026-07-11 19:07:07 TP1] Load weight begin. avail mem=109.23 GB",
                         "Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s] Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00, 940.43it/s]",
                         "[2026-07-11 19:07:08 TP3] Load weight end. elapsed=0.82 s, type=DSparkDraftModel, avail mem=107.95 GB.",
+                        "[2026-07-11 19:07:12 TP3] Capture draft verify CUDA graph begin. backend=full, num_tokens_per_bs=8, bs=[1, 2, 4, 8], avail mem=30.55 GB",
                         "[2026-07-11 19:07:26 TP3] Capture draft verify CUDA graph end. elapsed=14.74 s, mem usage=1.53 GB.",
+                        "[2026-07-11 19:08:00] INFO:     Application startup complete.",
+                        "[2026-07-11 19:08:01] INFO:     Uvicorn running on http://0.0.0.0:30158 (Press CTRL+C to quit)",
                         "[aiter] import [module_moe] under /sgl-workspace/aiter/aiter/jit/module_moe.so",
                         "[aiter] [pid=254 pname=Process-4] start build [module_moe] under /sgl-workspace/aiter/aiter/jit/build/module_moe",
                         "[aiter] [pid=254 pname=Process-4] \x1b[32mfinish build [module_moe], cost 57.8s \x1b[0m",
@@ -65,6 +77,22 @@ class TestDSparkLaunchReport(CustomTestCase):
             self.assertEqual(run["target_weight_load"]["slowest_rank"], 0)
             self.assertAlmostEqual(run["target_weight_load"]["max_s"], 167.05)
             self.assertAlmostEqual(run["target_weight_load"]["skew_s"], 52.17)
+            phase_durations = run["phase_summary"]["durations_s"]
+            self.assertAlmostEqual(
+                phase_durations["start_to_first_target_load_begin"], 60.0
+            )
+            self.assertAlmostEqual(phase_durations["target_load_wall"], 167.0)
+            self.assertAlmostEqual(
+                phase_durations["target_load_post_shard_inferred"], 145.05
+            )
+            self.assertAlmostEqual(phase_durations["target_to_draft_load_begin"], 5.0)
+            self.assertAlmostEqual(phase_durations["draft_load_wall"], 1.0)
+            self.assertAlmostEqual(phase_durations["draft_to_graph_begin"], 4.0)
+            self.assertAlmostEqual(phase_durations["draft_graph_wall"], 14.0)
+            self.assertAlmostEqual(phase_durations["app_startup_to_ready"], 66.0)
+            self.assertAlmostEqual(phase_durations["uvicorn_running_to_ready"], 65.0)
+            self.assertEqual(run["phase_summary"]["target_load_begin"]["rank_count"], 4)
+            self.assertEqual(run["phase_summary"]["target_load_begin"]["first_rank"], 3)
             self.assertEqual(run["target_shard_loading_progress"]["event_count"], 1)
             self.assertEqual(
                 run["target_shard_loading_progress"]["total_shards_max"], 141
@@ -99,6 +127,9 @@ class TestDSparkLaunchReport(CustomTestCase):
             self.assertAlmostEqual(
                 run["launch_insight"]["target_shard_progress_elapsed_s"], 22.0
             )
+            self.assertAlmostEqual(
+                run["launch_insight"]["target_load_post_shard_inferred_s"], 145.05
+            )
             self.assertEqual(
                 run["launch_insight"]["aiter_cache_action"],
                 "prewarm_or_reuse_aiter_jit_cache",
@@ -122,6 +153,11 @@ class TestDSparkLaunchReport(CustomTestCase):
             )
             self.assertIn(
                 "| r4b | target_weight_load | 167.05 | prewarm_or_reuse_aiter_jit_cache | generate_tuned_miss_inputs |",
+                markdown,
+            )
+            self.assertIn("## Launch Phase Breakdown", markdown)
+            self.assertIn(
+                "| r4b | 60.00 | 167.00 | 22.00 | 145.05 | 5.00 | 1.00 | 4.00 | 14.00 | 66.00 | 65.00 |",
                 markdown,
             )
             self.assertIn(
