@@ -44,6 +44,11 @@ TUNED_MISS_RE = re.compile(
     r"shape is M:(?P<m>\d+), N:(?P<n>\d+), K:(?P<k>\d+).*"
     r"not found tuned config in (?P<config>\S+)"
 )
+SHARD_PROGRESS_RE = re.compile(
+    r"Multi-thread loading shards:\s+"
+    r"(?P<pct>\d+)% Completed \| (?P<done>\d+)/(?P<total>\d+) "
+    r"\[(?P<elapsed>[0-9:]+)(?:<|,)"
+)
 
 
 def stable_json(data: Any) -> str:
@@ -90,6 +95,16 @@ def parse_start_line(line: str) -> datetime | None:
     )
 
 
+def parse_elapsed_to_seconds(value: str) -> float:
+    parts = [int(part) for part in value.split(":")]
+    if len(parts) == 1:
+        return float(parts[0])
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return float(seconds)
+
+
 def summarize_rank_seconds(values: dict[int, float]) -> dict[str, Any]:
     if not values:
         return {
@@ -115,6 +130,63 @@ def summarize_rank_seconds(values: dict[int, float]) -> dict[str, Any]:
     }
 
 
+def parse_shard_progress_line(line: str) -> dict[str, Any] | None:
+    matches = list(SHARD_PROGRESS_RE.finditer(line))
+    if not matches:
+        return None
+
+    updates: list[dict[str, Any]] = []
+    for match in matches:
+        updates.append(
+            {
+                "percent": int(match.group("pct")),
+                "completed": int(match.group("done")),
+                "total": int(match.group("total")),
+                "elapsed_s": parse_elapsed_to_seconds(match.group("elapsed")),
+            }
+        )
+
+    final_updates = [
+        update for update in updates if update["completed"] == update["total"]
+    ]
+    best = max(
+        final_updates or updates,
+        key=lambda update: (update["completed"], update["elapsed_s"]),
+    )
+    return {
+        "update_count": len(updates),
+        "completed": best["completed"],
+        "total": best["total"],
+        "elapsed_s": best["elapsed_s"],
+        "final_seen": bool(final_updates),
+    }
+
+
+def summarize_shard_progress(
+    records: list[dict[str, Any]], *, kind: str | None = None
+) -> dict[str, Any]:
+    filtered = [
+        record
+        for record in records
+        if kind is None or record.get("kind") == kind
+    ]
+    if not filtered:
+        return {
+            "event_count": 0,
+            "elapsed_s_max": None,
+            "completed_shards_max": None,
+            "total_shards_max": None,
+            "update_count_total": 0,
+        }
+    return {
+        "event_count": len(filtered),
+        "elapsed_s_max": max(float(record["elapsed_s"]) for record in filtered),
+        "completed_shards_max": max(int(record["completed"]) for record in filtered),
+        "total_shards_max": max(int(record["total"]) for record in filtered),
+        "update_count_total": sum(int(record["update_count"]) for record in filtered),
+    }
+
+
 def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
     start_ts: datetime | None = None
     ready_ts: datetime | None = None
@@ -126,6 +198,8 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
     aiter_build_starts: Counter[tuple[str, str]] = Counter()
     aiter_build_events: list[dict[str, Any]] = []
     tuned_misses: Counter[tuple[str, str, str, str]] = Counter()
+    shard_progress_records: list[dict[str, Any]] = []
+    pending_shard_progress: dict[str, Any] | None = None
     ready_seen = False
 
     with path.open("r", encoding="utf-8", errors="replace") as fin:
@@ -145,12 +219,28 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
                 elapsed = float(load_match.group("elapsed"))
                 if load_type == "DSparkDraftModel":
                     draft_load[rank] = elapsed
+                    load_kind = "draft"
                 else:
                     target_load[rank] = elapsed
+                    load_kind = "target"
+                if pending_shard_progress is not None:
+                    shard_progress_records.append(
+                        {
+                            **pending_shard_progress,
+                            "kind": load_kind,
+                            "model_type": load_type,
+                            "first_end_rank": rank,
+                        }
+                    )
+                    pending_shard_progress = None
 
             graph_match = GRAPH_RE.search(line)
             if graph_match and rank is not None:
                 draft_graph[rank] = float(graph_match.group("elapsed"))
+
+            shard_progress = parse_shard_progress_line(line)
+            if shard_progress is not None:
+                pending_shard_progress = shard_progress
 
             import_match = IMPORT_RE.search(line)
             if import_match:
@@ -210,6 +300,13 @@ def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
         "draft_verify_graph_capture": summarize_rank_seconds(draft_graph),
         "aiter_builds": summarize_aiter_builds(aiter_build_events),
         "aiter_build_events": aiter_build_events,
+        "shard_loading_progress": shard_progress_records,
+        "target_shard_loading_progress": summarize_shard_progress(
+            shard_progress_records, kind="target"
+        ),
+        "draft_shard_loading_progress": summarize_shard_progress(
+            shard_progress_records, kind="draft"
+        ),
         "aiter_build_starts": [
             {"module": module, "path": build_path, "count": count}
             for (module, build_path), count in sorted(aiter_build_starts.items())
@@ -281,7 +378,15 @@ def sum_aiter_build_seconds(run: dict[str, Any], field: str) -> float:
 def observed_launch_stages(run: dict[str, Any]) -> list[dict[str, Any]]:
     stage_specs = [
         ("target_weight_load", run["target_weight_load"].get("max_s")),
+        (
+            "target_shard_loading_progress",
+            run["target_shard_loading_progress"].get("elapsed_s_max"),
+        ),
         ("draft_weight_load", run["draft_weight_load"].get("max_s")),
+        (
+            "draft_shard_loading_progress",
+            run["draft_shard_loading_progress"].get("elapsed_s_max"),
+        ),
         (
             "draft_verify_graph_capture",
             run["draft_verify_graph_capture"].get("max_s"),
@@ -319,6 +424,12 @@ def summarize_launch_insight(run: dict[str, Any]) -> dict[str, Any]:
         "aiter_cache_action": aiter_cache_action,
         "tuned_miss_events": miss_events,
         "tuned_miss_shapes": miss_shapes,
+        "target_shard_progress_elapsed_s": run["target_shard_loading_progress"].get(
+            "elapsed_s_max"
+        ),
+        "draft_shard_progress_elapsed_s": run["draft_shard_loading_progress"].get(
+            "elapsed_s_max"
+        ),
         "tuned_miss_action": (
             "generate_tuned_miss_inputs" if miss_events else "no_tuned_miss_action"
         ),
@@ -435,6 +546,35 @@ def render_markdown(report: dict[str, Any]) -> str:
                 miss_action=insight.get("tuned_miss_action", "-"),
             )
         )
+
+    shard_rows = [
+        (run, record)
+        for run in report["runs"]
+        for record in run.get("shard_loading_progress", [])
+    ]
+    if shard_rows:
+        lines.extend(
+            [
+                "",
+                "## Shard Loading Progress",
+                "",
+                "| run | kind | model_type | completed | total | progress_elapsed_s | updates | first_end_rank |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for run, record in shard_rows:
+            lines.append(
+                "| {label} | {kind} | {model_type} | {completed} | {total} | {elapsed} | {updates} | {rank} |".format(
+                    label=run["label"],
+                    kind=record.get("kind", "-"),
+                    model_type=record.get("model_type", "-"),
+                    completed=record.get("completed", "-"),
+                    total=record.get("total", "-"),
+                    elapsed=format_seconds(record.get("elapsed_s")),
+                    updates=record.get("update_count", "-"),
+                    rank=record.get("first_end_rank", "-"),
+                )
+            )
 
     if report.get("cache_dirs"):
         lines.extend(

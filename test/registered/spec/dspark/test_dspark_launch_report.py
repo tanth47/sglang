@@ -24,10 +24,12 @@ class TestDSparkLaunchReport(CustomTestCase):
                 "\n".join(
                     [
                         "Sat Jul 11 19:03:15 UTC 2026",
+                        "Multi-thread loading shards:   0% Completed | 0/141 [00:00<?, ?it/s] Multi-thread loading shards: 100% Completed | 141/141 [00:22<00:00,  6.30it/s]",
                         "[2026-07-11 19:06:10 TP3] Load weight end. elapsed=114.88 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:06:11 TP2] Load weight end. elapsed=115.28 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:06:48 TP1] Load weight end. elapsed=152.65 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
                         "[2026-07-11 19:07:02 TP0] Load weight end. elapsed=167.05 s, type=GlmMoeDsaForCausalLM, quant=fp8.",
+                        "Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s] Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00, 940.43it/s]",
                         "[2026-07-11 19:07:08 TP3] Load weight end. elapsed=0.82 s, type=DSparkDraftModel, avail mem=107.95 GB.",
                         "[2026-07-11 19:07:26 TP3] Capture draft verify CUDA graph end. elapsed=14.74 s, mem usage=1.53 GB.",
                         "[aiter] import [module_moe] under /sgl-workspace/aiter/aiter/jit/module_moe.so",
@@ -57,6 +59,17 @@ class TestDSparkLaunchReport(CustomTestCase):
             self.assertEqual(run["target_weight_load"]["slowest_rank"], 0)
             self.assertAlmostEqual(run["target_weight_load"]["max_s"], 167.05)
             self.assertAlmostEqual(run["target_weight_load"]["skew_s"], 52.17)
+            self.assertEqual(run["target_shard_loading_progress"]["event_count"], 1)
+            self.assertEqual(
+                run["target_shard_loading_progress"]["total_shards_max"], 141
+            )
+            self.assertAlmostEqual(
+                run["target_shard_loading_progress"]["elapsed_s_max"], 22.0
+            )
+            self.assertEqual(run["draft_shard_loading_progress"]["event_count"], 1)
+            self.assertEqual(
+                run["draft_shard_loading_progress"]["total_shards_max"], 1
+            )
             self.assertEqual(run["draft_verify_graph_capture"]["rank_count"], 1)
             self.assertAlmostEqual(run["draft_weight_load"]["max_s"], 0.82)
             self.assertAlmostEqual(run["draft_verify_graph_capture"]["max_s"], 14.74)
@@ -79,6 +92,9 @@ class TestDSparkLaunchReport(CustomTestCase):
             self.assertAlmostEqual(
                 run["launch_insight"]["dominant_observed_stage"]["seconds"], 167.05
             )
+            self.assertAlmostEqual(
+                run["launch_insight"]["target_shard_progress_elapsed_s"], 22.0
+            )
             self.assertEqual(
                 run["launch_insight"]["aiter_cache_action"],
                 "prewarm_or_reuse_aiter_jit_cache",
@@ -98,6 +114,10 @@ class TestDSparkLaunchReport(CustomTestCase):
             )
             self.assertIn(
                 "| r4b | target_weight_load | 167.05 | prewarm_or_reuse_aiter_jit_cache | generate_tuned_miss_inputs |",
+                markdown,
+            )
+            self.assertIn(
+                "| r4b | target | GlmMoeDsaForCausalLM | 141 | 141 | 22.00 | 2 | 3 |",
                 markdown,
             )
             self.assertIn("aiter_jit", markdown)
