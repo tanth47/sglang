@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import logging
@@ -42,7 +43,9 @@ try:
         load_sps_table_from_path,
         profile_sps_table,
     )
-except ImportError as exc:
+except (ImportError, RuntimeError) as exc:
+    if isinstance(exc, RuntimeError) and "No HIP GPUs are available" not in str(exc):
+        raise
     logger.warning(
         "Full sglang runtime unavailable (%s); using a torch-free fallback import. "
         "The 'fit' subcommand works; 'run' requires the full sglang install.",
@@ -58,8 +61,17 @@ except ImportError as exc:
     profile_sps_table = _table_module.profile_sps_table
     DEFAULT_TIMEOUT = 60
     get_tokenizer = None
-    should_skip_due_to_max_running_requests = None
-    should_skip_due_to_token_capacity = None
+
+    def should_skip_due_to_max_running_requests(
+        batch_size, skip_max_running_requests_threshold
+    ):
+        return batch_size > skip_max_running_requests_threshold
+
+    def should_skip_due_to_token_capacity(
+        batch_size, input_len, output_len, skip_token_capacity_threshold
+    ):
+        return batch_size * (input_len + output_len) > skip_token_capacity_threshold
+
 
 DEFAULT_OUT = "~/main/artifacts/sglang/dspark_sps_table.json"
 DEFAULT_MAX_BATCH_SIZE = 256
@@ -68,6 +80,7 @@ DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MIN_STEADY_STEPS = 32
 DEFAULT_MIN_STEADY_SECONDS = 10.0
 DEFAULT_ROUND_TIMEOUT_SECONDS = 300.0
+DEFAULT_ADDITIVE_M_BIN_WIDTH = 64
 ROUND_WARMUP_STEPS = 8
 ROUND_STEP_SLACK = 64
 STEP_TIME_FLOOR_SECONDS = 0.02
@@ -173,6 +186,7 @@ class RoundOutcome(msgspec.Struct, frozen=True):
     rank_rows: list[list[SpsRow]]
     load_info: LoadInfo
     frac: Optional[float] = None
+    budget_match_fraction: Optional[float] = None
 
 
 def out_paths(*, out: str) -> dict[str, Path]:
@@ -184,6 +198,26 @@ def out_paths(*, out: str) -> dict[str, Path]:
         "manifest": out_path.with_name(out_path.name + ".manifest.json"),
         "plot": out_path.with_name(out_path.stem + ".plot.png"),
     }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fin:
+        for chunk in iter(lambda: fin.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_entry(path: Path) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "path": str(path),
+        "name": path.name,
+        "exists": path.exists(),
+    }
+    if path.exists() and path.is_file():
+        entry["size_bytes"] = path.stat().st_size
+        entry["sha256"] = sha256_file(path)
+    return entry
 
 
 def run_profile(
@@ -296,8 +330,10 @@ def run_profile(
 
     write_manifest(
         manifest_path=paths["manifest"],
+        table_path=paths["table"],
         records_path=paths["records"],
         rounds_path=paths["rounds"],
+        plot_path=paths["plot"],
         context=context,
         batch_sizes=batch_sizes,
         settings=settings,
@@ -318,6 +354,7 @@ def fit_profile(
     *,
     out: str,
     max_batch_tokens: Optional[int],
+    m_bin_width: Optional[int],
     self_check: bool,
     plot: bool,
 ) -> None:
@@ -334,7 +371,10 @@ def fit_profile(
     offdiag = any(summary.get("frac") is not None for summary in summaries)
 
     table = build_table_from_summaries(
-        summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
+        summaries=summaries,
+        max_batch_tokens=max_batch_tokens,
+        offdiag=offdiag,
+        m_bin_width=m_bin_width,
     )
     paths["table"].write_text(table.to_json(), encoding="utf-8")
     if offdiag:
@@ -360,6 +400,7 @@ def fit_profile(
 
     if self_check:
         run_self_check(out_path=paths["table"], offdiag=offdiag)
+    refresh_manifest_artifacts(out=out)
 
 
 def profile_all(
@@ -369,6 +410,7 @@ def profile_all(
     settings: RoundSettings,
     out: str,
     max_batch_tokens: Optional[int],
+    m_bin_width: Optional[int],
     repeats: int,
     self_check: bool,
     local_tokenizer_path: Optional[str],
@@ -389,6 +431,7 @@ def profile_all(
     fit_profile(
         out=out,
         max_batch_tokens=max_batch_tokens,
+        m_bin_width=m_bin_width,
         self_check=self_check,
         plot=plot,
     )
@@ -415,11 +458,16 @@ def summaries_to_cells(*, summaries: list[dict]) -> list[dict]:
 
 
 def build_table_from_summaries(
-    *, summaries: list[dict], max_batch_tokens: Optional[int], offdiag: bool
+    *,
+    summaries: list[dict],
+    max_batch_tokens: Optional[int],
+    offdiag: bool,
+    m_bin_width: Optional[int] = None,
 ):
     if offdiag:
         return build_additive_table_from_cells(
-            cells=summaries_to_cells(summaries=summaries)
+            cells=summaries_to_cells(summaries=summaries),
+            m_bin_width=m_bin_width,
         )
 
     by_batch_tokens: dict[int, list[float]] = {}
@@ -677,81 +725,87 @@ def run_one_round(
     ):
         return None
 
+    forced_budget_set = False
     if frac is not None:
         set_forced_budget_frac(base_url=context.base_url, frac=frac)
+        forced_budget_set = True
 
-    flush_cache(base_url=context.base_url)
-    watermarks = [
-        max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(
+    try:
+        flush_cache(base_url=context.base_url)
+        watermarks = [
+            max((row.forward_ct for row in rows), default=-1)
+            for rows in fetch_rank_rows(
+                base_url=context.base_url, record_source=context.record_source
+            )
+        ]
+
+        start_time = time.monotonic()
+        load_thread = start_load(
+            base_url=context.base_url,
+            num_requests=batch_size,
+            input_len=settings.input_len,
+            max_new_tokens=max_new_tokens,
+            temperature=settings.temperature,
+            vocab_size=vocab_size,
+            rng=rng,
+        )
+        reached_target = wait_for_aligned_steps(
+            context=context,
+            watermarks=watermarks,
+            batch_size_per_rank=batch_size_per_rank,
+            min_steady_steps=settings.min_steady_steps,
+            min_steady_seconds=settings.min_steady_seconds,
+            timeout_seconds=settings.round_timeout_seconds,
+        )
+        abort_all_requests(base_url=context.base_url)
+        load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+        if load_thread.is_alive():
+            logger.warning(
+                "Load batch for bs=%s did not return within %.0fs after abort; "
+                "continuing with the collected records.",
+                batch_size,
+                LOAD_JOIN_TIMEOUT_SECONDS,
+            )
+        wall_seconds = time.monotonic() - start_time
+        if not reached_target:
+            logger.warning(
+                "Round bs=%s hit the %.0fs timeout before both gates (>=%s steady "
+                "steps and >=%.1fs) were met; proceeding with what was collected.",
+                batch_size,
+                settings.round_timeout_seconds,
+                settings.min_steady_steps,
+                settings.min_steady_seconds,
+            )
+
+        rank_rows = fetch_rank_rows(
             base_url=context.base_url, record_source=context.record_source
         )
-    ]
-
-    start_time = time.monotonic()
-    load_thread = start_load(
-        base_url=context.base_url,
-        num_requests=batch_size,
-        input_len=settings.input_len,
-        max_new_tokens=max_new_tokens,
-        temperature=settings.temperature,
-        vocab_size=vocab_size,
-        rng=rng,
-    )
-    reached_target = wait_for_aligned_steps(
-        context=context,
-        watermarks=watermarks,
-        batch_size_per_rank=batch_size_per_rank,
-        min_steady_steps=settings.min_steady_steps,
-        min_steady_seconds=settings.min_steady_seconds,
-        timeout_seconds=settings.round_timeout_seconds,
-    )
-    abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
-    if load_thread.is_alive():
-        logger.warning(
-            "Load batch for bs=%s did not return within %.0fs after abort; "
-            "continuing with the collected records.",
-            batch_size,
-            LOAD_JOIN_TIMEOUT_SECONDS,
+        if len(rank_rows) != len(watermarks):
+            raise RuntimeError(
+                f"DP rank count changed mid-profile: {len(watermarks)} -> "
+                f"{len(rank_rows)}."
+            )
+        new_rank_rows = [
+            [row for row in rows if row.forward_ct > watermark]
+            for rows, watermark in zip(rank_rows, watermarks)
+        ]
+        return postprocess_round(
+            rank_rows=new_rank_rows,
+            batch_size_per_rank=batch_size_per_rank,
+            dp_size=context.dp_size,
+            verify_num_draft_tokens=context.verify_num_draft_tokens,
+            min_steady_steps=settings.min_steady_steps,
+            load_info=LoadInfo(
+                num_requests=batch_size,
+                max_new_tokens=max_new_tokens,
+                wall_seconds=round(wall_seconds, 3),
+                reached_target=reached_target,
+            ),
+            frac=frac,
         )
-    wall_seconds = time.monotonic() - start_time
-    if not reached_target:
-        logger.warning(
-            "Round bs=%s hit the %.0fs timeout before both gates (>=%s steady "
-            "steps and >=%.1fs) were met; proceeding with what was collected.",
-            batch_size,
-            settings.round_timeout_seconds,
-            settings.min_steady_steps,
-            settings.min_steady_seconds,
-        )
-
-    rank_rows = fetch_rank_rows(
-        base_url=context.base_url, record_source=context.record_source
-    )
-    if len(rank_rows) != len(watermarks):
-        raise RuntimeError(
-            f"DP rank count changed mid-profile: {len(watermarks)} -> "
-            f"{len(rank_rows)}."
-        )
-    new_rank_rows = [
-        [row for row in rows if row.forward_ct > watermark]
-        for rows, watermark in zip(rank_rows, watermarks)
-    ]
-    return postprocess_round(
-        rank_rows=new_rank_rows,
-        batch_size_per_rank=batch_size_per_rank,
-        dp_size=context.dp_size,
-        verify_num_draft_tokens=context.verify_num_draft_tokens,
-        min_steady_steps=settings.min_steady_steps,
-        load_info=LoadInfo(
-            num_requests=batch_size,
-            max_new_tokens=max_new_tokens,
-            wall_seconds=round(wall_seconds, 3),
-            reached_target=reached_target,
-        ),
-        frac=frac,
-    )
+    finally:
+        if forced_budget_set:
+            set_forced_budget_frac(base_url=context.base_url, frac=None)
 
 
 def start_load(
@@ -976,31 +1030,10 @@ def postprocess_round(
         )
 
     aligned_cts: list[int] = []
-    aligned_verify_tokens: set[int] = set()
     for ct in sorted(common_cts):
         rows_at_ct = [by_ct[ct] for by_ct in by_ct_per_rank]
         if all(row.num_running_reqs == batch_size_per_rank for row in rows_at_ct):
-            for rank_index, row in enumerate(rows_at_ct):
-                if not offdiag and row.num_verify_tokens < expected_tokens:
-                    raise RuntimeError(
-                        f"DP rank {rank_index} at forward_ct={ct} reports "
-                        f"num_verify_tokens={row.num_verify_tokens}, expected at "
-                        f"least {expected_tokens} (= {batch_size_per_rank} reqs x "
-                        f"{verify_num_draft_tokens}); ranks are not running the "
-                        "uniform static verify the table assumes. The recorded "
-                        "count is the replayed graph tier, which may exceed the "
-                        "candidate count when a bs is not an exact capture tier."
-                    )
-                aligned_verify_tokens.add(row.num_verify_tokens)
             aligned_cts.append(ct)
-
-    if not offdiag and len(aligned_verify_tokens) != 1:
-        raise RuntimeError(
-            f"Round bs={batch_size} aligned steps ran at differing "
-            f"num_verify_tokens {sorted(aligned_verify_tokens)} across ranks/steps; "
-            "the static SPS table needs a single replayed graph tier for this "
-            "probe. Inspect the raw records."
-        )
 
     if len(aligned_cts) < ROUND_WARMUP_STEPS + min_steady_steps:
         raise RuntimeError(
@@ -1033,28 +1066,75 @@ def postprocess_round(
         )
 
     steady_cts = aligned_cts[ROUND_WARMUP_STEPS:]
+    batch_tokens = expected_tokens
+    budget_match_fraction: Optional[float] = None
+    profile_cts = steady_cts
+    if offdiag:
+        budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
+        batch_tokens = batch_size_per_rank + budget
+        profile_cts = [
+            ct
+            for ct in steady_cts
+            if all(
+                row.num_verify_tokens >= batch_tokens
+                for row in (by_ct[ct] for by_ct in by_ct_per_rank)
+            )
+        ]
+        budget_match_fraction = (
+            len(profile_cts) / len(steady_cts) if steady_cts else None
+        )
+        if len(profile_cts) < min_steady_steps:
+            raise RuntimeError(
+                f"Round bs={batch_size} frac={frac}: only {len(profile_cts)} "
+                f"of {len(steady_cts)} steady steps reached pinned M={batch_tokens} "
+                f"(need at least {min_steady_steps}). The confidence scheduler "
+                "under-filled the forced budget too often for a clean SPS probe."
+            )
+
+    profile_verify_tokens: set[int] = set()
+    for ct in profile_cts:
+        rows_at_ct = [by_ct[ct] for by_ct in by_ct_per_rank]
+        for rank_index, row in enumerate(rows_at_ct):
+            if not offdiag and row.num_verify_tokens < expected_tokens:
+                raise RuntimeError(
+                    f"DP rank {rank_index} at forward_ct={ct} reports "
+                    f"num_verify_tokens={row.num_verify_tokens}, expected at "
+                    f"least {expected_tokens} (= {batch_size_per_rank} reqs x "
+                    f"{verify_num_draft_tokens}); ranks are not running the "
+                    "uniform static verify the table assumes. The recorded "
+                    "count is the replayed graph tier, which may exceed the "
+                    "candidate count when a bs is not an exact capture tier."
+                )
+            profile_verify_tokens.add(row.num_verify_tokens)
+
+    if not offdiag and len(profile_verify_tokens) != 1:
+        raise RuntimeError(
+            f"Round bs={batch_size} steady steps ran at differing "
+            f"num_verify_tokens {sorted(profile_verify_tokens)} across ranks/steps; "
+            "the static SPS table needs a single replayed graph tier for this "
+            "probe. Inspect the raw records."
+        )
+
     per_ct_step_times = [
         statistics.fmean(by_ct[ct].step_time for by_ct in by_ct_per_rank)
-        for ct in steady_cts
+        for ct in profile_cts
     ]
     per_rank_median_step_time = [
-        statistics.median(by_ct[ct].step_time for ct in steady_cts)
+        statistics.median(by_ct[ct].step_time for ct in profile_cts)
         for by_ct in by_ct_per_rank
     ]
     median_step_time = statistics.median(per_ct_step_times)
 
     if offdiag:
-        if len(aligned_verify_tokens) != 1:
+        if len(profile_verify_tokens) != 1:
             raise RuntimeError(
-                f"Round bs={batch_size} frac={frac}: aligned steps ran at "
-                f"differing num_verify_tokens {sorted(aligned_verify_tokens)}; the "
+                f"Round bs={batch_size} frac={frac}: steady steps ran at "
+                f"differing num_verify_tokens {sorted(profile_verify_tokens)}; the "
                 "budget pin did not hold a single graph tier across all "
                 "ranks/steps, so the measurement is ambiguous. Inspect the raw "
                 "records."
             )
-        graph_tier = aligned_verify_tokens.pop()
-        budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
-        batch_tokens = batch_size_per_rank + budget
+        graph_tier = profile_verify_tokens.pop()
         if graph_tier < batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
@@ -1062,20 +1142,19 @@ def postprocess_round(
                 f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
                 f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
             )
-    else:
-        batch_tokens = expected_tokens
 
     return RoundOutcome(
         batch_size=batch_size,
         batch_size_per_rank=batch_size_per_rank,
         batch_tokens=batch_tokens,
         steps_per_sec=1.0 / median_step_time,
-        num_steady_steps=len(steady_cts),
+        num_steady_steps=len(profile_cts),
         match_fraction=match_fraction,
         per_rank_median_step_time=per_rank_median_step_time,
         rank_rows=rank_rows,
         load_info=load_info,
         frac=frac,
+        budget_match_fraction=budget_match_fraction,
     )
 
 
@@ -1213,12 +1292,19 @@ def plot_fit(*, cells: list[dict], table, plot_path: Path) -> None:
     logger.info("Wrote fit plot to %s", plot_path)
 
 
-def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTable:
+def build_additive_table_from_cells(
+    *, cells: list[dict], m_bin_width: Optional[int] = None
+) -> SpsAdditiveCostTable:
     if len(cells) < 4:
         raise RuntimeError(
             f"Off-diagonal fit needs at least 4 cells, got {len(cells)}."
         )
-    bias, alpha, theta, _rel, _stats = ols_resid_backfit(cells)
+    resolved_m_bin_width = resolve_additive_m_bin_width(
+        cells=cells, m_bin_width=m_bin_width
+    )
+    bias, alpha, theta, _rel, _stats = ols_resid_backfit(
+        cells, mbin_w=resolved_m_bin_width
+    )
     bs_probes = sorted(alpha)
     m_probes = sorted(theta)
     return SpsAdditiveCostTable(
@@ -1230,7 +1316,26 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
     )
 
 
-def ols_resid_backfit(cells: list, mbin_w: int = 64):
+def resolve_additive_m_bin_width(
+    *, cells: list[dict], m_bin_width: Optional[int] = None
+) -> int:
+    if m_bin_width is not None:
+        if m_bin_width < 1:
+            raise ValueError(f"m_bin_width must be >= 1, got {m_bin_width}.")
+        return int(m_bin_width)
+
+    max_m = max(int(c["M"]) for c in cells)
+    if max_m < DEFAULT_ADDITIVE_M_BIN_WIDTH:
+        # Small profiler sweeps (for example bs<=4 smoke runs) otherwise collapse
+        # all M values into bin 0 under the production-sized 64-token bin.
+        return max(1, math.ceil(max_m / 8))
+    return DEFAULT_ADDITIVE_M_BIN_WIDTH
+
+
+def ols_resid_backfit(cells: list, mbin_w: int = DEFAULT_ADDITIVE_M_BIN_WIDTH):
+    if mbin_w < 1:
+        raise ValueError(f"mbin_w must be >= 1, got {mbin_w}.")
+
     def mbin(m):
         return round(m / mbin_w) * mbin_w
 
@@ -1292,6 +1397,7 @@ def round_summary_dict(*, outcome: RoundOutcome, repeat: int) -> dict:
         "steps_per_sec": outcome.steps_per_sec,
         "num_steady_steps": outcome.num_steady_steps,
         "match_fraction": outcome.match_fraction,
+        "budget_match_fraction": outcome.budget_match_fraction,
         "per_rank_median_step_time": outcome.per_rank_median_step_time,
         "load_info": msgspec.to_builtins(outcome.load_info),
     }
@@ -1334,8 +1440,10 @@ def append_round_files(
 def write_manifest(
     *,
     manifest_path: Path,
+    table_path: Path,
     records_path: Path,
     rounds_path: Path,
+    plot_path: Path,
     context: ServerContext,
     batch_sizes: list[int],
     settings: RoundSettings,
@@ -1360,11 +1468,34 @@ def write_manifest(
         "static_conditioning_caveat": STATIC_CONDITIONING_CAVEAT,
         "records_jsonl": records_path.name,
         "rounds_jsonl": rounds_path.name,
+        "artifacts": {
+            "table": artifact_entry(table_path),
+            "records_jsonl": artifact_entry(records_path),
+            "rounds_jsonl": artifact_entry(rounds_path),
+            "plot": artifact_entry(plot_path),
+        },
         "round_summaries": [
             round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
         ],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def refresh_manifest_artifacts(*, out: str) -> bool:
+    paths = out_paths(out=out)
+    manifest_path = paths["manifest"]
+    if not manifest_path.exists():
+        return False
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"] = {
+        "table": artifact_entry(paths["table"]),
+        "records_jsonl": artifact_entry(paths["records"]),
+        "rounds_jsonl": artifact_entry(paths["rounds"]),
+        "plot": artifact_entry(paths["plot"]),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return True
 
 
 def run_self_check(*, out_path: Path, offdiag: bool) -> None:
@@ -1561,6 +1692,16 @@ def add_fit_args(parser: argparse.ArgumentParser) -> None:
         "to the largest probed batch_tokens). Ignored for off-diagonal fits.",
     )
     parser.add_argument(
+        "--m-bin-width",
+        type=int,
+        default=None,
+        help=(
+            "Off-diagonal additive fit only: bin width for M=num verify tokens. "
+            "Defaults to 64 for production-sized sweeps, but automatically shrinks "
+            "for small M-only smoke sweeps so the M dimension does not collapse."
+        ),
+    )
+    parser.add_argument(
         "--no-self-check",
         dest="self_check",
         action="store_false",
@@ -1639,6 +1780,7 @@ def cli_main() -> None:
         fit_profile(
             out=args.out,
             max_batch_tokens=args.max_batch_tokens,
+            m_bin_width=args.m_bin_width,
             self_check=args.self_check,
             plot=args.plot,
         )
@@ -1649,6 +1791,7 @@ def cli_main() -> None:
             settings=run_settings(args=args),
             out=args.out,
             max_batch_tokens=args.max_batch_tokens,
+            m_bin_width=args.m_bin_width,
             repeats=args.repeats,
             self_check=args.self_check,
             local_tokenizer_path=args.local_tokenizer_path,
