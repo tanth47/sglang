@@ -17,9 +17,14 @@ class TestDSparkLaunchReport(CustomTestCase):
             log = root / "server.log"
             cache = root / "cache"
             nested = cache / "nested"
+            rocm_smi = root / "rocm_smi.txt"
             nested.mkdir(parents=True)
             (cache / "module.so").write_bytes(b"abc")
             (nested / "kernel.cpp").write_bytes(b"12345")
+            rocm_smi.write_text(
+                "GPU[0] VRAM Total Memory (B): 196592402432\n",
+                encoding="utf-8",
+            )
             log.write_text(
                 "\n".join(
                     [
@@ -46,6 +51,7 @@ class TestDSparkLaunchReport(CustomTestCase):
             launch_report = report.build_report(
                 runs=[("r4b", log)],
                 cache_dirs=[("aiter_jit", cache)],
+                resource_snapshots=[("rocm_smi", rocm_smi)],
                 provenance={"metadata": {"git_commit": "abc123"}},
             )
             run = launch_report["runs"][0]
@@ -103,6 +109,10 @@ class TestDSparkLaunchReport(CustomTestCase):
             )
             self.assertEqual(launch_report["cache_dirs"][0]["file_count"], 2)
             self.assertEqual(launch_report["cache_dirs"][0]["total_size_bytes"], 8)
+            self.assertEqual(
+                launch_report["resource_snapshots"][0]["label"], "rocm_smi"
+            )
+            self.assertIn("sha256", launch_report["resource_snapshots"][0])
             self.assertIn("sha256", run["log"])
 
             markdown = report.render_markdown(launch_report)
@@ -119,6 +129,8 @@ class TestDSparkLaunchReport(CustomTestCase):
                 markdown,
             )
             self.assertIn("aiter_jit", markdown)
+            self.assertIn("## Resource Snapshots", markdown)
+            self.assertIn("rocm_smi", markdown)
 
     def test_launch_insight_preserves_warm_aiter_cache(self):
         with tempfile.TemporaryDirectory() as td:

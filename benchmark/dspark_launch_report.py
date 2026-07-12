@@ -20,7 +20,7 @@ try:
 except ModuleNotFoundError:
     from dspark_profile_artifacts import add_provenance_args, provenance_from_args
 
-SCHEMA = "sglang-dspark-launch-report-v4"
+SCHEMA = "sglang-dspark-launch-report-v5"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 START_RE = re.compile(
@@ -462,10 +462,17 @@ def inventory_cache_dir(label: str, path: Path) -> dict[str, Any]:
     return entry
 
 
+def inventory_resource_snapshot(label: str, path: Path) -> dict[str, Any]:
+    entry = artifact_entry(path)
+    entry["label"] = label
+    return entry
+
+
 def build_report(
     *,
     runs: list[tuple[str, Path]],
     cache_dirs: list[tuple[str, Path]],
+    resource_snapshots: list[tuple[str, Path]] | None = None,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_records = [parse_launch_log(label, path) for label, path in runs]
@@ -477,6 +484,10 @@ def build_report(
         "provenance": provenance or {},
         "runs": run_records,
         "cache_dirs": [inventory_cache_dir(label, path) for label, path in cache_dirs],
+        "resource_snapshots": [
+            inventory_resource_snapshot(label, path)
+            for label, path in resource_snapshots or []
+        ],
     }
 
 
@@ -590,6 +601,23 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{cache['file_count']} | {cache['total_size_bytes']} |"
             )
 
+    if report.get("resource_snapshots"):
+        lines.extend(
+            [
+                "",
+                "## Resource Snapshots",
+                "",
+                "| label | path | exists | size_bytes | sha256 |",
+                "| --- | --- | ---: | ---: | --- |",
+            ]
+        )
+        for snapshot in report["resource_snapshots"]:
+            lines.append(
+                f"| {snapshot['label']} | `{snapshot['path']}` | "
+                f"{snapshot['exists']} | {snapshot.get('size_bytes', 0)} | "
+                f"{snapshot.get('sha256', '-')} |"
+            )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -649,6 +677,16 @@ def main() -> None:
         metavar="LABEL=PATH",
         help="Optional cache directory to inventory. Can be repeated.",
     )
+    parser.add_argument(
+        "--resource-snapshot",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Optional resource/profiling snapshot to hash into the report, e.g. "
+            "rocm_smi=/artifacts/preflight_rocm_smi.txt. Can be repeated."
+        ),
+    )
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--markdown-output", type=Path)
     parser.add_argument(
@@ -667,6 +705,9 @@ def main() -> None:
     report = build_report(
         runs=[(label, Path(path).expanduser()) for label, path in args.run],
         cache_dirs=[parse_label_path(value) for value in args.cache_dir],
+        resource_snapshots=[
+            parse_label_path(value) for value in args.resource_snapshot
+        ],
         provenance=provenance_from_args(args),
     )
 
