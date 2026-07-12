@@ -8,12 +8,6 @@ import torch
 # tensors, so keep their construction on torch for this module without leaking
 # env defaults to the rest of the test process.
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import (
-    TRTLLMHAAttnBackend,
-    _resolve_ragged_verify_layout,
-    build_ragged_target_verify_geometry,
-)
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.kernels import (
     padded_to_bucket as _padded_to_bucket_mod,
 )
@@ -23,6 +17,45 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_TRTLLM_MHA_IMPORT_ERROR = None
+_DFLASH_VERIFY_INPUT_IMPORT_ERROR = None
+try:
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnBackend,
+        _resolve_ragged_verify_layout,
+        build_ragged_target_verify_geometry,
+    )
+except Exception as exc:
+    if torch.cuda.is_available():
+        raise
+    TRTLLMHAAttnBackend = None
+    _resolve_ragged_verify_layout = None
+    build_ragged_target_verify_geometry = None
+    _TRTLLM_MHA_IMPORT_ERROR = exc
+
+try:
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+except Exception as exc:
+    if torch.cuda.is_available():
+        raise
+    DFlashVerifyInput = None
+    _DFLASH_VERIFY_INPUT_IMPORT_ERROR = exc
+
+
+def requires_trtllm_mha_backend(obj):
+    return unittest.skipIf(
+        _TRTLLM_MHA_IMPORT_ERROR is not None,
+        f"requires TRTLLM MHA backend import: {_TRTLLM_MHA_IMPORT_ERROR}",
+    )(obj)
+
+
+def requires_dflash_verify_input(obj):
+    return unittest.skipIf(
+        _DFLASH_VERIFY_INPUT_IMPORT_ERROR is not None,
+        f"requires DFlashVerifyInput import: {_DFLASH_VERIFY_INPUT_IMPORT_ERROR}",
+    )(obj)
+
 
 _OLD_QO_INDPTR_KERNEL_IMPL = _qo_indptr_mod._KERNEL_IMPL
 _OLD_PADDED_TO_BUCKET_KERNEL_IMPL = _padded_to_bucket_mod._KERNEL_IMPL
@@ -54,9 +87,11 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
     def test_base_backend_defaults_false(self):
         self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
 
+    @requires_trtllm_mha_backend
     def test_trtllm_mha_supports_ragged_verify_graph(self):
         self.assertTrue(TRTLLMHAAttnBackend.supports_ragged_verify_graph)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires visible CUDA/ROCm device")
     def test_dsv4_supports_ragged_verify_graph(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -64,6 +99,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
 
         self.assertTrue(DeepseekV4AttnBackend.supports_ragged_verify_graph)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires visible CUDA/ROCm device")
     def test_dsv4_hip_radix_does_not_support_ragged_verify_graph(self):
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,
@@ -72,6 +108,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         self.assertFalse(DeepseekV4HipRadixBackend.supports_ragged_verify_graph)
 
 
+@requires_trtllm_mha_backend
 class TestResolveRaggedVerifyLayout(CustomTestCase):
     def test_none_without_spec_info(self):
         fb = types.SimpleNamespace(spec_info=None)
@@ -132,6 +169,7 @@ class TestResolveRaggedVerifyLayout(CustomTestCase):
         self.assertIsNone(layout.is_full_width)
 
 
+@requires_dflash_verify_input
 class TestDFlashVerifyInputRaggedLayout(CustomTestCase):
     def test_prefill_uses_graph_capacity_when_real_total_unknown(self):
         layout = RaggedVerifyLayout.from_verify_lens_device(
@@ -169,6 +207,7 @@ class TestDFlashVerifyInputRaggedLayout(CustomTestCase):
         self.assertIsNone(mask)
 
 
+@requires_trtllm_mha_backend
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
     def test_mixed_verify_lens_geometry(self):
         layout = RaggedVerifyLayout.from_verify_lens(
@@ -200,6 +239,7 @@ class TestRaggedTargetVerifyGeometry(CustomTestCase):
         self.assertEqual(int(geometry.cu_seqlens_q[-1]), layout.total_verify_tokens)
 
 
+@requires_trtllm_mha_backend
 class TestPaddedRaggedVerifyGeometry(CustomTestCase):
     def test_padded_layout_grows_bs_and_fills_bucket(self):
         raw = RaggedVerifyLayout.from_verify_lens(
@@ -311,6 +351,7 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         self.assertIs(padded, raw)
 
 
+@requires_trtllm_mha_backend
 class TestNegativeSeamGeometry(CustomTestCase):
     def test_uniform_capture_geometry_diverges_from_ragged(self):
         seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
@@ -389,6 +430,7 @@ def _fake_model_runner(capture_num_tokens, max_bs):
     return types.SimpleNamespace(decode_cuda_graph_runner=runner)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires visible CUDA/ROCm device")
 class TestBudgetTierSelection(CustomTestCase):
     def test_floor_uses_budget_upper_bound(self):
         from sglang.srt.speculative.dspark_components.dspark_verify import (

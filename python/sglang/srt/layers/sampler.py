@@ -43,7 +43,9 @@ if is_musa():
         top_p_renorm_prob,
     )
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_is_hip = is_hip()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 

@@ -129,7 +129,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 _is_musa = is_musa()
 
 # Experimental: skip the HIP padded-token routing-weight masking entirely.

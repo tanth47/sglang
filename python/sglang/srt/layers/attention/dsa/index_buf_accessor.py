@@ -10,11 +10,12 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
 # uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
 # is also enabled).
-_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
+_use_aiter_preshuffle = _use_aiter and aiter_can_use_preshuffle_paged_mqa()
 
 if _use_aiter_preshuffle:
     from aiter.ops.cache import cp_gather_indexer_k_quant_cache
