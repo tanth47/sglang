@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import re
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from benchmark.dspark_profile_artifacts import (
+        add_provenance_args,
+        provenance_from_args,
+    )
+except ModuleNotFoundError:
+    from dspark_profile_artifacts import add_provenance_args, provenance_from_args
+
+SCHEMA = "sglang-dspark-launch-report-v4"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+START_RE = re.compile(
+    r"^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} UTC \d{4}$"
+)
+TIMESTAMP_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?: TP(?P<rank>\d+))?\]"
+)
+LOAD_RE = re.compile(
+    r"Load weight end\. elapsed=(?P<elapsed>[0-9.]+) s, type=(?P<type>[^,\n]+)"
+)
+GRAPH_RE = re.compile(
+    r"Capture draft verify CUDA graph end\. elapsed=(?P<elapsed>[0-9.]+) s"
+)
+BUILD_START_RE = re.compile(r"start build \[(?P<module>[^\]]+)\] under (?P<path>\S+)")
+BUILD_FINISH_RE = re.compile(
+    r"finish build \[(?P<module>[^\]]+)\], cost (?P<cost>[0-9.]+)s"
+)
+IMPORT_RE = re.compile(r"import \[(?P<module>[^\]]+)\] under (?P<path>\S+)")
+TUNED_MISS_RE = re.compile(
+    r"shape is M:(?P<m>\d+), N:(?P<n>\d+), K:(?P<k>\d+).*"
+    r"not found tuned config in (?P<config>\S+)"
+)
+
+
+def stable_json(data: Any) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fin:
+        for chunk in iter(lambda: fin.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_entry(path: Path) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "path": str(path),
+        "name": path.name,
+        "exists": path.exists(),
+    }
+    if path.exists() and path.is_file():
+        entry["size_bytes"] = path.stat().st_size
+        entry["sha256"] = sha256_file(path)
+    return entry
+
+
+def parse_log_timestamp(line: str) -> tuple[datetime | None, int | None]:
+    match = TIMESTAMP_RE.search(line)
+    if not match:
+        return None, None
+    ts = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=timezone.utc
+    )
+    rank = match.group("rank")
+    return ts, int(rank) if rank is not None else None
+
+
+def parse_start_line(line: str) -> datetime | None:
+    line = line.strip()
+    if not START_RE.match(line):
+        return None
+    return datetime.strptime(line, "%a %b %d %H:%M:%S UTC %Y").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def summarize_rank_seconds(values: dict[int, float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "by_rank": {},
+            "rank_count": 0,
+            "ranks": [],
+            "min_s": None,
+            "max_s": None,
+            "skew_s": None,
+            "slowest_rank": None,
+        }
+    min_s = min(values.values())
+    max_s = max(values.values())
+    slowest_rank = max(values, key=lambda rank: values[rank])
+    return {
+        "by_rank": {str(rank): values[rank] for rank in sorted(values)},
+        "rank_count": len(values),
+        "ranks": sorted(values),
+        "min_s": min_s,
+        "max_s": max_s,
+        "skew_s": max_s - min_s,
+        "slowest_rank": slowest_rank,
+    }
+
+
+def parse_launch_log(label: str, path: Path) -> dict[str, Any]:
+    start_ts: datetime | None = None
+    ready_ts: datetime | None = None
+    first_log_ts: datetime | None = None
+    target_load: dict[int, float] = {}
+    draft_load: dict[int, float] = {}
+    draft_graph: dict[int, float] = {}
+    aiter_imports: Counter[tuple[str, str]] = Counter()
+    aiter_build_starts: Counter[tuple[str, str]] = Counter()
+    aiter_build_events: list[dict[str, Any]] = []
+    tuned_misses: Counter[tuple[str, str, str, str]] = Counter()
+    ready_seen = False
+
+    with path.open("r", encoding="utf-8", errors="replace") as fin:
+        for raw_line in fin:
+            line = ANSI_RE.sub("", raw_line.rstrip("\n"))
+            if start_ts is None:
+                start_ts = parse_start_line(line)
+            ts, rank = parse_log_timestamp(line)
+            if ts is not None and first_log_ts is None:
+                first_log_ts = ts
+            if "The server is fired up and ready to roll!" in line and ts is not None:
+                ready_ts = ts
+
+            load_match = LOAD_RE.search(line)
+            if load_match and rank is not None:
+                load_type = load_match.group("type")
+                elapsed = float(load_match.group("elapsed"))
+                if load_type == "DSparkDraftModel":
+                    draft_load[rank] = elapsed
+                else:
+                    target_load[rank] = elapsed
+
+            graph_match = GRAPH_RE.search(line)
+            if graph_match and rank is not None:
+                draft_graph[rank] = float(graph_match.group("elapsed"))
+
+            import_match = IMPORT_RE.search(line)
+            if import_match:
+                aiter_imports[
+                    (import_match.group("module"), import_match.group("path"))
+                ] += 1
+
+            build_start_match = BUILD_START_RE.search(line)
+            if build_start_match:
+                aiter_build_starts[
+                    (
+                        build_start_match.group("module"),
+                        build_start_match.group("path"),
+                    )
+                ] += 1
+
+            build_finish_match = BUILD_FINISH_RE.search(line)
+            if build_finish_match:
+                aiter_build_events.append(
+                    {
+                        "module": build_finish_match.group("module"),
+                        "cost_s": float(build_finish_match.group("cost")),
+                        "phase": "post_ready" if ready_seen else "pre_ready",
+                    }
+                )
+
+            tuned_miss_match = TUNED_MISS_RE.search(line)
+            if tuned_miss_match:
+                config_path = tuned_miss_match.group("config").rstrip(",")
+                tuned_misses[
+                    (
+                        config_path,
+                        tuned_miss_match.group("m"),
+                        tuned_miss_match.group("n"),
+                        tuned_miss_match.group("k"),
+                    )
+                ] += 1
+
+            if ready_ts == ts and "The server is fired up and ready to roll!" in line:
+                ready_seen = True
+
+    effective_start = start_ts or first_log_ts
+    start_to_ready_s = (
+        (ready_ts - effective_start).total_seconds()
+        if effective_start is not None and ready_ts is not None
+        else None
+    )
+
+    return {
+        "label": label,
+        "log": artifact_entry(path),
+        "start_time": effective_start.isoformat() if effective_start else None,
+        "ready_time": ready_ts.isoformat() if ready_ts else None,
+        "start_to_ready_s": start_to_ready_s,
+        "target_weight_load": summarize_rank_seconds(target_load),
+        "draft_weight_load": summarize_rank_seconds(draft_load),
+        "draft_verify_graph_capture": summarize_rank_seconds(draft_graph),
+        "aiter_builds": summarize_aiter_builds(aiter_build_events),
+        "aiter_build_events": aiter_build_events,
+        "aiter_build_starts": [
+            {"module": module, "path": build_path, "count": count}
+            for (module, build_path), count in sorted(aiter_build_starts.items())
+        ],
+        "aiter_imports": [
+            {"module": module, "path": import_path, "count": count}
+            for (module, import_path), count in sorted(aiter_imports.items())
+        ],
+        "tuned_config_misses": [
+            {
+                "config": config,
+                "m": int(m),
+                "n": int(n),
+                "k": int(k),
+                "count": count,
+            }
+            for (config, m, n, k), count in sorted(tuned_misses.items())
+        ],
+        "tuned_config_miss_summary": summarize_tuned_misses(tuned_misses),
+    }
+
+
+def summarize_aiter_builds(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_module: dict[str, dict[str, Any]] = {}
+    for event in events:
+        module = event["module"]
+        summary = by_module.setdefault(
+            module,
+            {
+                "module": module,
+                "count": 0,
+                "costs_s": [],
+                "total_cost_s": 0.0,
+                "pre_ready_cost_s": 0.0,
+                "post_ready_cost_s": 0.0,
+            },
+        )
+        cost = float(event["cost_s"])
+        summary["count"] += 1
+        summary["costs_s"].append(cost)
+        summary["total_cost_s"] += cost
+        if event["phase"] == "pre_ready":
+            summary["pre_ready_cost_s"] += cost
+        else:
+            summary["post_ready_cost_s"] += cost
+    return [by_module[module] for module in sorted(by_module)]
+
+
+def summarize_tuned_misses(
+    tuned_misses: Counter[tuple[str, str, str, str]],
+) -> dict[str, Any]:
+    by_config: Counter[str] = Counter()
+    for (config, _m, _n, _k), count in tuned_misses.items():
+        by_config[config] += count
+    return {
+        "event_count": sum(tuned_misses.values()),
+        "unique_shape_count": len(tuned_misses),
+        "by_config": [
+            {"config": config, "count": count}
+            for config, count in sorted(by_config.items())
+        ],
+    }
+
+
+def sum_aiter_build_seconds(run: dict[str, Any], field: str) -> float:
+    return sum(float(build.get(field, 0.0)) for build in run.get("aiter_builds", []))
+
+
+def observed_launch_stages(run: dict[str, Any]) -> list[dict[str, Any]]:
+    stage_specs = [
+        ("target_weight_load", run["target_weight_load"].get("max_s")),
+        ("draft_weight_load", run["draft_weight_load"].get("max_s")),
+        (
+            "draft_verify_graph_capture",
+            run["draft_verify_graph_capture"].get("max_s"),
+        ),
+        ("aiter_build_pre_ready", sum_aiter_build_seconds(run, "pre_ready_cost_s")),
+    ]
+    return [
+        {"stage": name, "seconds": seconds}
+        for name, seconds in stage_specs
+        if seconds is not None and float(seconds) > 0.0
+    ]
+
+
+def summarize_launch_insight(run: dict[str, Any]) -> dict[str, Any]:
+    stages = observed_launch_stages(run)
+    dominant = max(stages, key=lambda item: item["seconds"]) if stages else None
+    build_pre_ready = sum_aiter_build_seconds(run, "pre_ready_cost_s")
+    build_total = sum_aiter_build_seconds(run, "total_cost_s")
+    miss_summary = run.get("tuned_config_miss_summary") or {}
+    miss_events = int(miss_summary.get("event_count", 0))
+    miss_shapes = int(miss_summary.get("unique_shape_count", 0))
+
+    if build_pre_ready > 0.0:
+        aiter_cache_action = "prewarm_or_reuse_aiter_jit_cache"
+    elif run.get("aiter_imports"):
+        aiter_cache_action = "preserve_warm_aiter_jit_cache"
+    else:
+        aiter_cache_action = "no_aiter_cache_signal"
+
+    return {
+        "observed_stages": stages,
+        "dominant_observed_stage": dominant,
+        "aiter_build_pre_ready_s": build_pre_ready,
+        "aiter_build_total_s": build_total,
+        "aiter_cache_action": aiter_cache_action,
+        "tuned_miss_events": miss_events,
+        "tuned_miss_shapes": miss_shapes,
+        "tuned_miss_action": (
+            "generate_tuned_miss_inputs" if miss_events else "no_tuned_miss_action"
+        ),
+    }
+
+
+def parse_label_path(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise SystemExit(f"expected LABEL=PATH, got {value!r}")
+    label, raw_path = value.split("=", 1)
+    if not label or not raw_path:
+        raise SystemExit(f"expected non-empty LABEL=PATH, got {value!r}")
+    return label, Path(raw_path).expanduser()
+
+
+def inventory_cache_dir(label: str, path: Path) -> dict[str, Any]:
+    entry = artifact_entry(path)
+    entry["label"] = label
+    if not path.exists() or not path.is_dir():
+        entry["file_count"] = 0
+        entry["total_size_bytes"] = 0
+        return entry
+
+    file_count = 0
+    total_size = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            file_count += 1
+            total_size += child.stat().st_size
+    entry["file_count"] = file_count
+    entry["total_size_bytes"] = total_size
+    return entry
+
+
+def build_report(
+    *,
+    runs: list[tuple[str, Path]],
+    cache_dirs: list[tuple[str, Path]],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    run_records = [parse_launch_log(label, path) for label, path in runs]
+    for run in run_records:
+        run["launch_insight"] = summarize_launch_insight(run)
+    return {
+        "schema": SCHEMA,
+        "generated_at": time.time(),
+        "provenance": provenance or {},
+        "runs": run_records,
+        "cache_dirs": [inventory_cache_dir(label, path) for label, path in cache_dirs],
+    }
+
+
+def format_seconds(value: Any) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value):.2f}"
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# DSpark Launch Report",
+        "",
+        "| run | ready_s | target_load_ranks | target_load_max_s | target_load_skew_s | draft_graph_ranks | draft_graph_max_s | aiter_build_pre_ready_s | aiter_build_total_s | tuned_miss_events | tuned_miss_shapes |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for run in report["runs"]:
+        build_total = sum_aiter_build_seconds(run, "total_cost_s")
+        build_pre_ready = sum_aiter_build_seconds(run, "pre_ready_cost_s")
+        miss_summary = run.get("tuned_config_miss_summary") or {}
+        lines.append(
+            "| {label} | {ready} | {target_ranks} | {target_max} | {target_skew} | {graph_ranks} | {graph_max} | {build_pre_ready:.2f} | {build_total:.2f} | {miss_events} | {miss_shapes} |".format(
+                label=run["label"],
+                ready=format_seconds(run.get("start_to_ready_s")),
+                target_ranks=run["target_weight_load"].get("rank_count", 0),
+                target_max=format_seconds(run["target_weight_load"].get("max_s")),
+                target_skew=format_seconds(run["target_weight_load"].get("skew_s")),
+                graph_ranks=run["draft_verify_graph_capture"].get("rank_count", 0),
+                graph_max=format_seconds(
+                    run["draft_verify_graph_capture"].get("max_s")
+                ),
+                build_pre_ready=build_pre_ready,
+                build_total=build_total,
+                miss_events=miss_summary.get(
+                    "event_count",
+                    sum(
+                        int(item.get("count") or 0)
+                        for item in run.get("tuned_config_misses", [])
+                    ),
+                ),
+                miss_shapes=miss_summary.get(
+                    "unique_shape_count", len(run.get("tuned_config_misses", []))
+                ),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Launch Insights",
+            "",
+            "| run | dominant_stage | dominant_s | aiter_cache_action | tuned_miss_action |",
+            "| --- | --- | ---: | --- | --- |",
+        ]
+    )
+    for run in report["runs"]:
+        insight = run.get("launch_insight") or {}
+        dominant = insight.get("dominant_observed_stage") or {}
+        lines.append(
+            "| {label} | {stage} | {seconds} | {aiter_action} | {miss_action} |".format(
+                label=run["label"],
+                stage=dominant.get("stage", "-"),
+                seconds=format_seconds(dominant.get("seconds")),
+                aiter_action=insight.get("aiter_cache_action", "-"),
+                miss_action=insight.get("tuned_miss_action", "-"),
+            )
+        )
+
+    if report.get("cache_dirs"):
+        lines.extend(
+            [
+                "",
+                "## Cache Directories",
+                "",
+                "| label | path | exists | files | size_bytes |",
+                "| --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for cache in report["cache_dirs"]:
+            lines.append(
+                f"| {cache['label']} | `{cache['path']}` | {cache['exists']} | "
+                f"{cache['file_count']} | {cache['total_size_bytes']} |"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def iter_tuned_miss_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for run in report.get("runs", []):
+        for item in run.get("tuned_config_misses", []):
+            rows.append(
+                {
+                    "run": run.get("label"),
+                    "config": item.get("config"),
+                    "m": item.get("m"),
+                    "n": item.get("n"),
+                    "k": item.get("k"),
+                    "count": item.get("count"),
+                }
+            )
+    return rows
+
+
+def write_tuned_misses_csv(path: Path, report: dict[str, Any]) -> None:
+    rows = iter_tuned_miss_rows(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fout:
+        writer = csv.DictWriter(
+            fout, fieldnames=["run", "config", "m", "n", "k", "count"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_tuned_misses_jsonl(path: Path, report: dict[str, Any]) -> None:
+    rows = iter_tuned_miss_rows(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fout:
+        for row in rows:
+            fout.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Summarize DSpark server launch/cache evidence from saved logs."
+    )
+    parser.add_argument(
+        "--run",
+        action="append",
+        nargs=2,
+        metavar=("LABEL", "LOG"),
+        required=True,
+        help="Saved launch log to parse. Can be repeated.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="Optional cache directory to inventory. Can be repeated.",
+    )
+    parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--markdown-output", type=Path)
+    parser.add_argument(
+        "--tuned-misses-csv-output",
+        type=Path,
+        help="Optional CSV with one row per run/config/M/N/K tuned-config miss.",
+    )
+    parser.add_argument(
+        "--tuned-misses-jsonl-output",
+        type=Path,
+        help="Optional JSONL with one row per run/config/M/N/K tuned-config miss.",
+    )
+    add_provenance_args(parser)
+    args = parser.parse_args()
+
+    report = build_report(
+        runs=[(label, Path(path).expanduser()) for label, path in args.run],
+        cache_dirs=[parse_label_path(value) for value in args.cache_dir],
+        provenance=provenance_from_args(args),
+    )
+
+    if args.json_output:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+    if args.markdown_output:
+        args.markdown_output.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown_output.write_text(render_markdown(report), encoding="utf-8")
+    if args.tuned_misses_csv_output:
+        write_tuned_misses_csv(args.tuned_misses_csv_output, report)
+    if args.tuned_misses_jsonl_output:
+        write_tuned_misses_jsonl(args.tuned_misses_jsonl_output, report)
+    if not any(
+        [
+            args.json_output,
+            args.markdown_output,
+            args.tuned_misses_csv_output,
+            args.tuned_misses_jsonl_output,
+        ]
+    ):
+        print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()

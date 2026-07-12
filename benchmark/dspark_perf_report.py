@@ -29,6 +29,14 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from benchmark.dspark_profile_artifacts import (
+        add_provenance_args,
+        provenance_from_args,
+    )
+except ModuleNotFoundError:
+    from dspark_profile_artifacts import add_provenance_args, provenance_from_args
+
+try:
     from dspark_accuracy_harness import (
         iter_dspark_info_records,
         read_json_or_jsonl,
@@ -44,7 +52,7 @@ except ModuleNotFoundError:
     )
 
 
-SCHEMA = "sglang-dspark-perf-report-v2"
+SCHEMA = "sglang-dspark-perf-report-v3"
 
 
 @dataclass(frozen=True)
@@ -436,6 +444,11 @@ def build_record(
         "collect_path": str(run.collect_path),
         "server_info_path": str(run.server_info_path) if run.server_info_path else None,
         "manifest_path": str(run.manifest_path) if run.manifest_path else None,
+        "artifacts": {
+            "collect": artifact_record(run.collect_path, path_maps=path_maps),
+            "server_info": artifact_record(run.server_info_path, path_maps=path_maps),
+            "manifest": artifact_record(run.manifest_path, path_maps=path_maps),
+        },
         "requests": collect.get("requests"),
         "ok_requests": collect.get("ok_requests"),
         "error_requests": collect.get("error_requests"),
@@ -905,6 +918,7 @@ def main() -> None:
     parser.add_argument("--expect-target-verify-eager", action="store_true")
     parser.add_argument("--expect-target-verify-graph", action="store_true")
     parser.add_argument("--fail-on-verdict", action="store_true")
+    add_provenance_args(parser)
     args = parser.parse_args()
 
     path_maps = parse_path_maps(args.path_map)
@@ -931,6 +945,7 @@ def main() -> None:
     report = {
         "schema": SCHEMA,
         "created_unix_s": time.time(),
+        "provenance": provenance_from_args(args),
         "path_maps": path_maps,
         "runs": records,
         "evidence": evidence,
