@@ -75,6 +75,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    verify_lens_broadcast_group,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify_epilogue import (
     CommitInjectCtx,
@@ -94,9 +95,29 @@ from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens impor
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_cuda_alike
 
 logger = logging.getLogger(__name__)
+
+
+def _should_enable_verify_epilogue(
+    *,
+    is_compact_mode: bool,
+    disable_cuda_graph: bool,
+) -> bool:
+    return bool(is_compact_mode and not disable_cuda_graph and is_cuda_alike())
+
+
+def _should_arm_verify_epilogue_commit(
+    *,
+    fold_eligible: bool,
+    epilogue_folds_commit: bool,
+    tp_size: int,
+) -> bool:
+    # With TP>1, rank-local accept decisions are reconciled after target verify.
+    # Folding KV commit into the graph would write rank-local commit lengths before
+    # that broadcast, so keep commit on the explicit post-sync path.
+    return bool(fold_eligible and epilogue_folds_commit and int(tp_size) <= 1)
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -284,10 +305,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
         self._verify_epilogue = None
-        if (
-            self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
-            and is_cuda()
+        if _should_enable_verify_epilogue(
+            is_compact_mode=self._verify_planner.is_compact_mode,
+            disable_cuda_graph=server_args.disable_cuda_graph,
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
@@ -521,17 +541,66 @@ class DSparkWorkerV2(BaseSpecWorker):
             return False
         if batch.batch_size() <= 1:
             return True
-        if str(getattr(self.server_args, "attention_backend", "")).lower() != "dsa":
+        if not self._target_verify_uses_dsa_attention_backend():
+            return True
+        if (
+            envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.get()
+            and envs.SGLANG_DSA_TOPK_BROADCAST.get()
+        ):
+            if self.tp_rank == 0 and not self._warned_dsa_compact_batch_fallback:
+                logger.info(
+                    "DSpark compact target verify is enabled for multi-request "
+                    "batches on the DSA attention backend with TP top-k "
+                    "broadcast enabled."
+                )
+                self._warned_dsa_compact_batch_fallback = True
             return True
         if self.tp_rank == 0 and not self._warned_dsa_compact_batch_fallback:
-            logger.warning(
-                "DSpark compact target verify is temporarily disabled for "
-                "multi-request batches on the DSA attention backend. Falling "
-                "back to non-compact target verify while preserving variable "
-                "verify lengths for accept/cap semantics."
-            )
+            if envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.get():
+                logger.warning(
+                    "DSpark compact target verify remains disabled for "
+                    "multi-request batches on the DSA attention backend because "
+                    "SGLANG_DSA_TOPK_BROADCAST=1 is required to keep TP ranks "
+                    "in sync. Falling back to non-compact target verify while "
+                    "preserving variable verify lengths for accept/cap semantics."
+                )
+            else:
+                logger.warning(
+                    "DSpark compact target verify is temporarily disabled for "
+                    "multi-request batches on the DSA attention backend. Falling "
+                    "back to non-compact target verify while preserving variable "
+                    "verify lengths for accept/cap semantics."
+                )
             self._warned_dsa_compact_batch_fallback = True
         return False
+
+    def _target_verify_uses_dsa_attention_backend(self) -> bool:
+        server_args = self.server_args
+        target_verify_backend = getattr(
+            server_args, "target_verify_attention_backend", None
+        )
+        if callable(target_verify_backend):
+            return str(target_verify_backend() or "").lower() in ("dsa", "nsa")
+
+        prefill_backend = getattr(server_args, "prefill_attention_backend", None)
+        decode_backend = getattr(server_args, "decode_attention_backend", None)
+
+        get_attention_backends = getattr(server_args, "get_attention_backends", None)
+        if callable(get_attention_backends):
+            prefill_backend, decode_backend = get_attention_backends()
+
+        attention_backend = getattr(server_args, "attention_backend", None)
+        speculative_attention_mode = getattr(
+            server_args, "speculative_attention_mode", "prefill"
+        )
+        target_verify_backend = (
+            decode_backend
+            if speculative_attention_mode == "decode"
+            else prefill_backend
+        )
+        target_verify_backend = target_verify_backend or attention_backend
+
+        return str(target_verify_backend or "").lower() in ("dsa", "nsa")
 
     def dump_sps_records(self) -> Optional[dict]:
         if self._sps_recorder is None:
@@ -556,6 +625,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
+        self._verify_tracer.reset_records()
 
     def flush_sts_records(self) -> None:
         flush_error = None
@@ -725,6 +795,60 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
+    def _sync_accept_result_across_tp(
+        self,
+        *,
+        correct_len: torch.Tensor,
+        bonus: torch.Tensor,
+        cap_trim_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+        new_seq_lens: torch.Tensor,
+        out_tokens: torch.Tensor,
+    ) -> None:
+        tp_group, group_size = verify_lens_broadcast_group(
+            tp_size=int(self.server_args.tp_size)
+        )
+        if group_size <= 1:
+            return
+
+        # Acceptance mutates request/KV state on every TP rank. Keep rank-local
+        # floating-point or sampler differences from committing divergent states.
+        for tensor in (
+            correct_len,
+            bonus,
+            cap_trim_lens,
+            commit_lens,
+            new_seq_lens,
+            out_tokens,
+        ):
+            tp_group.broadcast(tensor, src=0)
+
+    def _sync_draft_proposal_across_tp(self, proposal) -> None:
+        tp_group, group_size = verify_lens_broadcast_group(
+            tp_size=int(self.server_args.tp_size)
+        )
+        if group_size <= 1:
+            return
+
+        tensors = [
+            proposal.draft_block_ids,
+            proposal.draft_block.draft_tokens,
+            proposal.draft_block.greedy_mask,
+            proposal.draft_block.temperatures,
+        ]
+        if proposal.draft_block.corrected_logits is not None:
+            tensors.append(proposal.draft_block.corrected_logits)
+        if proposal.draft_hidden is not None:
+            tensors.append(proposal.draft_hidden)
+        if proposal.confidence_tap is not None:
+            tensors.append(proposal.confidence_tap)
+        if proposal.confidence is not None:
+            tensors.append(proposal.confidence)
+        if proposal.confidence_raw is not None:
+            tensors.append(proposal.confidence_raw)
+        for tensor in tensors:
+            tp_group.broadcast(tensor, src=0)
+
     def _decode_idle_result(
         self,
         *,
@@ -799,6 +923,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+        self._sync_draft_proposal_across_tp(proposal)
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -865,11 +990,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        epilogue = self._verify_executor.verify_epilogue
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+        )
+        folded_commit_armed = _should_arm_verify_epilogue_commit(
+            fold_eligible=fold_eligible,
+            epilogue_folds_commit=(
+                False if epilogue is None else bool(epilogue.folds_commit)
+            ),
+            tp_size=int(self.server_args.tp_size),
         )
         with self._info_dumper.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -881,7 +1014,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,
-                    inject_gate=fold_eligible,
+                    inject_gate=folded_commit_armed,
                 )
             else:
                 target_verify = self._verify_executor.run_non_compact(
@@ -896,7 +1029,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
-        epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         if folded_accept:
             accept = epilogue.read_accept(bs)
@@ -938,6 +1070,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 gamma=self.gamma,
             )
+        self._sync_accept_result_across_tp(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            commit_lens=commit_lens,
+            new_seq_lens=new_seq_lens,
+            out_tokens=out_tokens,
+        )
         self._verify_tracer.maybe_trace(
             forward_ct=batch.forward_iter,
             bs=bs,
@@ -976,7 +1116,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(new_seq_lens)
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        folded_commit = folded_accept and folded_commit_armed
         if not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,

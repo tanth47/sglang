@@ -76,24 +76,26 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
-    try:
-        from aiter import (  # noqa: F401
-            flash_attn_varlen_func,
-            get_mla_metadata_info_v1,
-            get_mla_metadata_v1,
-            mha_batch_prefill_func,
-            paged_attention_ragged,
-        )
-        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
-    except ImportError:
-        print(
-            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-        )
+    if _has_visible_hip_device:
+        try:
+            from aiter import (  # noqa: F401
+                flash_attn_varlen_func,
+                get_mla_metadata_info_v1,
+                get_mla_metadata_v1,
+                mha_batch_prefill_func,
+                paged_attention_ragged,
+            )
+            from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
+        except (ImportError, RuntimeError):
+            print(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            )
 else:
     from sglang.jit_kernel.flash_attention import (
         flash_attn_varlen_func,
@@ -718,9 +720,11 @@ class DeepseekSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+        dsa_extend_seq_lens_list = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
+            dsa_extend_seq_lens_list = extend_seq_lens_cpu
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
@@ -760,6 +764,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=extend_seq_lens, dim=0
                 )
+                dsa_extend_seq_lens_list = [1] * int(total_verify_tokens)
             else:
                 cu_seqlens_q = torch.arange(
                     0,
@@ -793,6 +798,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
+                dsa_extend_seq_lens_list = [1] * expected_out_tokens
         elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -825,6 +831,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
+                dsa_extend_seq_lens_list = [1] * forward_batch.extend_num_tokens
             else:
                 # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
                 # per request after verification. Lengths vary per request based on
@@ -832,6 +839,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
+                dsa_extend_seq_lens_list = extend_seq_lens_cpu
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -926,8 +934,11 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_k[:-1],
                     extend_seq_lens,
                 )
+            dsa_extend_seq_lens_list = extend_seq_lens_cpu
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
+
+        assert dsa_extend_seq_lens_list is not None
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
             forward_batch, bs_idx_cpu
@@ -987,7 +998,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
-            dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,

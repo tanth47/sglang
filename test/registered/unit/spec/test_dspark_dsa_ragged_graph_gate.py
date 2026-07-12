@@ -2,6 +2,11 @@ from types import SimpleNamespace
 
 import torch
 
+import sglang.srt.model_executor.runner.decode_cuda_graph_runner as decode_cgr
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.transform_index import (
+    transform_index_page_table_prefill_ref,
+)
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend as RealDeepseekSparseAttnBackend,
 )
@@ -191,6 +196,79 @@ def test_compact_mode_admits_token_tier_padded_dsa_ragged_layout():
     )
 
 
+def _graph_gate_model_runner(
+    *,
+    backend="dsa",
+    is_dspark=True,
+    is_draft_worker=False,
+):
+    return SimpleNamespace(
+        is_draft_worker=is_draft_worker,
+        spec_algorithm=SimpleNamespace(is_dspark=lambda: is_dspark),
+        server_args=SimpleNamespace(target_verify_attention_backend=lambda: backend),
+    )
+
+
+def test_dspark_dsa_target_verify_graph_disabled_on_hip_topk_broadcast(monkeypatch):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: True)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(
+        True
+    ), envs.SGLANG_DSPARK_ALLOW_HIP_DSA_TARGET_VERIFY_GRAPH.override(False):
+        assert decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner()
+        )
+
+
+def test_dspark_dsa_target_verify_graph_can_be_experimentally_enabled_on_hip(
+    monkeypatch,
+):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: True)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(
+        True
+    ), envs.SGLANG_DSPARK_ALLOW_HIP_DSA_TARGET_VERIFY_GRAPH.override(True):
+        assert not decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner()
+        )
+
+
+def test_dspark_dsa_target_verify_graph_not_disabled_without_hip(monkeypatch):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: False)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+        assert not decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner()
+        )
+
+
+def test_dspark_dsa_target_verify_graph_not_disabled_for_draft_worker(monkeypatch):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: True)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+        assert not decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner(is_draft_worker=True)
+        )
+
+
+def test_dspark_dsa_target_verify_graph_not_disabled_for_non_dsa(monkeypatch):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: True)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+        assert not decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner(backend="triton")
+        )
+
+
+def test_dspark_dsa_target_verify_graph_not_disabled_for_non_dspark(monkeypatch):
+    monkeypatch.setattr(decode_cgr, "is_hip", lambda: True)
+
+    with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+        assert not decode_cgr.dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+            _graph_gate_model_runner(is_dspark=False)
+        )
+
+
 def test_dsa_ragged_metadata_key_uses_token_tier():
     backend = object.__new__(RealDeepseekSparseAttnBackend)
     backend.device = torch.device("cpu")
@@ -251,6 +329,21 @@ def test_dsa_ragged_metadata_padding_prefers_dummy_rows():
     assert padded.tolist() == [8, 8, 8]
 
 
+def test_dsa_ragged_metadata_pads_device_only_layout_to_graph_total():
+    backend = object.__new__(RealDeepseekSparseAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.speculative_num_draft_tokens = 8
+    layout = RaggedVerifyLayout.from_verify_lens_device(
+        verify_lens=torch.tensor([8, 1], dtype=torch.int32),
+        graph_num_tokens=16,
+    )
+
+    padded = backend._ragged_verify_lens_for_cuda_graph(layout=layout, bs=2)
+
+    assert layout.total_verify_tokens is None
+    assert padded.tolist() == [8, 8]
+
+
 def test_pad_verify_lens_within_rows_fills_real_rows_when_no_dummy_rows():
     padded = PadVerifyLensWithinRows.execute(
         verify_lens=torch.tensor([8, 1], dtype=torch.int32),
@@ -276,3 +369,41 @@ def test_pad_verify_lens_within_rows_rejects_over_capacity():
         assert "cannot fit" in str(exc)
     else:
         raise AssertionError("expected over-capacity graph tier to be rejected")
+
+
+def test_dsa_expanded_verify_page_table_uses_token_level_extend_lens():
+    page_table = torch.arange(4 * 8, dtype=torch.int32).view(4, 8)
+    topk = torch.tensor(
+        [
+            [0, 2, -1],
+            [1, 3, -1],
+            [2, 4, -1],
+            [3, 5, -1],
+        ],
+        dtype=torch.int64,
+    )
+
+    result = transform_index_page_table_prefill_ref(
+        page_table=page_table,
+        topk_indices=topk,
+        extend_lens_cpu=[1, 1, 1, 1],
+    )
+
+    expected = torch.gather(page_table.to(result.dtype), dim=1, index=topk.clamp(min=0))
+    expected[topk < 0] = -1
+    assert torch.equal(result, expected)
+
+
+def test_dsa_expanded_verify_page_table_rejects_request_level_extend_lens():
+    page_table = torch.arange(4 * 8, dtype=torch.int32).view(4, 8)
+    topk = torch.zeros((4, 3), dtype=torch.int64)
+
+    try:
+        transform_index_page_table_prefill_ref(
+            page_table=page_table,
+            topk_indices=topk,
+            extend_lens_cpu=[1, 3],
+        )
+    except AssertionError:
+        return
+    raise AssertionError("request-level extend lengths must not match token rows")

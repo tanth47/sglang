@@ -2652,6 +2652,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                dspark_dsa_target_verify_cuda_graph_unsafe_on_hip,
+            )
+
+            if dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(self):
+                logger.warning(
+                    "Disable DSpark target verify CUDA graph because HIP/ROCm "
+                    "DSA top-k broadcast is not safe inside graph capture. "
+                    "Target verification will use eager execution; compact "
+                    "ragged verify remains enabled."
+                )
+                return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(

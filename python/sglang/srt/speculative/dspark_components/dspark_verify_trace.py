@@ -35,6 +35,7 @@ class DsparkVerifyTracer:
         self.path = envs.SGLANG_DSPARK_VERIFY_TRACE_PATH.get()
         self.limit = int(envs.SGLANG_DSPARK_VERIFY_TRACE_LIMIT.get())
         self.assert_enabled = envs.SGLANG_DSPARK_VERIFY_TRACE_ASSERT.get()
+        self.trace_all_ranks = envs.SGLANG_DSPARK_VERIFY_TRACE_ALL_RANKS.get()
         self._records = 0
         self._warned_write_error = False
 
@@ -66,7 +67,7 @@ class DsparkVerifyTracer:
         out_tokens: torch.Tensor,
         simulated_accept: bool,
     ) -> None:
-        if self.tp_rank != 0 or bs <= 0:
+        if (self.tp_rank != 0 and not self.trace_all_ranks) or bs <= 0:
             return
 
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
@@ -112,18 +113,31 @@ class DsparkVerifyTracer:
     def _should_write(self) -> bool:
         return self.limit <= 0 or self._records < self.limit
 
+    def reset_records(self) -> None:
+        self._records = 0
+
     def _write_record(self, record: dict) -> None:
         try:
-            parent = os.path.dirname(self.path)
+            path = self._trace_path_for_rank()
+            parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             self._records += 1
         except Exception:
             if not self._warned_write_error:
                 logger.exception("Failed to write DSpark verify trace to %s", self.path)
                 self._warned_write_error = True
+
+    def _trace_path_for_rank(self) -> str:
+        if not self.trace_all_ranks or self.tp_rank == 0:
+            return self.path
+        root, ext = os.path.splitext(self.path)
+        suffix = f".tp{self.tp_rank}"
+        if ext:
+            return f"{root}{suffix}{ext}"
+        return f"{self.path}{suffix}"
 
     def _build_record(
         self,

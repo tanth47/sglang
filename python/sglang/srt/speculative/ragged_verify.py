@@ -115,8 +115,17 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         from sglang.srt.speculative.dspark_components.kernels.qo_indptr import (
             BuildQoIndptr,
         )
+        from sglang.srt.utils.async_probe import maybe_assert_async
 
+        if graph_num_tokens < 1:
+            raise ValueError(f"graph_num_tokens must be >= 1, got {graph_num_tokens}")
         verify_lens = verify_lens.to(torch.int32)
+        if total_verify_tokens is None and envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            maybe_assert_async(
+                verify_lens.to(torch.int64).sum() <= int(graph_num_tokens),
+                "RaggedVerifyLayout verify_lens exceed graph_num_tokens "
+                f"(graph_num_tokens={graph_num_tokens})",
+            )
         indptr = BuildQoIndptr.execute(verify_lens=verify_lens)
         return cls(
             verify_lens=verify_lens,

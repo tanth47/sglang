@@ -5,6 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.dspark_components.dspark_scheduler import (
+    DSparkScheduleConfig,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
 )
@@ -143,6 +146,95 @@ class TestDSparkVerifyPlanner(CustomTestCase):
             supports_ragged_verify_graph=True
         )
         planner.validate_attention_backend_support()
+
+    def test_compute_budget_sync_preserves_prefix_lens_for_resolved_budget(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = object()
+        planner.model_runner = types.SimpleNamespace(
+            req_to_token_pool=types.SimpleNamespace(
+                req_generation=torch.tensor([10, 11, 12], dtype=torch.int64)
+            )
+        )
+        seen = {}
+
+        def budget_from_resolved(
+            *, resolved, req_pool_indices_cpu, current_seq_lens_cpu
+        ):
+            seen["resolved_seq_lens"] = resolved.seq_lens
+            seen["current_seq_lens_cpu"] = current_seq_lens_cpu
+            seen["req_pool_indices_cpu"] = req_pool_indices_cpu
+            return 123
+
+        planner._budget_from_resolved = budget_from_resolved
+        prefix_lens = torch.tensor([5, 9], dtype=torch.int64)
+        req_pool_indices = torch.tensor([0, 2], dtype=torch.int64)
+
+        budget = planner.compute_budget_sync(
+            confidence=torch.ones(2, 7),
+            prefix_lens=prefix_lens,
+            req_pool_indices=req_pool_indices,
+        )
+
+        self.assertEqual(budget, 123)
+        torch.testing.assert_close(seen["resolved_seq_lens"], prefix_lens)
+        torch.testing.assert_close(seen["current_seq_lens_cpu"], prefix_lens)
+        torch.testing.assert_close(seen["req_pool_indices_cpu"], req_pool_indices)
+
+    def test_tp_verify_lens_broadcast_syncs_graph_num_tokens(self):
+        class FakeBudgetPlanner:
+            forced_budget_frac = None
+
+            def observe_budget_step(self, *, num_requests, budget):
+                del num_requests, budget
+
+        class FakeBroadcastGroup:
+            def broadcast(self, tensor, src):
+                del src
+                if tensor.numel() == 1:
+                    tensor.fill_(16)
+                else:
+                    tensor.copy_(
+                        torch.tensor([8, 8], dtype=tensor.dtype, device=tensor.device)
+                    )
+
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._dynamic_graph_tier = True
+        planner._align_verify_tokens_to_graph_tier = False
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7, min_verify_len=1)
+        planner._budget_planner = FakeBudgetPlanner()
+        planner.verify_num_draft_tokens = 8
+        planner.server_args = types.SimpleNamespace(tp_size=2)
+        planner.model_runner = types.SimpleNamespace(
+            decode_cuda_graph_runner=types.SimpleNamespace(
+                ragged_verify_mode=True,
+                capture_num_tokens=[4, 8, 16],
+                max_bs=2,
+            )
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify_planner."
+            "verify_lens_broadcast_group",
+            return_value=(FakeBroadcastGroup(), 2),
+        ), patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify_planner."
+            "ScheduleVerifyLensTopk.execute",
+            return_value=torch.tensor([1, 1], dtype=torch.int32),
+        ):
+            layout = planner.schedule_layout(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                prefix_lens=torch.tensor([8, 8], dtype=torch.int64),
+                device=torch.device("cpu"),
+                confidence=torch.ones(2, 7),
+                budget=2,
+            )
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.graph_num_tokens, 16)
+        torch.testing.assert_close(
+            layout.verify_lens, torch.tensor([8, 8], dtype=torch.int32)
+        )
 
 
 if __name__ == "__main__":
