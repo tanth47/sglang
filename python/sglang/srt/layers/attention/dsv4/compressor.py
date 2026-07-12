@@ -34,7 +34,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _has_visible_hip_device
 _tgemm = None
 if _use_aiter:
     from aiter.tuned_gemm import tgemm

@@ -113,9 +113,10 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
-_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_has_visible_hip_device = _is_hip and torch.cuda.is_available()
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _has_visible_hip_device
+_use_aiter = envs.SGLANG_USE_AITER.get() and _has_visible_hip_device
+_is_shuffle_moe_mxfp4 = _has_visible_hip_device and is_gfx95_supported()
 
 
 def _require_fp4_dtype():

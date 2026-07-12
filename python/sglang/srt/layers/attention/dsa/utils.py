@@ -46,6 +46,8 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
     """
     if not is_hip():
         return False
+    if not torch.cuda.is_available():
+        return False
     if not get_bool_env_var("SGLANG_USE_AITER"):
         return False
     if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
