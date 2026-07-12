@@ -29,6 +29,14 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from benchmark.dspark_profile_artifacts import (
+        add_provenance_args,
+        provenance_from_args,
+    )
+except ModuleNotFoundError:
+    from dspark_profile_artifacts import add_provenance_args, provenance_from_args
+
+try:
     from dspark_accuracy_harness import (
         iter_dspark_info_records,
         read_json_or_jsonl,
@@ -44,7 +52,7 @@ except ModuleNotFoundError:
     )
 
 
-SCHEMA = "sglang-dspark-perf-report-v2"
+SCHEMA = "sglang-dspark-perf-report-v3"
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,15 @@ def parse_path_maps(values: list[str] | None) -> list[tuple[str, str]]:
             raise SystemExit(f"--path-map expects non-empty FROM=TO, got {value!r}")
         mappings.append((src.rstrip("/"), dst.rstrip("/")))
     return mappings
+
+
+def parse_label_path(value: str, *, option: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise SystemExit(f"{option} expects LABEL=PATH, got {value!r}")
+    label, raw_path = value.split("=", 1)
+    if not label or not raw_path:
+        raise SystemExit(f"{option} expects non-empty LABEL=PATH, got {value!r}")
+    return label, Path(raw_path).expanduser()
 
 
 def apply_path_maps(path: Path, mappings: list[tuple[str, str]]) -> Path:
@@ -436,6 +453,11 @@ def build_record(
         "collect_path": str(run.collect_path),
         "server_info_path": str(run.server_info_path) if run.server_info_path else None,
         "manifest_path": str(run.manifest_path) if run.manifest_path else None,
+        "artifacts": {
+            "collect": artifact_record(run.collect_path, path_maps=path_maps),
+            "server_info": artifact_record(run.server_info_path, path_maps=path_maps),
+            "manifest": artifact_record(run.manifest_path, path_maps=path_maps),
+        },
         "requests": collect.get("requests"),
         "ok_requests": collect.get("ok_requests"),
         "error_requests": collect.get("error_requests"),
@@ -473,6 +495,12 @@ def build_evidence(
     args: argparse.Namespace, *, path_maps: list[tuple[str, str]]
 ) -> dict[str, Any]:
     trace_summary = load_optional_json(args.trace_summary, path_maps=path_maps)
+    resource_snapshots = []
+    for value in getattr(args, "resource_snapshot", None) or []:
+        label, path = parse_label_path(value, option="--resource-snapshot")
+        snapshot = artifact_record(path, path_maps=path_maps)
+        snapshot["label"] = label
+        resource_snapshots.append(snapshot)
     return {
         "trace_summary": trace_summary,
         "artifacts": {
@@ -483,6 +511,7 @@ def build_evidence(
                 args.sts_calibration, path_maps=path_maps
             ),
         },
+        "resource_snapshots": resource_snapshots,
     }
 
 
@@ -792,6 +821,27 @@ def render_markdown(
                 f"cuda_graph={fmt_int(trace_summary.get('cuda_graph_records'))}",
             ]
         )
+    resource_snapshots = (evidence or {}).get("resource_snapshots") or []
+    if resource_snapshots:
+        lines.extend(
+            [
+                "",
+                "Resource snapshots:",
+                "",
+                "| label | exists | size_bytes | sha256 | path |",
+                "| --- | ---: | ---: | --- | --- |",
+            ]
+        )
+        for snapshot in resource_snapshots:
+            lines.append(
+                "| {label} | {exists} | {size} | {sha256} | `{path}` |".format(
+                    label=snapshot.get("label", "-"),
+                    exists=snapshot.get("exists"),
+                    size=snapshot.get("size_bytes", 0),
+                    sha256=snapshot.get("sha256", "-"),
+                    path=snapshot.get("path"),
+                )
+            )
     return "\n".join(lines)
 
 
@@ -884,6 +934,17 @@ def main() -> None:
     parser.add_argument("--sps-manifest", type=Path)
     parser.add_argument("--sts-calibration", type=Path)
     parser.add_argument(
+        "--resource-snapshot",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Optional resource/profiling snapshot to hash into the final "
+            "evidence, e.g. rocm_smi=/artifacts/preflight_rocm_smi.txt. "
+            "Can be repeated."
+        ),
+    )
+    parser.add_argument(
         "--path-map",
         action="append",
         help="Map artifact path prefixes, e.g. /artifacts=/tmp/run-artifacts.",
@@ -905,6 +966,7 @@ def main() -> None:
     parser.add_argument("--expect-target-verify-eager", action="store_true")
     parser.add_argument("--expect-target-verify-graph", action="store_true")
     parser.add_argument("--fail-on-verdict", action="store_true")
+    add_provenance_args(parser)
     args = parser.parse_args()
 
     path_maps = parse_path_maps(args.path_map)
@@ -931,6 +993,7 @@ def main() -> None:
     report = {
         "schema": SCHEMA,
         "created_unix_s": time.time(),
+        "provenance": provenance_from_args(args),
         "path_maps": path_maps,
         "runs": records,
         "evidence": evidence,

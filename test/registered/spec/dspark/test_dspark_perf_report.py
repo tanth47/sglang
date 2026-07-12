@@ -29,6 +29,7 @@ class TestDSparkPerfReport(CustomTestCase):
             trace_summary = root / "trace_summary.json"
             sps_table = root / "sps.json"
             sts = root / "sts.json"
+            resource_snapshot = root / "rocm_smi.txt"
 
             _write_jsonl(
                 collect,
@@ -91,6 +92,10 @@ class TestDSparkPerfReport(CustomTestCase):
             )
             _write_json(sps_table, {"bias_seconds": 1.0})
             _write_json(sts, {"temperatures": [1.0]})
+            resource_snapshot.write_text(
+                "GPU[0] VRAM Total Memory (B): 196592402432\n",
+                encoding="utf-8",
+            )
 
             path_maps = report.parse_path_maps([f"/artifacts={root}"])
             run = report.run_input_from_manifest("compact", manifest)
@@ -101,6 +106,7 @@ class TestDSparkPerfReport(CustomTestCase):
                     sps_table=Path("/artifacts/sps.json"),
                     sps_manifest=None,
                     sts_calibration=Path("/artifacts/sts.json"),
+                    resource_snapshot=["rocm_smi=/artifacts/rocm_smi.txt"],
                 ),
                 path_maps=path_maps,
             )
@@ -129,8 +135,16 @@ class TestDSparkPerfReport(CustomTestCase):
             self.assertEqual(record["non_uniform_verify_lens_records"], 1)
             self.assertEqual(record["saved_verify_tokens"], 3)
             self.assertEqual(record["throughput_completion_tokens"], 4)
+            self.assertIn("sha256", record["artifacts"]["collect"])
+            self.assertIn("sha256", record["artifacts"]["server_info"])
+            self.assertIn("sha256", record["artifacts"]["manifest"])
             self.assertTrue(evidence["artifacts"]["sps_table"]["exists"])
             self.assertIn("sha256", evidence["artifacts"]["sts_calibration"])
+            self.assertEqual(evidence["resource_snapshots"][0]["label"], "rocm_smi")
+            self.assertIn("sha256", evidence["resource_snapshots"][0])
+            markdown = report.render_markdown([record], evidence=evidence)
+            self.assertIn("Resource snapshots", markdown)
+            self.assertIn("rocm_smi", markdown)
             self.assertTrue(verdict["passed"], verdict["failures"])
 
     def test_server_info_saved_tokens_uses_verify_lens_not_graph_padding(self):
