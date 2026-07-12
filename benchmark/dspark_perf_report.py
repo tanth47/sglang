@@ -80,6 +80,15 @@ def parse_path_maps(values: list[str] | None) -> list[tuple[str, str]]:
     return mappings
 
 
+def parse_label_path(value: str, *, option: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise SystemExit(f"{option} expects LABEL=PATH, got {value!r}")
+    label, raw_path = value.split("=", 1)
+    if not label or not raw_path:
+        raise SystemExit(f"{option} expects non-empty LABEL=PATH, got {value!r}")
+    return label, Path(raw_path).expanduser()
+
+
 def apply_path_maps(path: Path, mappings: list[tuple[str, str]]) -> Path:
     raw = str(path)
     for src, dst in mappings:
@@ -486,6 +495,12 @@ def build_evidence(
     args: argparse.Namespace, *, path_maps: list[tuple[str, str]]
 ) -> dict[str, Any]:
     trace_summary = load_optional_json(args.trace_summary, path_maps=path_maps)
+    resource_snapshots = []
+    for value in getattr(args, "resource_snapshot", None) or []:
+        label, path = parse_label_path(value, option="--resource-snapshot")
+        snapshot = artifact_record(path, path_maps=path_maps)
+        snapshot["label"] = label
+        resource_snapshots.append(snapshot)
     return {
         "trace_summary": trace_summary,
         "artifacts": {
@@ -496,6 +511,7 @@ def build_evidence(
                 args.sts_calibration, path_maps=path_maps
             ),
         },
+        "resource_snapshots": resource_snapshots,
     }
 
 
@@ -805,6 +821,27 @@ def render_markdown(
                 f"cuda_graph={fmt_int(trace_summary.get('cuda_graph_records'))}",
             ]
         )
+    resource_snapshots = (evidence or {}).get("resource_snapshots") or []
+    if resource_snapshots:
+        lines.extend(
+            [
+                "",
+                "Resource snapshots:",
+                "",
+                "| label | exists | size_bytes | sha256 | path |",
+                "| --- | ---: | ---: | --- | --- |",
+            ]
+        )
+        for snapshot in resource_snapshots:
+            lines.append(
+                "| {label} | {exists} | {size} | {sha256} | `{path}` |".format(
+                    label=snapshot.get("label", "-"),
+                    exists=snapshot.get("exists"),
+                    size=snapshot.get("size_bytes", 0),
+                    sha256=snapshot.get("sha256", "-"),
+                    path=snapshot.get("path"),
+                )
+            )
     return "\n".join(lines)
 
 
@@ -896,6 +933,17 @@ def main() -> None:
     parser.add_argument("--sps-table", type=Path)
     parser.add_argument("--sps-manifest", type=Path)
     parser.add_argument("--sts-calibration", type=Path)
+    parser.add_argument(
+        "--resource-snapshot",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Optional resource/profiling snapshot to hash into the final "
+            "evidence, e.g. rocm_smi=/artifacts/preflight_rocm_smi.txt. "
+            "Can be repeated."
+        ),
+    )
     parser.add_argument(
         "--path-map",
         action="append",
