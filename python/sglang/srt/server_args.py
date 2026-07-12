@@ -2727,6 +2727,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._handle_dspark_dsa_compact_defaults()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -6811,6 +6812,46 @@ class ServerArgs:
             else self.attention_backend
         )
         return prefill_attention_backend_str, decode_attention_backend_str
+
+    def target_verify_attention_backend(self):
+        """Return the attention backend used by speculative target verification."""
+        prefill_attention_backend_str, decode_attention_backend_str = (
+            self.get_attention_backends()
+        )
+        if self.speculative_attention_mode == "decode":
+            return decode_attention_backend_str
+        return prefill_attention_backend_str
+
+    def _handle_dspark_dsa_compact_defaults(self):
+        if self.speculative_algorithm != "DSPARK":
+            return
+        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "compact":
+            return
+        target_verify_backend = str(
+            self.target_verify_attention_backend() or ""
+        ).lower()
+        if target_verify_backend not in ("dsa", "nsa"):
+            return
+
+        topk_broadcast_enabled = envs.SGLANG_DSA_TOPK_BROADCAST.get()
+        if not envs.SGLANG_DSA_TOPK_BROADCAST.is_set():
+            envs.SGLANG_DSA_TOPK_BROADCAST.set(True)
+            topk_broadcast_enabled = True
+            logger.info(
+                "Enabled SGLANG_DSA_TOPK_BROADCAST for DSpark compact target "
+                "verification on the %s attention backend.",
+                target_verify_backend,
+            )
+        if (
+            topk_broadcast_enabled
+            and not envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.is_set()
+        ):
+            envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.set(True)
+            logger.info(
+                "Enabled multi-request DSpark compact target verification on "
+                "the %s attention backend.",
+                target_verify_backend,
+            )
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch

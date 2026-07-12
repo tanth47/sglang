@@ -66,7 +66,11 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            ragged_verify_layout=layout,
+            # `layout` is an accept/cap policy for non-compact verify. The target
+            # forward itself must stay full-width strided; passing the ragged
+            # layout here makes attention backends interpret full-width ids/cache
+            # rows with compact query metadata.
+            ragged_verify_layout=None,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -208,9 +212,18 @@ class TargetVerifyExecutor:
             verify_window=verify_window,
             device=device,
         )
+        epilogue_can_cover_layout = self.verify_epilogue is not None and int(
+            layout.verify_lens.shape[0]
+        ) <= int(self.verify_epilogue.max_bs)
         if self.verify_epilogue is not None:
+            # The epilogue buffers are sized to the captured CUDA-graph max BS.
+            # Compact eager verify can legally run larger scheduler batches, so
+            # keep the stale graph/commit gate disarmed when the layout does not
+            # fit those fixed buffers.
             self.verify_epilogue.begin_step(
-                layout.verify_lens, armed=inject_gate, verify_window=verify_window
+                layout.verify_lens if epilogue_can_cover_layout else None,
+                armed=inject_gate and epilogue_can_cover_layout,
+                verify_window=verify_window,
             )
         target_verify = self._run_ragged(
             batch=batch,
@@ -221,7 +234,11 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
-        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
+        if (
+            self.verify_epilogue is not None
+            and epilogue_can_cover_layout
+            and target_verify.can_run_cuda_graph
+        ):
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
             assert strided_logits is not None and hidden_strided is not None, (

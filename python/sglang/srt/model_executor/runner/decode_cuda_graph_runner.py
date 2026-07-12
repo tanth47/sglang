@@ -95,6 +95,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -126,6 +127,42 @@ def ragged_verify_full_mode_enabled(spec_algorithm: SpeculativeAlgorithm) -> boo
     except ImportError:
         return False
     return ragged_verify_compact_enabled()
+
+
+def dspark_dsa_target_verify_cuda_graph_unsafe_on_hip(
+    model_runner: ModelRunner,
+) -> bool:
+    """Return True for the ROCm DSA target-verify graph path that needs eager fallback.
+
+    DSA/NSA top-k broadcast uses PyNCCL when CUDA graph capture is active. On HIP,
+    this can fail during target-verify capture with a captured-stream event error.
+    Keep DSpark compact target verification functional by skipping graph capture for
+    this narrow target-worker configuration.
+    """
+    if not is_hip():
+        return False
+    if getattr(model_runner, "is_draft_worker", False):
+        return False
+    spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+    if spec_algorithm is None or not spec_algorithm.is_dspark():
+        return False
+    if not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        return False
+    if envs.SGLANG_DSPARK_ALLOW_HIP_DSA_TARGET_VERIFY_GRAPH.get():
+        logger.warning(
+            "SGLANG_DSPARK_ALLOW_HIP_DSA_TARGET_VERIFY_GRAPH=1 bypasses the "
+            "ROCm DSA target-verify graph safety fallback. Use only for "
+            "controlled DSpark performance validation."
+        )
+        return False
+
+    server_args = getattr(model_runner, "server_args", None)
+    target_verify_backend = getattr(
+        server_args, "target_verify_attention_backend", None
+    )
+    if callable(target_verify_backend):
+        return str(target_verify_backend() or "").lower() in ("dsa", "nsa")
+    return False
 
 
 def build_replay_fb_view(

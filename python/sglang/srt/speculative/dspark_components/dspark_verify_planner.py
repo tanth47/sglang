@@ -567,13 +567,6 @@ class DSparkVerifyPlanner:
             )
         else:
             tier_num_tokens = None
-        if ragged_layout_exceeds_captured_grid(
-            num_reqs=tier_num_reqs,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_tokens_hint=tier_num_tokens,
-        ):
-            return None
         graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
             num_reqs=tier_num_reqs,
             ragged_verify_mode=self._ragged_verify_mode,
@@ -583,7 +576,23 @@ class DSparkVerifyPlanner:
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
-            graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            if ragged_layout_exceeds_captured_grid(
+                num_reqs=tier_num_reqs,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+                tier_tokens_hint=tier_num_tokens,
+            ):
+                graph_num_tokens = -1
+            else:
+                graph_num_tokens = round_up_grid(
+                    graph_num_tokens_floor, capture_num_tokens
+                )
+            graph_num_tokens = self._sync_layout_graph_num_tokens_across_tp(
+                graph_num_tokens=graph_num_tokens,
+                device=device,
+            )
+            if graph_num_tokens < 0:
+                return None
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
             )
@@ -600,6 +609,25 @@ class DSparkVerifyPlanner:
             graph_num_tokens_floor=graph_num_tokens_floor,
             num_draft_tokens=self.verify_num_draft_tokens,
         )
+
+    def _sync_layout_graph_num_tokens_across_tp(
+        self,
+        *,
+        graph_num_tokens: int,
+        device: torch.device,
+    ) -> int:
+        broadcast_group, group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
+        if group_size <= 1:
+            return graph_num_tokens
+
+        # verify_lens are sourced from rank 0, so the graph tier must be sourced
+        # from the same rank. Otherwise a non-src TP rank can receive rank-0
+        # verify_lens but keep a smaller local budget-derived graph bucket.
+        tensor = torch.tensor([int(graph_num_tokens)], dtype=torch.int64, device=device)
+        broadcast_group.broadcast(tensor, src=0)
+        return int(tensor.item())
 
     def _budget_aligned_to_graph_tier(
         self,

@@ -5,6 +5,9 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_verify_trace import (
     DsparkVerifyTracer,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _build_non_greedy_record(*, accept_assert_enabled: bool) -> dict:
@@ -68,3 +71,20 @@ def test_non_greedy_trace_requires_accept_sampling_reference_for_decision():
         "non-greedy accept decision is not replayed by verifier trace; "
         "enable SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT"
     ]
+
+
+def test_trace_counter_reset_rearms_limit():
+    with patch(
+        "sglang.srt.speculative.dspark_components.dspark_verify_trace."
+        "envs.SGLANG_DSPARK_VERIFY_TRACE_LIMIT.get",
+        return_value=1,
+    ):
+        tracer = DsparkVerifyTracer(gamma=2, verify_num_draft_tokens=3, tp_rank=0)
+
+    tracer._records = 1
+
+    assert not tracer._should_write()
+
+    tracer.reset_records()
+
+    assert tracer._should_write()

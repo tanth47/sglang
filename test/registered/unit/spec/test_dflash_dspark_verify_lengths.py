@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +23,14 @@ from sglang.srt.speculative.dspark_components.dspark_draft_proposer import (
 from sglang.srt.speculative.dspark_components.dspark_target_verify import (
     TargetVerifyExecutor,
 )
-from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.dspark_components.dspark_verify_epilogue import (
+    DsparkVerifyEpilogue,
+)
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
+    _should_arm_verify_epilogue_commit,
+    _should_enable_verify_epilogue,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -198,9 +206,79 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         layout = object()
         batch = SimpleNamespace(batch_size=lambda: 2)
 
-        self.assertFalse(
-            worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            False
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(False):
+            self.assertFalse(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_nsa_multi_request_compact_verify_falls_back(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="nsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
         )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            False
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(False):
+            self.assertFalse(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_split_prefill_dsa_compact_verify_falls_back(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(
+            attention_backend="flashinfer",
+            prefill_attention_backend="dsa",
+            decode_attention_backend="flashinfer",
+            speculative_attention_mode="prefill",
+        )
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            False
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(False):
+            self.assertFalse(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_split_decode_dsa_compact_verify_falls_back(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(
+            attention_backend="flashinfer",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="nsa",
+            speculative_attention_mode="decode",
+        )
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            False
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(False):
+            self.assertFalse(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
         self.assertTrue(worker._warned_dsa_compact_batch_fallback)
 
     def test_dspark_dsa_single_request_keeps_compact_verify(self):
@@ -216,6 +294,283 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
 
         self.assertTrue(
             worker._should_run_compact_target_verify(batch=batch, layout=layout)
+        )
+
+    def test_dspark_dsa_multi_request_compact_verify_requires_topk_broadcast(
+        self,
+    ):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            True
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(False):
+            self.assertFalse(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_dsa_multi_request_compact_verify_with_topk_broadcast(
+        self,
+    ):
+        worker = object.__new__(DSparkWorkerV2)
+        worker.tp_rank = 0
+        worker.server_args = SimpleNamespace(attention_backend="dsa")
+        worker._warned_dsa_compact_batch_fallback = False
+        worker._verify_planner = SimpleNamespace(
+            should_run_compact=lambda *, layout: layout is not None
+        )
+        layout = object()
+        batch = SimpleNamespace(batch_size=lambda: 2)
+
+        with envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.override(
+            True
+        ), envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+            self.assertTrue(
+                worker._should_run_compact_target_verify(batch=batch, layout=layout)
+            )
+        self.assertTrue(worker._warned_dsa_compact_batch_fallback)
+
+    def test_dspark_verify_epilogue_allows_cuda_alike_platforms(self):
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_cuda_alike",
+            return_value=True,
+        ):
+            self.assertTrue(
+                _should_enable_verify_epilogue(
+                    is_compact_mode=True,
+                    disable_cuda_graph=False,
+                )
+            )
+
+    def test_dspark_verify_epilogue_requires_compact_graph_enabled(self):
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_cuda_alike",
+            return_value=True,
+        ):
+            self.assertFalse(
+                _should_enable_verify_epilogue(
+                    is_compact_mode=False,
+                    disable_cuda_graph=False,
+                )
+            )
+            self.assertFalse(
+                _should_enable_verify_epilogue(
+                    is_compact_mode=True,
+                    disable_cuda_graph=True,
+                )
+            )
+
+    def test_dspark_verify_epilogue_commit_not_folded_before_tp_sync(self):
+        self.assertTrue(
+            _should_arm_verify_epilogue_commit(
+                fold_eligible=True,
+                epilogue_folds_commit=True,
+                tp_size=1,
+            )
+        )
+        self.assertFalse(
+            _should_arm_verify_epilogue_commit(
+                fold_eligible=True,
+                epilogue_folds_commit=True,
+                tp_size=4,
+            )
+        )
+        self.assertFalse(
+            _should_arm_verify_epilogue_commit(
+                fold_eligible=True,
+                epilogue_folds_commit=False,
+                tp_size=1,
+            )
+        )
+
+    def test_dspark_compact_dsa_defaults_enable_scoped_topk_broadcast(self):
+        args = object.__new__(ServerArgs)
+        args.speculative_algorithm = "DSPARK"
+        args.attention_backend = "dsa"
+        args.prefill_attention_backend = None
+        args.decode_attention_backend = None
+        args.speculative_attention_mode = "prefill"
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_RAGGED_VERIFY_MODE": "compact",
+            },
+            clear=False,
+        ):
+            os.environ.pop("SGLANG_DSA_TOPK_BROADCAST", None)
+            os.environ.pop("SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH", None)
+            args._handle_dspark_dsa_compact_defaults()
+
+            self.assertTrue(envs.SGLANG_DSA_TOPK_BROADCAST.get())
+            self.assertTrue(envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.get())
+
+    def test_dspark_compact_dsa_defaults_respect_disabled_topk_broadcast(self):
+        args = object.__new__(ServerArgs)
+        args.speculative_algorithm = "DSPARK"
+        args.attention_backend = "dsa"
+        args.prefill_attention_backend = None
+        args.decode_attention_backend = None
+        args.speculative_attention_mode = "prefill"
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_RAGGED_VERIFY_MODE": "compact",
+                "SGLANG_DSA_TOPK_BROADCAST": "0",
+            },
+            clear=False,
+        ):
+            os.environ.pop("SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH", None)
+            args._handle_dspark_dsa_compact_defaults()
+
+            self.assertFalse(envs.SGLANG_DSA_TOPK_BROADCAST.get())
+            self.assertFalse(envs.SGLANG_DSPARK_ALLOW_DSA_COMPACT_BATCH.is_set())
+
+    def test_dspark_accept_result_sync_overwrites_local_tp_state(self):
+        class FakeBroadcastGroup:
+            def __init__(self):
+                self.src_values = [
+                    torch.tensor([2, 0], dtype=torch.int32),
+                    torch.tensor([101, 202], dtype=torch.int64),
+                    torch.tensor([0, 1], dtype=torch.int32),
+                    torch.tensor([3, 1], dtype=torch.int32),
+                    torch.tensor([13, 21], dtype=torch.int64),
+                    torch.tensor(
+                        [[11, 12, 101, 0], [202, 22, 23, 0]], dtype=torch.int64
+                    ),
+                ]
+                self.calls = []
+
+            def broadcast(self, tensor, src=0):
+                self.calls.append((tensor.dtype, tuple(tensor.shape), src))
+                tensor.copy_(self.src_values[len(self.calls) - 1])
+
+        worker = object.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(tp_size=4)
+        group = FakeBroadcastGroup()
+
+        correct_len = torch.tensor([0, 3], dtype=torch.int32)
+        bonus = torch.tensor([999, 888], dtype=torch.int64)
+        cap_trim_lens = torch.tensor([4, 4], dtype=torch.int32)
+        commit_lens = torch.tensor([1, 4], dtype=torch.int32)
+        new_seq_lens = torch.tensor([10, 24], dtype=torch.int64)
+        out_tokens = torch.tensor([[99, 98, 97, 0], [88, 87, 86, 0]], dtype=torch.int64)
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.verify_lens_broadcast_group",
+            return_value=(group, 4),
+        ):
+            worker._sync_accept_result_across_tp(
+                correct_len=correct_len,
+                bonus=bonus,
+                cap_trim_lens=cap_trim_lens,
+                commit_lens=commit_lens,
+                new_seq_lens=new_seq_lens,
+                out_tokens=out_tokens,
+            )
+
+        self.assertTrue(torch.equal(correct_len, group.src_values[0]))
+        self.assertTrue(torch.equal(bonus, group.src_values[1]))
+        self.assertTrue(torch.equal(cap_trim_lens, group.src_values[2]))
+        self.assertTrue(torch.equal(commit_lens, group.src_values[3]))
+        self.assertTrue(torch.equal(new_seq_lens, group.src_values[4]))
+        self.assertTrue(torch.equal(out_tokens, group.src_values[5]))
+        self.assertEqual(
+            group.calls,
+            [
+                (torch.int32, (2,), 0),
+                (torch.int64, (2,), 0),
+                (torch.int32, (2,), 0),
+                (torch.int32, (2,), 0),
+                (torch.int64, (2,), 0),
+                (torch.int64, (2, 4), 0),
+            ],
+        )
+
+    def test_dspark_draft_proposal_sync_overwrites_local_tp_candidates(self):
+        class FakeBroadcastGroup:
+            def __init__(self):
+                self.src_values = [
+                    torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int64),
+                    torch.tensor([[11, 12], [21, 22]], dtype=torch.int64),
+                    torch.tensor([True, False], dtype=torch.bool),
+                    torch.tensor([1.0, 0.7], dtype=torch.float32),
+                    torch.full((2, 2, 5), 3.0, dtype=torch.float32),
+                    torch.full((2, 2, 3), 4.0, dtype=torch.float32),
+                    torch.full((4, 3), 5.0, dtype=torch.float32),
+                    torch.tensor([[0.9, 0.8], [0.6, 0.4]], dtype=torch.float32),
+                    torch.tensor([[1.9, 1.8], [1.6, 1.4]], dtype=torch.float32),
+                ]
+                self.calls = []
+
+            def broadcast(self, tensor, src=0):
+                self.calls.append((tensor.dtype, tuple(tensor.shape), src))
+                tensor.copy_(self.src_values[len(self.calls) - 1])
+
+        worker = object.__new__(DSparkWorkerV2)
+        worker.server_args = SimpleNamespace(tp_size=4)
+        group = FakeBroadcastGroup()
+        proposal = SimpleNamespace(
+            draft_block_ids=torch.tensor(
+                [[10, 99, 98], [20, 88, 87]], dtype=torch.int64
+            ),
+            draft_block=SimpleNamespace(
+                draft_tokens=torch.tensor([[99, 98], [88, 87]], dtype=torch.int64),
+                corrected_logits=torch.zeros((2, 2, 5), dtype=torch.float32),
+                greedy_mask=torch.tensor([False, False], dtype=torch.bool),
+                temperatures=torch.tensor([0.1, 0.2], dtype=torch.float32),
+            ),
+            draft_hidden=torch.zeros((2, 2, 3), dtype=torch.float32),
+            confidence_tap=torch.zeros((4, 3), dtype=torch.float32),
+            confidence=torch.zeros((2, 2), dtype=torch.float32),
+            confidence_raw=torch.zeros((2, 2), dtype=torch.float32),
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.verify_lens_broadcast_group",
+            return_value=(group, 4),
+        ):
+            worker._sync_draft_proposal_across_tp(proposal)
+
+        self.assertTrue(torch.equal(proposal.draft_block_ids, group.src_values[0]))
+        self.assertTrue(
+            torch.equal(proposal.draft_block.draft_tokens, group.src_values[1])
+        )
+        self.assertTrue(
+            torch.equal(proposal.draft_block.greedy_mask, group.src_values[2])
+        )
+        self.assertTrue(
+            torch.equal(proposal.draft_block.temperatures, group.src_values[3])
+        )
+        self.assertTrue(
+            torch.equal(proposal.draft_block.corrected_logits, group.src_values[4])
+        )
+        self.assertTrue(torch.equal(proposal.draft_hidden, group.src_values[5]))
+        self.assertTrue(torch.equal(proposal.confidence_tap, group.src_values[6]))
+        self.assertTrue(torch.equal(proposal.confidence, group.src_values[7]))
+        self.assertTrue(torch.equal(proposal.confidence_raw, group.src_values[8]))
+        self.assertEqual(
+            group.calls,
+            [
+                (torch.int64, (2, 3), 0),
+                (torch.int64, (2, 2), 0),
+                (torch.bool, (2,), 0),
+                (torch.float32, (2,), 0),
+                (torch.float32, (2, 2, 5), 0),
+                (torch.float32, (2, 2, 3), 0),
+                (torch.float32, (4, 3), 0),
+                (torch.float32, (2, 2), 0),
+                (torch.float32, (2, 2), 0),
+            ],
         )
 
     def test_dspark_sts_collection_writes_static_shard(self):
@@ -428,11 +783,18 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             positions_2d=torch.arange(8, dtype=torch.int64).view(2, 4),
             verify_cache_loc=torch.arange(8, dtype=torch.int64),
         )
+        cutoff_layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[1, 3],
+            device=torch.device("cpu"),
+            grid=[4],
+            num_draft_tokens=4,
+        )
         seen = {}
 
         def capture_prepare(_verify_input, verify_batch, _target_worker):
             seen["seq_lens_cpu"] = verify_batch.seq_lens_cpu.clone()
             seen["seq_lens_sum"] = verify_batch.seq_lens_sum
+            seen["ragged_verify_layout"] = _verify_input.ragged_verify_layout
             return SimpleNamespace(), False
 
         with patch.object(DFlashVerifyInput, "prepare_for_verify", new=capture_prepare):
@@ -441,13 +803,79 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 draft_input=draft_input,
                 verify_ids_2d=torch.ones((2, 4), dtype=torch.int64),
                 verify_window=verify_window,
+                layout=cutoff_layout,
                 sampling_info=None,
             )
 
         self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
         self.assertEqual(seen["seq_lens_sum"], 30)
+        self.assertIsNone(seen["ragged_verify_layout"])
         self.assertIsNone(batch.seq_lens_cpu)
         self.assertIsNone(batch.seq_lens_sum)
+
+    def test_dspark_compact_eager_skips_epilogue_when_layout_exceeds_graph_bs(self):
+        stride = 8
+        bs = 5
+        vocab_size = 7
+        hidden_size = 3
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=4,
+            verify_num_draft_tokens=stride,
+            device=torch.device("cpu"),
+        )
+        executor = TargetVerifyExecutor(
+            target_worker=SimpleNamespace(),
+            verify_num_draft_tokens=stride,
+            model_runner=SimpleNamespace(),
+            kv_injector=SimpleNamespace(),
+            verify_epilogue=epilogue,
+        )
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[stride] * bs,
+            device=torch.device("cpu"),
+            grid=[bs * stride],
+            num_draft_tokens=stride,
+        )
+        verify_window = SimpleNamespace(
+            positions_2d=torch.arange(bs * stride, dtype=torch.int64).view(bs, stride),
+            verify_cache_loc_2d=torch.arange(bs * stride, dtype=torch.int64).view(
+                bs, stride
+            ),
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.arange(
+                bs * stride * vocab_size, dtype=torch.float32
+            ).view(bs * stride, vocab_size),
+            hidden_states=torch.arange(
+                bs * stride * hidden_size, dtype=torch.float32
+            ).view(bs * stride, hidden_size),
+        )
+        target_result = SimpleNamespace(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
+        )
+
+        with patch.object(executor, "_run_ragged", return_value=target_result):
+            target_verify, hidden_strided = executor.run_compact(
+                batch=SimpleNamespace(),
+                layout=layout,
+                verify_ids_2d=torch.arange(bs * stride, dtype=torch.int64).view(
+                    bs, stride
+                ),
+                verify_window=verify_window,
+                bs=bs,
+                device="cpu",
+                sampling_info=None,
+            )
+
+        self.assertIs(target_verify, target_result)
+        self.assertEqual(
+            target_verify.logits_output.next_token_logits.shape,
+            (bs * stride, vocab_size),
+        )
+        self.assertEqual(hidden_strided.shape, (bs * stride, hidden_size))
+        self.assertEqual(epilogue.inject_gate_buf.item(), 0)
+        self.assertEqual(epilogue.verify_lens_buf.sum().item(), 0)
 
     def test_dspark_draft_proposer_passes_prefix_seq_lens_cpu_and_crops_anchor_hidden(
         self,
