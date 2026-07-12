@@ -49,6 +49,10 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                     "require_non_uniform_verify_lens", False
                 ),
                 require_padded_graph=kwargs.get("require_padded_graph", False),
+                require_cuda_graph_records=kwargs.get(
+                    "require_cuda_graph_records", False
+                ),
+                require_eager_records=kwargs.get("require_eager_records", False),
                 require_trimmed_verify_tokens=kwargs.get(
                     "require_trimmed_verify_tokens", False
                 ),
@@ -58,6 +62,43 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.harness.command_info_summary(args)
+            return json.loads(output.getvalue())
+
+    def _run_trace_summary(self, rows, **kwargs):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+            f.flush()
+            args = Namespace(
+                trace=f.name,
+                summary_output=None,
+                max_failure_examples=10,
+                require_records_min=kwargs.get("require_records_min"),
+                require_compact=kwargs.get("require_compact", False),
+                require_non_uniform_verify_lens=kwargs.get(
+                    "require_non_uniform_verify_lens", False
+                ),
+                require_folded_accept=kwargs.get("require_folded_accept", False),
+                require_non_greedy=kwargs.get("require_non_greedy", False),
+                require_seeded_sampling=kwargs.get("require_seeded_sampling", False),
+                require_non_greedy_accept_coverage=kwargs.get(
+                    "require_non_greedy_accept_coverage", False
+                ),
+                require_padded_graph=kwargs.get("require_padded_graph", False),
+                require_cuda_graph_records=kwargs.get(
+                    "require_cuda_graph_records", False
+                ),
+                require_eager_records=kwargs.get("require_eager_records", False),
+                require_trimmed_verify_tokens=kwargs.get(
+                    "require_trimmed_verify_tokens", False
+                ),
+                min_saved_verify_tokens=kwargs.get("min_saved_verify_tokens"),
+                require_no_skipped=kwargs.get("require_no_skipped", False),
+                fail_on_verdict=kwargs.get("fail_on_verdict", False),
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.harness.command_trace_summary(args)
             return json.loads(output.getvalue())
 
     def test_info_summary_counts_compact_non_uniform_and_graph_padding(self):
@@ -135,6 +176,116 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                 require_non_uniform_verify_lens=True,
                 fail_on_verdict=True,
             )
+
+    def test_trace_summary_distinguishes_graph_eager_and_unknown_records(self):
+        summary = self._run_trace_summary(
+            [
+                {
+                    "verdict": {"passed": True},
+                    "can_run_cuda_graph": True,
+                    "reqs": [{"verify_len": 8}],
+                    "verify_lens_sum": 8,
+                    "verify_num_draft_tokens": 8,
+                },
+                {
+                    "verdict": {"passed": True},
+                    "can_run_cuda_graph": False,
+                    "reqs": [{"verify_len": 8}],
+                    "verify_lens_sum": 8,
+                    "verify_num_draft_tokens": 8,
+                },
+                {
+                    "verdict": {"passed": True},
+                    "reqs": [{"verify_len": 8}],
+                    "verify_lens_sum": 8,
+                    "verify_num_draft_tokens": 8,
+                },
+            ]
+        )
+
+        self.assertEqual(summary["cuda_graph_records"], 1)
+        self.assertEqual(summary["eager_records"], 1)
+        self.assertEqual(summary["cuda_graph_unknown_records"], 1)
+
+    def test_trace_summary_graph_and_eager_gates(self):
+        passing = self._run_trace_summary(
+            [
+                {
+                    "verdict": {"passed": True},
+                    "can_run_cuda_graph": True,
+                    "reqs": [{"verify_len": 8}],
+                    "verify_lens_sum": 8,
+                    "verify_num_draft_tokens": 8,
+                },
+                {
+                    "verdict": {"passed": True},
+                    "can_run_cuda_graph": False,
+                    "reqs": [{"verify_len": 8}],
+                    "verify_lens_sum": 8,
+                    "verify_num_draft_tokens": 8,
+                },
+            ],
+            require_cuda_graph_records=True,
+            require_eager_records=True,
+            fail_on_verdict=True,
+        )
+
+        self.assertTrue(passing["verdict"]["passed"])
+
+        with self.assertRaises(SystemExit):
+            self._run_trace_summary(
+                [
+                    {
+                        "verdict": {"passed": True},
+                        "can_run_cuda_graph": False,
+                        "reqs": [{"verify_len": 8}],
+                        "verify_lens_sum": 8,
+                        "verify_num_draft_tokens": 8,
+                    }
+                ],
+                require_cuda_graph_records=True,
+                fail_on_verdict=True,
+            )
+
+    def test_trace_summary_coverage_gate_requires_non_greedy_records(self):
+        with self.assertRaises(SystemExit):
+            self._run_trace_summary(
+                [
+                    {
+                        "verdict": {"passed": True},
+                        "all_greedy": True,
+                        "reqs": [{"verify_len": 8}],
+                        "verify_lens_sum": 8,
+                        "verify_num_draft_tokens": 8,
+                    }
+                ],
+                require_non_greedy_accept_coverage=True,
+                fail_on_verdict=True,
+            )
+
+    def test_trace_summary_non_greedy_seeded_coverage_gate_passes(self):
+        summary = self._run_trace_summary(
+            [
+                {
+                    "verdict": {"passed": True},
+                    "all_greedy": False,
+                    "coverage": {"non_greedy_accept": "accept_sampling_reference"},
+                    "sampling": {"seed_present": True, "backend": "pytorch"},
+                    "reqs": [{"verify_len": 4}],
+                    "verify_lens_sum": 4,
+                    "verify_num_draft_tokens": 8,
+                }
+            ],
+            require_non_greedy=True,
+            require_seeded_sampling=True,
+            require_non_greedy_accept_coverage=True,
+            fail_on_verdict=True,
+        )
+
+        self.assertEqual(summary["non_greedy_records"], 1)
+        self.assertEqual(summary["seeded_sampling_records"], 1)
+        self.assertEqual(summary["non_greedy_accept_covered_records"], 1)
+        self.assertTrue(summary["verdict"]["passed"])
 
     def test_collect_manifest_hashes_artifacts_and_filters_environment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -256,6 +407,79 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
 
             self.assertEqual(events, ["force", "collect", "server_info", "reset"])
             self.assertTrue(server_info.exists())
+
+    def test_collect_resume_reports_wall_throughput_for_new_rows_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            prompts = tmpdir / "prompts.jsonl"
+            output = tmpdir / "collect.jsonl"
+            prompts.write_text(
+                '{"idx": 0, "text": "old"}\n{"idx": 1, "text": "new"}\n',
+                encoding="utf-8",
+            )
+            output.write_text(
+                json.dumps(
+                    {
+                        "idx": 0,
+                        "ok": True,
+                        "completion_tokens": 10,
+                        "meta_info": {"completion_tokens": 10},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                base_url="http://127.0.0.1:30000",
+                prompts=str(prompts),
+                output=str(output),
+                run_label="resume",
+                start_idx=None,
+                end_idx=None,
+                limit=None,
+                resume=True,
+                concurrency=1,
+                print_records=False,
+                temperature=0.0,
+                sampling_seed=None,
+                allow_nondeterministic_sampling=False,
+                dspark_force_budget_frac=None,
+                dspark_reset_force_budget=True,
+                dspark_clear_info_records=False,
+                timeout_s=1,
+                server_info_output=None,
+                manifest_output=None,
+            )
+
+            def fake_collect_one(row, args):
+                return {
+                    "idx": row["idx"],
+                    "ok": True,
+                    "completion_tokens": 5,
+                    "meta_info": {"completion_tokens": 5},
+                }
+
+            stdout = io.StringIO()
+            with (
+                patch.object(self.harness, "collect_one", side_effect=fake_collect_one),
+                patch.object(
+                    self.harness.time, "perf_counter", side_effect=[100.0, 102.0]
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.harness.command_collect(args)
+
+            summary = json.loads(stdout.getvalue().strip().splitlines()[-1])
+            self.assertEqual(summary["completion_tokens"], 15)
+            self.assertNotIn("elapsed_s", summary)
+            self.assertNotIn("completion_tokens_per_s_by_wall", summary)
+            self.assertEqual(summary["resumed_existing_rows"], 1)
+            self.assertEqual(summary["resumed_pending_requests"], 1)
+            self.assertEqual(summary["completion_tokens_new_requests"], 5)
+            self.assertEqual(summary["elapsed_s_new_requests"], 2.0)
+            self.assertEqual(
+                summary["completion_tokens_per_s_new_requests_by_wall"], 2.5
+            )
 
 
 if __name__ == "__main__":

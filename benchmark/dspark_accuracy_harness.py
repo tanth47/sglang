@@ -475,11 +475,14 @@ def command_collect(args) -> None:
         output_path.unlink()
 
     done = set()
+    resumed_existing_rows = []
     if output_path.exists() and args.resume:
-        done = {r["idx"] for r in read_jsonl(output_path) if r.get("ok") and "idx" in r}
+        resumed_existing_rows = read_jsonl(output_path)
+        done = {r["idx"] for r in resumed_existing_rows if r.get("ok") and "idx" in r}
 
     started = time.perf_counter()
     pending_prompts = [row for row in prompts if row["idx"] not in done]
+    pending_indices = {row["idx"] for row in pending_prompts}
     force_budget_applied = False
     try:
         if args.dspark_force_budget_frac is not None:
@@ -522,11 +525,21 @@ def command_collect(args) -> None:
 
     rows = read_jsonl(output_path)
     summary = summarize_run(rows)
+    elapsed_s = time.perf_counter() - started
+    if resumed_existing_rows:
+        add_resume_wall_stats(
+            summary,
+            rows=rows,
+            pending_indices=pending_indices,
+            wall_s=elapsed_s,
+            resumed_existing_rows=len(resumed_existing_rows),
+        )
+    else:
+        add_wall_throughput(summary, wall_s=elapsed_s)
     summary.update(
         {
             "run_label": args.run_label,
             "output": str(output_path),
-            "elapsed_s": time.perf_counter() - started,
             "dspark_force_budget_frac": args.dspark_force_budget_frac,
             "server_info_output": args.server_info_output,
             "manifest_output": args.manifest_output,
@@ -1082,6 +1095,9 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     accept_rates = [
         m["spec_accept_rate"] for m in metas if m.get("spec_accept_rate") is not None
     ]
+    elapsed_values = [
+        float(r["elapsed_s"]) for r in ok if r.get("elapsed_s") is not None
+    ]
     summary = {
         "requests": len(rows),
         "ok_requests": len(ok),
@@ -1118,7 +1134,50 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
         summary["p50_accept_rate"] = quantile(accept_rates, 50)
         summary["p90_accept_rate"] = quantile(accept_rates, 90)
         summary["accept_rate_buckets"] = accept_rate_buckets(accept_rates)
+    if elapsed_values:
+        elapsed_sum = sum(elapsed_values)
+        summary["request_elapsed_sum_s"] = elapsed_sum
+        summary["mean_request_latency_s"] = statistics.fmean(elapsed_values)
+        summary["p50_request_latency_s"] = quantile(elapsed_values, 50)
+        summary["p90_request_latency_s"] = quantile(elapsed_values, 90)
+        summary["max_request_latency_s"] = max(elapsed_values)
+        if elapsed_sum > 0:
+            summary["completion_tokens_per_s_by_request_sum"] = completion / elapsed_sum
     return summary
+
+
+def add_wall_throughput(summary: dict[str, Any], *, wall_s: float) -> None:
+    summary["elapsed_s"] = wall_s
+    completion = summary.get("completion_tokens") or 0
+    if wall_s > 0:
+        summary["completion_tokens_per_s_by_wall"] = completion / wall_s
+
+
+def add_resume_wall_stats(
+    summary: dict[str, Any],
+    *,
+    rows: list[dict[str, Any]],
+    pending_indices: set[int],
+    wall_s: float,
+    resumed_existing_rows: int,
+) -> None:
+    summary["resumed_existing_rows"] = resumed_existing_rows
+    summary["resumed_pending_requests"] = len(pending_indices)
+    summary["elapsed_s_new_requests"] = wall_s
+    new_completion = sum(
+        int(
+            row.get("completion_tokens")
+            or (row.get("meta_info") or {}).get("completion_tokens")
+            or 0
+        )
+        for row in rows
+        if row.get("ok") and row.get("idx") in pending_indices
+    )
+    summary["completion_tokens_new_requests"] = new_completion
+    if wall_s > 0 and new_completion:
+        summary["completion_tokens_per_s_new_requests_by_wall"] = (
+            new_completion / wall_s
+        )
 
 
 def quantile(values: list[float], pct: float) -> float:
@@ -1459,6 +1518,9 @@ def command_trace_summary(args) -> None:
     sampling_backends = {}
     simulated_count = 0
     padded_graph_count = 0
+    cuda_graph_count = 0
+    eager_count = 0
+    cuda_graph_unknown_count = 0
     request_rows = 0
     max_bs = 0
     verify_lens_sums = []
@@ -1510,6 +1572,13 @@ def command_trace_summary(args) -> None:
             sampling_backends[backend] = sampling_backends.get(backend, 0) + 1
         if row.get("simulated_accept"):
             simulated_count += 1
+        can_run_cuda_graph = row.get("can_run_cuda_graph")
+        if can_run_cuda_graph is True:
+            cuda_graph_count += 1
+        elif can_run_cuda_graph is False:
+            eager_count += 1
+        else:
+            cuda_graph_unknown_count += 1
         req_count = len(row.get("reqs") or [])
         request_rows += req_count
         max_bs = max(max_bs, req_count)
@@ -1542,15 +1611,25 @@ def command_trace_summary(args) -> None:
         gate_failures.append("no non-greedy records were observed")
     if args.require_seeded_sampling and seeded_count == 0:
         gate_failures.append("no seeded sampling records were observed")
-    if args.require_non_greedy_accept_coverage and non_greedy_accept_uncovered_count:
-        gate_failures.append(
-            f"{non_greedy_accept_uncovered_count} non-greedy records did not "
-            "have accept-sampling reference coverage"
-        )
+    if args.require_non_greedy_accept_coverage:
+        if non_greedy_count == 0:
+            gate_failures.append(
+                "non-greedy accept coverage was required, but no non-greedy "
+                "records were observed"
+            )
+        elif non_greedy_accept_uncovered_count:
+            gate_failures.append(
+                f"{non_greedy_accept_uncovered_count} non-greedy records did not "
+                "have accept-sampling reference coverage"
+            )
     if args.require_no_skipped and skipped_count:
         gate_failures.append(f"{skipped_count} skipped records were observed")
     if args.require_padded_graph and padded_graph_count == 0:
         gate_failures.append("no padded graph records were observed")
+    if args.require_cuda_graph_records and cuda_graph_count == 0:
+        gate_failures.append("no target-verify CUDA graph records were observed")
+    if args.require_eager_records and eager_count == 0:
+        gate_failures.append("no eager target-verify records were observed")
     saved_verify_tokens = full_verify_token_sum - scheduled_verify_token_sum
     if args.require_trimmed_verify_tokens and saved_verify_tokens <= 0:
         gate_failures.append("no verify tokens were trimmed")
@@ -1579,6 +1658,9 @@ def command_trace_summary(args) -> None:
         "seeded_sampling_records": seeded_count,
         "sampling_backends": sampling_backends,
         "simulated_accept_records": simulated_count,
+        "cuda_graph_records": cuda_graph_count,
+        "eager_records": eager_count,
+        "cuda_graph_unknown_records": cuda_graph_unknown_count,
         "padded_graph_records": padded_graph_count,
         "full_verify_token_sum": full_verify_token_sum,
         "scheduled_verify_token_sum": scheduled_verify_token_sum,
@@ -1952,6 +2034,8 @@ def add_trace_summary(subparsers) -> None:
     parser.add_argument("--require-seeded-sampling", action="store_true")
     parser.add_argument("--require-non-greedy-accept-coverage", action="store_true")
     parser.add_argument("--require-padded-graph", action="store_true")
+    parser.add_argument("--require-cuda-graph-records", action="store_true")
+    parser.add_argument("--require-eager-records", action="store_true")
     parser.add_argument("--require-trimmed-verify-tokens", action="store_true")
     parser.add_argument("--min-saved-verify-tokens", type=int)
     parser.add_argument("--require-no-skipped", action="store_true")
