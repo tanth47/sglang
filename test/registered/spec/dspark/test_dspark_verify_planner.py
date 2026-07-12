@@ -11,6 +11,9 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
 )
+from sglang.srt.speculative.dspark_components.kernels.schedule_verify_lens_topk import (
+    schedule_verify_lens_topk,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +28,8 @@ def _server_args():
         speculative_dspark_min_verify_len=None,
         speculative_dspark_max_verify_len=None,
         speculative_dspark_survival_eps=1e-6,
+        speculative_dspark_max_budget_frac=None,
+        speculative_dspark_theta_tolerance=1.0,
     )
 
 
@@ -89,6 +94,8 @@ class TestDSparkVerifyPlanner(CustomTestCase):
         server_args.speculative_dspark_min_verify_len = 2
         server_args.speculative_dspark_max_verify_len = 5
         server_args.speculative_dspark_survival_eps = 0.05
+        server_args.speculative_dspark_max_budget_frac = 0.75
+        server_args.speculative_dspark_theta_tolerance = 0.99
         with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}):
             planner = DSparkVerifyPlanner(
                 draft_model=_draft_model(with_confidence_head=False),
@@ -103,6 +110,8 @@ class TestDSparkVerifyPlanner(CustomTestCase):
         self.assertEqual(planner._schedule_cfg.min_verify_len, 2)
         self.assertEqual(planner._schedule_cfg.max_verify_len, 5)
         self.assertEqual(planner._schedule_cfg.survival_eps, 0.05)
+        self.assertEqual(planner._schedule_cfg.max_budget_frac, 0.75)
+        self.assertEqual(planner._schedule_cfg.theta_tolerance, 0.99)
 
     def test_compact_mode_rejects_backend_without_ragged_verify_graph_support(self):
         with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}):
@@ -179,6 +188,36 @@ class TestDSparkVerifyPlanner(CustomTestCase):
         torch.testing.assert_close(seen["resolved_seq_lens"], prefix_lens)
         torch.testing.assert_close(seen["current_seq_lens_cpu"], prefix_lens)
         torch.testing.assert_close(seen["req_pool_indices_cpu"], req_pool_indices)
+
+    def test_forced_budget_ignores_survival_eps_when_scheduling_lens(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = types.SimpleNamespace(forced_budget_frac=1.0)
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3, survival_eps=0.99)
+        planner.server_args = types.SimpleNamespace(tp_size=1)
+
+        confidence = torch.full((2, 3), 0.1)
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify_planner."
+            "verify_lens_broadcast_group",
+            return_value=(None, 1),
+        ), patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify_planner."
+            "ScheduleVerifyLensTopk.execute",
+            side_effect=lambda *, confidence, budget, cfg: schedule_verify_lens_topk(
+                confidence=confidence,
+                budget=budget,
+                cfg=cfg,
+            ),
+        ):
+            verify_lens = planner._schedule_verify_lens(
+                req_pool_indices=torch.tensor([0, 1]),
+                prefix_lens=torch.tensor([8, 8]),
+                device=torch.device("cpu"),
+                confidence=confidence,
+                budget=6,
+            )
+
+        torch.testing.assert_close(verify_lens, torch.tensor([4, 4], dtype=torch.int32))
 
     def test_tp_verify_lens_broadcast_syncs_graph_num_tokens(self):
         class FakeBudgetPlanner:

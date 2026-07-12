@@ -152,6 +152,8 @@ class DSparkVerifyPlanner:
                 else int(server_args.speculative_dspark_max_verify_len)
             ),
             survival_eps=float(server_args.speculative_dspark_survival_eps),
+            max_budget_frac=server_args.speculative_dspark_max_budget_frac,
+            theta_tolerance=float(server_args.speculative_dspark_theta_tolerance),
         )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._last_confidence_relay_stats: Optional[ConfidenceRelayStats] = None
@@ -706,10 +708,20 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        schedule_cfg = self._schedule_cfg
+        if self._budget_planner.forced_budget_frac is not None:
+            schedule_cfg = DSparkScheduleConfig(
+                gamma=self._schedule_cfg.gamma,
+                min_verify_len=self._schedule_cfg.min_verify_len,
+                max_verify_len=self._schedule_cfg.max_verify_len,
+                survival_eps=0.0,
+                max_budget_frac=self._schedule_cfg.max_budget_frac,
+                theta_tolerance=self._schedule_cfg.theta_tolerance,
+            )
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
-            cfg=self._schedule_cfg,
+            cfg=schedule_cfg,
         ).to(device=device, dtype=torch.int32)
 
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
