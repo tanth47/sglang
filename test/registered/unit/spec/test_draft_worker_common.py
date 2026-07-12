@@ -59,4 +59,3 @@ def test_draft_worker_keeps_non_quark_draft_quantization(tmp_path):
 
     assert server_args.speculative_draft_model_quantization == "fp8"
     assert server_args.quantization == "fp8"
-

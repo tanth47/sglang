@@ -1,8 +1,8 @@
 import unittest
 
 from sglang.benchmark.dspark_sps_profiler import (
-    LoadInfo,
     SPS_RECORD_SOURCE,
+    LoadInfo,
     ServerContext,
     SpsRow,
     build_request_count_sweep,

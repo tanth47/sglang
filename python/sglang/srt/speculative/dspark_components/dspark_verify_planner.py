@@ -464,7 +464,6 @@ class DSparkVerifyPlanner:
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ) -> Optional[int]:
-        del prefix_lens
         if self._budget_planner is None:
             return None
         req_pool_indices_cpu = req_pool_indices.to("cpu").to(torch.int64)

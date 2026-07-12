@@ -39,7 +39,9 @@ class TestDsparkVerifyEpilogueCommitWindow(CustomTestCase):
                 draft_model=draft_model,
                 block_pos_offsets=torch.arange(4, dtype=torch.int64),
                 resolve_pool=lambda: pool,
-                resolve_req_to_token=lambda: torch.full((3, 32), -999, dtype=torch.int64),
+                resolve_req_to_token=lambda: torch.full(
+                    (3, 32), -999, dtype=torch.int64
+                ),
             ),
         )
         epilogue.strided_hidden = torch.arange(24, dtype=torch.float32).view(12, 2)

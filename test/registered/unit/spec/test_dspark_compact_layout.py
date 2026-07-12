@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
+from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
 from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
     compact_row_index,
     compact_verify_ids,
 )
-from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

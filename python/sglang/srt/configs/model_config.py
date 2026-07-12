@@ -149,7 +149,9 @@ def _normalize_nested_transformer_config(hf_config: PretrainedConfig) -> None:
         items = transformer_cfg.items()
     else:
         to_dict = getattr(transformer_cfg, "to_dict", None)
-        items = to_dict().items() if callable(to_dict) else vars(transformer_cfg).items()
+        items = (
+            to_dict().items() if callable(to_dict) else vars(transformer_cfg).items()
+        )
 
     for key, value in items:
         if key.startswith("_"):

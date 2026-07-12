@@ -71,9 +71,7 @@ class StsDataRecorder:
             self._writer_queue.join()
             self._check_writer_error()
 
-    def _enqueue_shard(
-        self, shard_path: Path, shard: dict[str, torch.Tensor]
-    ) -> None:
+    def _enqueue_shard(self, shard_path: Path, shard: dict[str, torch.Tensor]) -> None:
         if self._writer_queue is None:
             self._writer_queue = Queue()
             self._writer_thread = Thread(

@@ -17,11 +17,11 @@ from sglang.srt.models.dspark import (
     normalize_dspark_draft_config,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.draft_worker_common import (
     _resolve_draft_attention_backend,
     draft_is_deepseek_v4,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dspark_components.dspark_utils import (
     parse_dspark_draft_config,
 )
@@ -218,7 +218,9 @@ class TestGLM52RedHatDSparkConfig(CustomTestCase):
         config = _glm52_redhat_dspark_config()
         config.aux_hidden_state_layer_ids = [8, 23, 77]
 
-        with self.assertRaisesRegex(ValueError, "cannot include the final target layer"):
+        with self.assertRaisesRegex(
+            ValueError, "cannot include the final target layer"
+        ):
             _resolve_dflash_or_dspark_capture_spec(
                 draft_hf_config=config,
                 target_num_layers=78,

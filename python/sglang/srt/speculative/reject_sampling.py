@@ -91,7 +91,9 @@ def speculative_sampling_classic_kernel(
     # Final Sampling
     all_drafts_accepted = continue_verifying
     coin_final = tl.load(
-        UniformSamplesFinal + pid * stride_uni_final_b + cur_prob_row * stride_uni_final_s
+        UniformSamplesFinal
+        + pid * stride_uni_final_b
+        + cur_prob_row * stride_uni_final_s
     )
     norm_sum = 0.0
 

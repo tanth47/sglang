@@ -14,9 +14,7 @@ def test_flashinfer_dispatch_falls_back_to_torch_when_unavailable(monkeypatch):
     logits = torch.tensor([[1.0, 2.0, -1.0], [0.5, -0.5, 3.0]])
     temperatures = torch.ones(1)
 
-    ref = mod.softmax_temp(
-        logits=logits, temperatures=temperatures, rows_per_request=2
-    )
+    ref = mod.softmax_temp(logits=logits, temperatures=temperatures, rows_per_request=2)
     got = mod.SoftmaxTemp.execute(
         logits=logits, temperatures=temperatures, rows_per_request=2
     )

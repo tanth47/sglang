@@ -129,7 +129,6 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -137,6 +136,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 

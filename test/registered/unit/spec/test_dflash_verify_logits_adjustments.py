@@ -34,7 +34,9 @@ def test_non_noop_verify_logits_adjustment_keeps_shape_checks():
     try:
         apply_dflash_verify_logits_adjustments(
             next_token_logits=torch.empty((3, 5)),
-            sampling_info=_SamplingInfo(vocab_mask=torch.ones((2, 5), dtype=torch.bool)),
+            sampling_info=_SamplingInfo(
+                vocab_mask=torch.ones((2, 5), dtype=torch.bool)
+            ),
             draft_token_num=4,
         )
     except ValueError as exc:

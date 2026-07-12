@@ -20,10 +20,10 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
+    build_seeded_dflash_sampling_uniforms,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
-    build_seeded_dflash_sampling_uniforms,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )

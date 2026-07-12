@@ -168,9 +168,7 @@ class VanillaMarkov(nn.Module):
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
-        self._opt_markov_w2_tp_shard = (
-            envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
-        )
+        self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
         self.markov_w2 = nn.Linear(
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
@@ -315,7 +313,9 @@ class VanillaMarkov(nn.Module):
         if self._tp_shard is not None:
             output_logits = []
             for k in range(base_logits.size(-2)):
-                step_hidden = None if hidden_states is None else hidden_states[..., k, :]
+                step_hidden = (
+                    None if hidden_states is None else hidden_states[..., k, :]
+                )
                 output_logits.append(
                     self.apply_step_logits(
                         base_logits[..., k, :],
@@ -403,9 +403,7 @@ class RNNHead(VanillaMarkov):
         prev_embeddings: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        new_state, latent = self._rnn_step_latent(
-            state, prev_embeddings, hidden_states
-        )
+        new_state, latent = self._rnn_step_latent(state, prev_embeddings, hidden_states)
         return new_state, self.project_bias(latent)
 
     def compute_step_latent(

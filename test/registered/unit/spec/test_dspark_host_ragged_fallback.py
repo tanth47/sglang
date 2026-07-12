@@ -2,12 +2,10 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.dspark_components.kernels import (
-    qo_indptr as _qo_indptr_mod,
-)
 from sglang.srt.speculative.dspark_components.dspark_verify_planner import (
     DSparkVerifyPlanner,
 )
+from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 

@@ -5,21 +5,23 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.speculative.dflash_utils as dflash_utils
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.speculative.dflash_utils import (
+    build_dflash_verify_target_probs,
+    build_seeded_dflash_sampling_uniforms,
+)
+from sglang.srt.speculative.dspark_components.dspark_accept import accept_draft_tokens
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    build_dspark_draft_probs,
+    sample_draft_block,
+)
+from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
 from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
     AcceptSampling,
     _chain_uniform_samples,
     _reference_chain_accept,
     _vectorized_chain_accept,
 )
-from sglang.srt.speculative.dspark_components.dspark_accept import accept_draft_tokens
-from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
-from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
-from sglang.srt.speculative.dflash_utils import build_seeded_dflash_sampling_uniforms
-from sglang.srt.speculative.dspark_components.dspark_draft import (
-    build_dspark_draft_probs,
-    sample_draft_block,
-)
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -507,9 +509,7 @@ class TestDFlashVerifyTargetProbs(unittest.TestCase):
 
         self.assertEqual(len(captured_probs), 2)
         for probs in captured_probs:
-            torch.testing.assert_close(
-                probs[:, 2:], torch.zeros_like(probs[:, 2:])
-            )
+            torch.testing.assert_close(probs[:, 2:], torch.zeros_like(probs[:, 2:]))
         torch.testing.assert_close(
             result.draft_tokens, torch.zeros((1, 2), dtype=torch.int64)
         )

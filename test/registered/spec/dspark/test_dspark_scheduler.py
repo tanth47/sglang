@@ -11,9 +11,6 @@ from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     compute_verify_token_budget,
     schedule_verify_lens_topk_from_survival,
 )
-from sglang.srt.speculative.dspark_components.kernels import (
-    qo_indptr as _qo_indptr_mod,
-)
 from sglang.srt.speculative.dspark_components.dspark_sps_table import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -21,6 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps_table import (
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     graph_tier_fill_budget,
 )
+from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -127,8 +125,7 @@ def schedule_verify_lens_topk_vanilla(
         selected_extra[request] += 1
 
     verify_lens = [
-        min(max(lower_bound + extra, lower_bound), max_len)
-        for extra in selected_extra
+        min(max(lower_bound + extra, lower_bound), max_len) for extra in selected_extra
     ]
     return torch.tensor(verify_lens, dtype=torch.int32, device=device)
 
@@ -417,9 +414,7 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
                 count,
                 f"request {request}: verify_len count mismatch",
             )
-            expected_prefix = list(
-                range(start_col, start_col + count)
-            )
+            expected_prefix = list(range(start_col, start_col + count))
             self.assertEqual(
                 positions,
                 expected_prefix,

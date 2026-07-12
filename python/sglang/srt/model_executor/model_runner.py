@@ -395,9 +395,7 @@ def _resolve_dflash_or_dspark_capture_spec(
             parse_dspark_draft_config,
         )
 
-        dspark_draft_config = parse_dspark_draft_config(
-            draft_hf_config=draft_hf_config
-        )
+        dspark_draft_config = parse_dspark_draft_config(draft_hf_config=draft_hf_config)
         if not dspark_draft_config.require_markov():
             raise ValueError(
                 "DSPARK requires markov_rank > 0 in the draft config, "
@@ -599,12 +597,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             self.dflash_or_dspark_use_aux_hidden_state = True
-            self.dflash_or_dspark_draft_num_layers = int(
-                capture_spec.draft_num_layers
-            )
-            self.dflash_or_dspark_target_layer_ids = list(
-                capture_spec.target_layer_ids
-            )
+            self.dflash_or_dspark_draft_num_layers = int(capture_spec.draft_num_layers)
+            self.dflash_or_dspark_target_layer_ids = list(capture_spec.target_layer_ids)
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:

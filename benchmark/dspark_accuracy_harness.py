@@ -38,7 +38,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_DATASET = "mgoin/GLM-5.2-FP8-magpie-ultrachat"
 DEFAULT_MODEL = "zai-org/GLM-5.2-FP8"
 MANIFEST_ENV_PREFIXES = ("SGLANG_",)
@@ -210,7 +209,9 @@ def encode_without_special_tokens(tokenizer, text: str) -> list[int]:
         return tokenizer.encode(text)
 
 
-def tokenize_prompt_and_gold(tokenizer, prompt_text: str, gold_text: str) -> dict[str, Any]:
+def tokenize_prompt_and_gold(
+    tokenizer, prompt_text: str, gold_text: str
+) -> dict[str, Any]:
     prompt_ids = tokenizer.encode(prompt_text)
     full_ids = tokenizer.encode(prompt_text + gold_text)
     boundary_exact = full_ids[: len(prompt_ids)] == prompt_ids
@@ -253,9 +254,9 @@ def load_ultrachat_prompts(args) -> list[dict[str, Any]]:
                 "id": row.get("id"),
                 "source": row.get("source"),
                 "dataset": args.dataset,
-                "prompt_mode": "chat_no_thinking"
-                if args.disable_thinking
-                else "chat_default",
+                "prompt_mode": (
+                    "chat_no_thinking" if args.disable_thinking else "chat_default"
+                ),
                 "prompt_tokens_offline": len(tokenizer.encode(text)),
                 "text": text,
             }
@@ -306,9 +307,9 @@ def load_ultrachat_gold(args) -> list[dict[str, Any]]:
             "id": row.get("id"),
             "source": row.get("source"),
             "dataset": args.dataset,
-            "prompt_mode": "chat_no_thinking"
-            if args.disable_thinking
-            else "chat_default",
+            "prompt_mode": (
+                "chat_no_thinking" if args.disable_thinking else "chat_default"
+            ),
             "prompt_ids": tokenized["prompt_ids"],
             "gold_ids": gold_ids,
             "prompt_tokens_offline": tokenized["prompt_token_count_offline"],
@@ -561,16 +562,20 @@ def collect_one(row: dict[str, Any], args) -> dict[str, Any]:
                     "elapsed_s": time.perf_counter() - request_started,
                     "text": obj.get("text"),
                     "output_ids": output_ids,
-                    "output_id_count": len(output_ids)
-                    if isinstance(output_ids, list)
-                    else None,
+                    "output_id_count": (
+                        len(output_ids) if isinstance(output_ids, list) else None
+                    ),
                     "prompt_token_ids": prompt_token_ids,
-                    "prompt_token_id_count": len(prompt_token_ids)
-                    if isinstance(prompt_token_ids, list)
-                    else None,
-                    "prompt_token_ids_sha256": sha256_json(prompt_token_ids)
-                    if isinstance(prompt_token_ids, list)
-                    else None,
+                    "prompt_token_id_count": (
+                        len(prompt_token_ids)
+                        if isinstance(prompt_token_ids, list)
+                        else None
+                    ),
+                    "prompt_token_ids_sha256": (
+                        sha256_json(prompt_token_ids)
+                        if isinstance(prompt_token_ids, list)
+                        else None
+                    ),
                     "meta_info": meta,
                     "prompt_tokens": meta.get("prompt_tokens"),
                     "completion_tokens": meta.get("completion_tokens"),
@@ -835,7 +840,9 @@ def attach_teacher_forced_dspark_records(
     return attached
 
 
-def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[str, Any]:
+def summarize_teacher_forced(
+    rows: list[dict[str, Any]], *, gamma: int
+) -> dict[str, Any]:
     http_ok_rows = [r for r in rows if r.get("ok")]
     dspark_rows = [
         r
@@ -843,18 +850,14 @@ def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[
         if r.get("ok") and r.get("teacher_forced_ok") and r.get("dspark_info")
     ]
     gold_rows = [
-        r
-        for r in dspark_rows
-        if r.get("gold_compare_ok") and r.get("compare_width")
+        r for r in dspark_rows if r.get("gold_compare_ok") and r.get("compare_width")
     ]
     missing = [
         r
         for r in rows
         if r.get("ok") and int(r.get("dspark_info_records_for_rid") or 0) == 0
     ]
-    anchor_mismatch = [
-        r for r in dspark_rows if not bool(r.get("anchor_matches_gold"))
-    ]
+    anchor_mismatch = [r for r in dspark_rows if not bool(r.get("anchor_matches_gold"))]
     errors = [r for r in rows if not r.get("ok")]
     correct = sum(int(r.get("correct_len") or 0) for r in gold_rows)
     proposed = sum(int(r.get("compare_width") or 0) for r in gold_rows)
@@ -864,9 +867,7 @@ def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[
         if correct_len >= len(hist):
             hist.extend([0] * (correct_len + 1 - len(hist)))
         hist[correct_len] += 1
-    server_rows = [
-        r for r in dspark_rows if r.get("server_correct_drafts") is not None
-    ]
+    server_rows = [r for r in dspark_rows if r.get("server_correct_drafts") is not None]
     server_hist = [0] * (gamma + 1)
     for row in server_rows:
         server_correct_len = min(int(row.get("server_correct_drafts") or 0), gamma)
@@ -876,7 +877,9 @@ def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[
     server_correct = sum(int(r.get("server_correct_drafts") or 0) for r in server_rows)
     server_proposed = gamma * len(server_rows)
     server_acc_lens = [
-        int(r["server_acc_len"]) for r in server_rows if r.get("server_acc_len") is not None
+        int(r["server_acc_len"])
+        for r in server_rows
+        if r.get("server_acc_len") is not None
     ]
     summary = {
         "windows": len(rows),
@@ -902,9 +905,9 @@ def summarize_teacher_forced(rows: list[dict[str, Any]], *, gamma: int) -> dict[
         summary["accept_rate"] = correct / proposed
     if gold_rows:
         summary["draft_accept_length"] = correct / len(gold_rows)
-        summary["accept_length_including_bonus"] = (
-            correct + len(gold_rows)
-        ) / len(gold_rows)
+        summary["accept_length_including_bonus"] = (correct + len(gold_rows)) / len(
+            gold_rows
+        )
         summary["mean_compare_width"] = proposed / len(gold_rows)
     if server_proposed:
         summary["server_accept_rate"] = server_correct / server_proposed
@@ -1021,8 +1024,7 @@ def command_teacher_forced_probe(args) -> None:
         )
     if (
         args.min_accept_length is not None
-        and summary.get("accept_length_including_bonus", 0.0)
-        < args.min_accept_length
+        and summary.get("accept_length_including_bonus", 0.0) < args.min_accept_length
     ):
         failures.append(
             "accept_length_including_bonus "
@@ -1073,7 +1075,9 @@ def summarize_run(rows: list[dict[str, Any]]) -> dict[str, Any]:
     accept_len_histogram = sum_histogram(spec_metas, "spec_accept_histogram")
     cap_lens_histogram = sum_histogram(spec_metas, "spec_cap_lens_histogram")
     accept_lengths = [
-        m["spec_accept_length"] for m in metas if m.get("spec_accept_length") is not None
+        m["spec_accept_length"]
+        for m in metas
+        if m.get("spec_accept_length") is not None
     ]
     accept_rates = [
         m["spec_accept_rate"] for m in metas if m.get("spec_accept_rate") is not None
@@ -1194,7 +1198,10 @@ def command_run_summary(args) -> None:
         }
     )
     failures = []
-    if args.min_ok_requests is not None and summary["ok_requests"] < args.min_ok_requests:
+    if (
+        args.min_ok_requests is not None
+        and summary["ok_requests"] < args.min_ok_requests
+    ):
         failures.append(
             f"ok_requests {summary['ok_requests']} is below {args.min_ok_requests}"
         )
@@ -1289,12 +1296,12 @@ def command_compare(args) -> None:
         can_compare_ids = isinstance(target_ids, list) and isinstance(spec_ids, list)
         token_exact = target_ids == spec_ids if can_compare_ids else None
         text_exact = target.get("text") == spec.get("text")
-        mismatch_at = (
-            first_mismatch(target_ids, spec_ids) if can_compare_ids else None
-        )
+        mismatch_at = first_mismatch(target_ids, spec_ids) if can_compare_ids else None
         target_prompt_hash = target.get("prompt_token_ids_sha256")
         spec_prompt_hash = spec.get("prompt_token_ids_sha256")
-        prompt_tokens_comparable = target_prompt_hash is not None and spec_prompt_hash is not None
+        prompt_tokens_comparable = (
+            target_prompt_hash is not None and spec_prompt_hash is not None
+        )
         prompt_tokens_exact = (
             target_prompt_hash == spec_prompt_hash if prompt_tokens_comparable else None
         )
@@ -1338,11 +1345,15 @@ def command_compare(args) -> None:
     prompt_tokens_comparable = [
         c for c in comparisons if c["prompt_tokens_exact"] is not None
     ]
-    prompt_token_matches = [c for c in prompt_tokens_comparable if c["prompt_tokens_exact"]]
+    prompt_token_matches = [
+        c for c in prompt_tokens_comparable if c["prompt_tokens_exact"]
+    ]
     token_exact_match_rate = (
         len(token_matches) / len(token_comparable) if token_comparable else None
     )
-    text_exact_match_rate = len(text_matches) / len(comparisons) if comparisons else None
+    text_exact_match_rate = (
+        len(text_matches) / len(comparisons) if comparisons else None
+    )
     matched_prefix_mean = (
         statistics.fmean(matched_prefixes) if matched_prefixes else None
     )
@@ -1520,9 +1531,7 @@ def command_trace_summary(args) -> None:
 
     gate_failures = []
     if args.require_records_min is not None and len(rows) < args.require_records_min:
-        gate_failures.append(
-            f"records {len(rows)} is below {args.require_records_min}"
-        )
+        gate_failures.append(f"records {len(rows)} is below {args.require_records_min}")
     if args.require_compact and compact_count == 0:
         gate_failures.append("no compact records were observed")
     if args.require_non_uniform_verify_lens and non_uniform_count == 0:
@@ -1533,10 +1542,7 @@ def command_trace_summary(args) -> None:
         gate_failures.append("no non-greedy records were observed")
     if args.require_seeded_sampling and seeded_count == 0:
         gate_failures.append("no seeded sampling records were observed")
-    if (
-        args.require_non_greedy_accept_coverage
-        and non_greedy_accept_uncovered_count
-    ):
+    if args.require_non_greedy_accept_coverage and non_greedy_accept_uncovered_count:
         gate_failures.append(
             f"{non_greedy_accept_uncovered_count} non-greedy records did not "
             "have accept-sampling reference coverage"
@@ -1585,15 +1591,15 @@ def command_trace_summary(args) -> None:
         "max_bs": max_bs,
         "min_verify_lens_sum": min(verify_lens_sums) if verify_lens_sums else None,
         "max_verify_lens_sum": max(verify_lens_sums) if verify_lens_sums else None,
-        "min_layout_graph_num_tokens": min(graph_token_counts)
-        if graph_token_counts
-        else None,
-        "max_layout_graph_num_tokens": max(graph_token_counts)
-        if graph_token_counts
-        else None,
-        "max_graph_padding_tokens": max(graph_padding_tokens)
-        if graph_padding_tokens
-        else None,
+        "min_layout_graph_num_tokens": (
+            min(graph_token_counts) if graph_token_counts else None
+        ),
+        "max_layout_graph_num_tokens": (
+            max(graph_token_counts) if graph_token_counts else None
+        ),
+        "max_graph_padding_tokens": (
+            max(graph_padding_tokens) if graph_padding_tokens else None
+        ),
         "failure_examples": failures[: args.max_failure_examples],
         "skipped_examples": skipped_examples[: args.max_failure_examples],
         "verdict": {
@@ -1702,9 +1708,7 @@ def command_info_summary(args) -> None:
             else scheduled_tokens
         )
         graph_token_key = str(graph_tokens)
-        graph_key_counts[graph_token_key] = (
-            graph_key_counts.get(graph_token_key, 0) + 1
-        )
+        graph_key_counts[graph_token_key] = graph_key_counts.get(graph_token_key, 0) + 1
         if graph_tokens > scheduled_tokens:
             padded_graph_count += 1
         if verify_width and bs:
@@ -1762,9 +1766,7 @@ def command_info_summary(args) -> None:
             "step_cpu": summarize_timing(records, "step_cpu_ms"),
             "step_gpu": summarize_timing(records, "step_gpu_ms"),
             "draft_gpu": summarize_timing(records, "draft_gpu_ms"),
-            "target_verify_gpu": summarize_timing(
-                records, "target_verify_gpu_ms"
-            ),
+            "target_verify_gpu": summarize_timing(records, "target_verify_gpu_ms"),
         },
         "verdict": {
             "passed": not failures and not gate_failures,
@@ -1787,8 +1789,12 @@ def add_prepare(subparsers) -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-samples", type=int, default=256)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--streaming", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--trust-remote-code", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--disable-thinking", action="store_true")
     parser.set_defaults(func=command_prepare)
 
@@ -1800,13 +1806,19 @@ def add_prepare_gold(subparsers) -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-samples", type=int, default=256)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--streaming", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--trust-remote-code", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--min-gold-tokens", type=int, default=8)
     parser.add_argument("--max-gold-tokens", type=int)
     parser.add_argument("--max-prompt-tokens", type=int)
-    parser.add_argument("--include-text", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--include-text", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.set_defaults(func=command_prepare_gold)
 
 
@@ -1823,14 +1835,18 @@ def add_collect(subparsers) -> None:
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--sampling-seed", type=int)
     parser.add_argument("--allow-nondeterministic-sampling", action="store_true")
-    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--ignore-eos", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--return-logprob", action="store_true")
     parser.add_argument("--return-prompt-token-ids", action="store_true")
     parser.add_argument("--start-idx", type=int)
     parser.add_argument("--end-idx", type=int)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--print-records", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--print-records", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--timeout-s", type=int, default=600)
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-sleep-s", type=float, default=5.0)
@@ -1861,14 +1877,18 @@ def add_teacher_forced_probe(subparsers) -> None:
     parser.add_argument("--max-windows-per-sample", type=int)
     parser.add_argument("--limit-windows", type=int)
     parser.add_argument("--max-gold-tokens", type=int)
-    parser.add_argument("--drop-short-windows", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--drop-short-windows", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--sampling-seed", type=int)
-    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--ignore-eos", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--start-idx", type=int)
     parser.add_argument("--end-idx", type=int)
     parser.add_argument("--limit", type=int)
@@ -1877,9 +1897,15 @@ def add_teacher_forced_probe(subparsers) -> None:
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-sleep-s", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--print-records", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--print-records", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--quiet-records", action="store_true")
-    parser.add_argument("--dspark-clear-info-records", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--dspark-clear-info-records",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--min-accept-rate", type=float)
     parser.add_argument("--min-accept-length", type=float)
     parser.add_argument("--require-no-missing-dspark-info", action="store_true")

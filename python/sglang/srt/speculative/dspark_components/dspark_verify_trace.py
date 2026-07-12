@@ -190,9 +190,7 @@ class DsparkVerifyTracer:
         else:
             greedy_mask_cpu = [bool(x) for x in _cpu_list(greedy_mask)]
         has_non_greedy_rows = not all(greedy_mask_cpu)
-        sampling_accept_assert = (
-            envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get()
-        )
+        sampling_accept_assert = envs.SGLANG_DSPARK_ACCEPT_SAMPLING_TRACE_ASSERT.get()
 
         failures = []
         skipped = []
@@ -266,11 +264,9 @@ class DsparkVerifyTracer:
                     "target_predict": [int(x) for x in target_predict_cpu[row]],
                     "is_greedy": bool(greedy_mask_cpu[row]),
                     "expected_correct_len": int(
-                        (
-                            greedy_expected_cpu
-                            if greedy_mask_cpu[row]
-                            else actual_cpu
-                        )["correct_len"][row]
+                        (greedy_expected_cpu if greedy_mask_cpu[row] else actual_cpu)[
+                            "correct_len"
+                        ][row]
                     ),
                     "actual_correct_len": int(actual_cpu["correct_len"][row]),
                     "expected_bonus": int(
@@ -304,7 +300,9 @@ class DsparkVerifyTracer:
             "mode": mode,
             "budget": None if budget is None else int(budget),
             "layout_graph_num_tokens": (
-                None if layout_graph_num_tokens is None else int(layout_graph_num_tokens)
+                None
+                if layout_graph_num_tokens is None
+                else int(layout_graph_num_tokens)
             ),
             "verify_lens": verify_lens_cpu,
             "verify_lens_sum": int(sum(int(x) for x in verify_lens_cpu)),
@@ -318,9 +316,7 @@ class DsparkVerifyTracer:
             "simulated_accept": bool(simulated_accept),
             "coverage": {
                 "greedy_accept_rows": int(sum(1 for x in greedy_mask_cpu if x)),
-                "non_greedy_accept_rows": int(
-                    sum(1 for x in greedy_mask_cpu if not x)
-                ),
+                "non_greedy_accept_rows": int(sum(1 for x in greedy_mask_cpu if not x)),
                 "non_greedy_accept": (
                     "not_applicable"
                     if not has_non_greedy_rows

@@ -728,7 +728,9 @@ class DeepseekSparseAttnBackend(
             max_seqlen_q = 1
             layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
             if layout is not None:
-                extend_seq_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+                extend_seq_lens = layout.verify_lens.to(
+                    device=device, dtype=torch.int32
+                )
                 total_verify_tokens = layout.total_verify_tokens
                 if total_verify_tokens is None:
                     total_verify_tokens = layout.graph_num_tokens
@@ -1214,9 +1216,7 @@ class DeepseekSparseAttnBackend(
                     layout=layout, bs=bs
                 )
                 total_verify_tokens = int(layout.graph_num_tokens)
-                cache_seqlens_int32 = (seq_lens[:bs] + extend_seq_lens).to(
-                    torch.int32
-                )
+                cache_seqlens_int32 = (seq_lens[:bs] + extend_seq_lens).to(torch.int32)
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_q = 1
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][
@@ -1254,9 +1254,9 @@ class DeepseekSparseAttnBackend(
                 else:
                     flashmla_metadata = None
             else:
-                cache_seqlens_int32 = (
-                    seq_lens + self.speculative_num_draft_tokens
-                ).to(torch.int32)
+                cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
+                    torch.int32
+                )
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_q = 1
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][
@@ -1296,9 +1296,7 @@ class DeepseekSparseAttnBackend(
                 dsa_cache_seqlens_int32 = compute_dsa_seqlens(
                     seqlens_expanded, dsa_index_topk=self.dsa_index_topk
                 )
-                dsa_extend_seq_lens_list = [
-                    1
-                ] * bs * self.speculative_num_draft_tokens
+                dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
                 if self.dsa_decode_impl == "flashmla_kv":
                     flashmla_metadata = self.decode_cuda_graph_metadata[

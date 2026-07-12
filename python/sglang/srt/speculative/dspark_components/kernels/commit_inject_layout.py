@@ -164,7 +164,7 @@ def build_commit_inject_layout_from_window(
     swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
 
     col = torch.arange(stride, device=device).view(1, -1)
-    committed = (col < commit_lens.to(device=device, dtype=torch.long).view(-1, 1))
+    committed = col < commit_lens.to(device=device, dtype=torch.long).view(-1, 1)
     committed = committed.reshape(-1)
     swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
 

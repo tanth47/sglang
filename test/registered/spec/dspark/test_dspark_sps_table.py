@@ -243,9 +243,7 @@ class TestProfilerConversion(CustomTestCase):
             out_path = Path(tmp) / "sps.json"
             out_path.write_text(table.to_json(), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "non-positive SPS"):
-                dspark_sps_profiler.run_self_check(
-                    out_path=out_path, offdiag=False
-                )
+                dspark_sps_profiler.run_self_check(out_path=out_path, offdiag=False)
 
 
 def _build_sps_cost_table_for(*, sps_table_path):

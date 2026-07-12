@@ -92,7 +92,7 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     FinalizeAcceptLens,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -837,9 +837,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._should_run_compact_target_verify(
-            batch=batch, layout=layout
-        )
+        run_compact = self._should_run_compact_target_verify(batch=batch, layout=layout)
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1

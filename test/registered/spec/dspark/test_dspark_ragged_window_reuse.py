@@ -185,10 +185,16 @@ class TestDSparkRaggedWindowReuse(CustomTestCase):
         self.assertEqual(len(draft_model.calls), 1)
         call = draft_model.calls[0]
         torch.testing.assert_close(call["target_hidden"], hidden)
-        torch.testing.assert_close(call["positions"], verify_window.positions_2d.reshape(-1))
+        torch.testing.assert_close(
+            call["positions"], verify_window.positions_2d.reshape(-1)
+        )
         torch.testing.assert_close(call["cache_loc"], verify_window.verify_cache_loc)
-        torch.testing.assert_close(call["cache_loc_2d"], verify_window.verify_cache_loc_2d)
-        torch.testing.assert_close(call["commit_lens"], torch.tensor([1, 3], dtype=torch.int32))
+        torch.testing.assert_close(
+            call["cache_loc_2d"], verify_window.verify_cache_loc_2d
+        )
+        torch.testing.assert_close(
+            call["commit_lens"], torch.tensor([1, 3], dtype=torch.int32)
+        )
 
 
 if __name__ == "__main__":

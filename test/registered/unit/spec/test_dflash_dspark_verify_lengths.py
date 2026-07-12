@@ -246,9 +246,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             shard = torch.load(shards[0])
 
         self.assertTrue(
-            torch.equal(
-                shard["logits"], worker._verify_planner.last_confidence_raw
-            )
+            torch.equal(shard["logits"], worker._verify_planner.last_confidence_raw)
         )
         self.assertTrue(
             torch.equal(
@@ -437,9 +435,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             seen["seq_lens_sum"] = verify_batch.seq_lens_sum
             return SimpleNamespace(), False
 
-        with patch.object(
-            DFlashVerifyInput, "prepare_for_verify", new=capture_prepare
-        ):
+        with patch.object(DFlashVerifyInput, "prepare_for_verify", new=capture_prepare):
             executor.run_non_compact(
                 batch=batch,
                 draft_input=draft_input,
@@ -468,9 +464,9 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 seen["seq_lens"] = forward_batch.seq_lens.clone()
                 seen["seq_lens_cpu"] = forward_batch.seq_lens_cpu.clone()
                 seen["seq_lens_sum"] = forward_batch.seq_lens_sum
-                hidden = torch.arange(
-                    bs * draft_width * 16, dtype=torch.float32
-                ).view(bs * draft_width, 16)
+                hidden = torch.arange(bs * draft_width * 16, dtype=torch.float32).view(
+                    bs * draft_width, 16
+                )
                 return SimpleNamespace(
                     logits_output=SimpleNamespace(hidden_states=hidden),
                     can_run_graph=False,
@@ -496,9 +492,9 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             positions_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
                 bs, draft_width
             ),
-            verify_cache_loc_2d=torch.arange(
-                bs * draft_width, dtype=torch.int64
-            ).view(bs, draft_width),
+            verify_cache_loc_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
+                bs, draft_width
+            ),
         )
 
         out = proposer._run_forward(
@@ -559,9 +555,9 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
             positions_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
                 bs, draft_width
             ),
-            verify_cache_loc_2d=torch.arange(
-                bs * draft_width, dtype=torch.int64
-            ).view(bs, draft_width),
+            verify_cache_loc_2d=torch.arange(bs * draft_width, dtype=torch.int64).view(
+                bs, draft_width
+            ),
         )
 
         proposer._run_forward(

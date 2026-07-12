@@ -17,6 +17,7 @@ except ModuleNotFoundError:
     def register_cpu_ci(*args, **kwargs):
         pass
 
+
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
@@ -163,9 +164,7 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
                     "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 },
             ):
-                manifest = self.harness.build_collect_manifest(
-                    args, {"ok_requests": 1}
-                )
+                manifest = self.harness.build_collect_manifest(args, {"ok_requests": 1})
 
             self.assertEqual(
                 manifest["schema"],
@@ -188,9 +187,7 @@ class TestDSparkAccuracyHarnessInfoSummary(CustomTestCase):
             self.assertEqual(
                 manifest["environment"]["SGLANG_RAGGED_VERIFY_MODE"], "compact"
             )
-            self.assertEqual(
-                manifest["environment"]["HIP_VISIBLE_DEVICES"], "0,1,2,3"
-            )
+            self.assertEqual(manifest["environment"]["HIP_VISIBLE_DEVICES"], "0,1,2,3")
             self.assertNotIn("HF_TOKEN", manifest["environment"])
             self.assertNotIn("SGLANG_API_KEY", manifest["environment"])
 

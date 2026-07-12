@@ -241,9 +241,7 @@ def sample_draft_block(
                 ).view(bs, -1)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 if sampling_info.sampling_seed is None:
-                    sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(
-                        -1
-                    )
+                    sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 else:
                     if draft_positions is None:
                         raise RuntimeError(

@@ -80,8 +80,10 @@ def compute_verify_token_budget(
     prefix_sum = torch.cumsum(candidates_sorted, dim=0)
     forced_gain = forced.to(torch.float64).sum()
 
-    tau_star = num_requests + forced_gain + torch.cat(
-        [torch.zeros(1, dtype=torch.float64), prefix_sum]
+    tau_star = (
+        num_requests
+        + forced_gain
+        + torch.cat([torch.zeros(1, dtype=torch.float64), prefix_sum])
     )
     base_batch_tokens = int(num_requests) * int(lower_bound)
     if isinstance(sps_table, SpsAdditiveCostTable):
@@ -306,15 +308,15 @@ class HostConfidenceBudgetPlanner:
     ) -> torch.Tensor:
         k_survival = torch.cumprod(lagged_confidence.to(torch.float32), dim=1)
         current_gen = current_generation.to(torch.int64)
-        fresh = (
-            (current_gen >= 1) & (lagged_generation.to(torch.int64) == current_gen)
-        )
+        fresh = (current_gen >= 1) & (lagged_generation.to(torch.int64) == current_gen)
         if lagged_seq_lens is not None and current_seq_lens is not None:
             current_seq = current_seq_lens.to(torch.int64)
             lagged_seq = lagged_seq_lens.to(torch.int64)
             seq_delta = current_seq - lagged_seq
-            seq_fresh = (lagged_seq > 0) & (seq_delta >= 0) & (
-                seq_delta <= self.max_seq_lag_tokens
+            seq_fresh = (
+                (lagged_seq > 0)
+                & (seq_delta >= 0)
+                & (seq_delta <= self.max_seq_lag_tokens)
             )
             fresh = fresh & seq_fresh
         fresh = fresh.view(-1, 1)

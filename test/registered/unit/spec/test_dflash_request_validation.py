@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.sampling.sampling_params import SamplingParams, TOP_K_ALL
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.speculative.dflash_request_validation import (
     validate_dflash_request_options,
 )
@@ -40,9 +40,7 @@ class _FakeTimeStats:
 
 def test_seeded_greedy_sampling_is_allowed():
     assert (
-        validate_dflash_request(
-            _req(sampling_seed=1234, top_k=1), enable_overlap=False
-        )
+        validate_dflash_request(_req(sampling_seed=1234, top_k=1), enable_overlap=False)
         is None
     )
 

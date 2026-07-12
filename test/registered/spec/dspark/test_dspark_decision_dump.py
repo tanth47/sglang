@@ -81,9 +81,7 @@ class TestDsparkDecisionDumper(CustomTestCase):
 
     def test_enabled_dumps_global_and_per_request_decision(self):
         confidence = torch.tensor([[0.9, 0.8, 0.5], [1.0, 0.0, 0.0]])
-        records = _dump_records(
-            enabled=True, confidence=confidence, verify_lens=[2, 4]
-        )
+        records = _dump_records(enabled=True, confidence=confidence, verify_lens=[2, 4])
         self.assertEqual(len(records), 1)
         record = records[0]
         self.assertEqual(record["forward_ct"], 42)
@@ -109,9 +107,9 @@ class TestDsparkDecisionDumper(CustomTestCase):
 
     def test_survival_is_prefix_product_of_confidence(self):
         confidence = torch.tensor([[0.9, 0.8, 0.5], [1.0, 0.5, 0.5]])
-        record = _dump_records(
-            enabled=True, confidence=confidence, verify_lens=[2, 4]
-        )[0]
+        record = _dump_records(enabled=True, confidence=confidence, verify_lens=[2, 4])[
+            0
+        ]
         for row, conf_row in enumerate(confidence.tolist()):
             survival = record["reqs"][row]["survival"]
             expected = []

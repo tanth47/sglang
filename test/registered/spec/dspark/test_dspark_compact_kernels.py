@@ -3,23 +3,23 @@ import types
 import pytest
 import torch
 
+from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.dspark_scheduler import (
     DSparkScheduleConfig,
 )
-from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.accept_greedy import (
     accept_greedy,
     accept_greedy_triton,
+)
+from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
+    build_out_tokens,
+    build_out_tokens_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.build_ragged_verify_window import (
     build_ragged_verify_window,
     build_ragged_verify_window_from_strided_torch,
     build_ragged_verify_window_from_strided_triton,
     build_ragged_verify_window_triton,
-)
-from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
-    build_out_tokens,
-    build_out_tokens_triton,
 )
 from sglang.srt.speculative.dspark_components.kernels.cap_correct_len import (
     cap_correct_len,
@@ -92,7 +92,9 @@ def _ragged_window_fixtures(bs, graph_num_tokens, device):
 @pytest.mark.parametrize("pad", ["tight", "bucket"])
 def test_build_ragged_verify_window_triton_matches_torch(bs, pad):
     device = torch.device("cuda")
-    graph_num_tokens = bs * VERIFY_TOKENS if pad == "tight" else (bs + 3) * VERIFY_TOKENS
+    graph_num_tokens = (
+        bs * VERIFY_TOKENS if pad == "tight" else (bs + 3) * VERIFY_TOKENS
+    )
     layout, batch, model_runner, draft_block_ids, draft_tokens = (
         _ragged_window_fixtures(bs, graph_num_tokens, device)
     )

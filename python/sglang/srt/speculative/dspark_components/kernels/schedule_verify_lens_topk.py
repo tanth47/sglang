@@ -199,9 +199,7 @@ def _schedule_topk_selected_extra_kernel(
         cpmask = cp < n
         rp = cp // select_cols
         pp = cp % select_cols + start_col
-        spp = tl.load(
-            survival_ptr + rp * survival_stride + pp, mask=cpmask, other=0.0
-        )
+        spp = tl.load(survival_ptr + rp * survival_stride + pp, mask=cpmask, other=0.0)
         validp = spp >= survival_eps
         mpp = tl.where(validp, spp, float("-inf"))
         gt = mpp[None, :] > mp[:, None]

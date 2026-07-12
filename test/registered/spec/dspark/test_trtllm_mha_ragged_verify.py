@@ -13,11 +13,11 @@ from sglang.srt.layers.attention.trtllm_mha_backend import (
     _resolve_ragged_verify_layout,
     build_ragged_target_verify_geometry,
 )
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.kernels import (
     padded_to_bucket as _padded_to_bucket_mod,
 )
 from sglang.srt.speculative.dspark_components.kernels import qo_indptr as _qo_indptr_mod
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,6 +36,7 @@ def setUpModule():
 def tearDownModule():
     _qo_indptr_mod._KERNEL_IMPL = _OLD_QO_INDPTR_KERNEL_IMPL
     _padded_to_bucket_mod._KERNEL_IMPL = _OLD_PADDED_TO_BUCKET_KERNEL_IMPL
+
 
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]

@@ -6,6 +6,7 @@ import msgspec
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.accept_greedy import (
     accept_greedy_triton,
 )
@@ -15,7 +16,6 @@ from sglang.srt.speculative.dspark_components.kernels.build_out_tokens import (
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
     BuildCommitInjectLayoutFromWindow,
 )
-from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens import (
     finalize_accept_lens_triton,
 )

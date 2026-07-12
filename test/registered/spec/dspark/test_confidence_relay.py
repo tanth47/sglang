@@ -28,9 +28,7 @@ class TestConfidenceRelayStats(CustomTestCase):
             pool=pool,
         )
 
-        self.assertIsNone(
-            relay.resolve(self._batch(), stream=None, publish_ready=None)
-        )
+        self.assertIsNone(relay.resolve(self._batch(), stream=None, publish_ready=None))
         stats = relay.snapshot_stats()
         self.assertEqual(stats.attempts, 1)
         self.assertEqual(stats.hits, 0)

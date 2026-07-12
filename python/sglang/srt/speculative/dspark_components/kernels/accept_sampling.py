@@ -263,8 +263,7 @@ def _assert_accept_sampling_reference(
             )
     if failures:
         raise AssertionError(
-            "DSpark non-greedy accept sampling invariant failed: "
-            + "; ".join(failures)
+            "DSpark non-greedy accept sampling invariant failed: " + "; ".join(failures)
         )
 
 
