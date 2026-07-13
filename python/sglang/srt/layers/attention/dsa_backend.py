@@ -57,6 +57,7 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -715,14 +716,36 @@ class DeepseekSparseAttnBackend(
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
+        ragged_verify_layout = None
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
+            ragged_verify_layout = resolve_ragged_verify_layout(forward_batch)
         else:
             draft_token_num = 0
 
-        cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        if ragged_verify_layout is not None:
+            cache_seqlens_int32 = (
+                forward_batch.seq_lens + ragged_verify_layout.verify_lens
+            ).to(torch.int32)
+        else:
+            cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(
+                torch.int32
+            )
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        if forward_batch.seq_lens_cpu is not None:
+        if (
+            ragged_verify_layout is not None
+            and forward_batch.seq_lens_cpu is not None
+            and ragged_verify_layout.verify_lens_cpu is not None
+        ):
+            max_seqlen_k = max(
+                int(seq_len) + int(verify_len)
+                for seq_len, verify_len in zip(
+                    forward_batch.seq_lens_cpu.tolist(),
+                    ragged_verify_layout.verify_lens_cpu,
+                    strict=True,
+                )
+            )
+        elif forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(
                 forward_batch.seq_lens_cpu.max().item() + draft_token_num
             )
@@ -730,7 +753,7 @@ class DeepseekSparseAttnBackend(
             # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
             # batches; graph replay uses the static page-table width, so only this
             # eager (e.g. over-capture-bs) fallback needs a length here.
-            max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
+            max_seqlen_k = int(cache_seqlens_int32.max().item())
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -762,33 +785,65 @@ class DeepseekSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+        dsa_extend_seq_lens_list = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
+            dsa_extend_seq_lens_list = extend_seq_lens_cpu
             max_seqlen_q = 1
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            max_seqlen_q = 1
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                1,
-                dtype=torch.int32,
-                device=device,
-            )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            if ragged_verify_layout is not None:
+                max_seqlen_q = 1
+                total_verify_tokens = int(
+                    ragged_verify_layout.total_verify_tokens
+                    if ragged_verify_layout.total_verify_tokens is not None
+                    else ragged_verify_layout.verify_lens.sum().item()
+                )
+                cu_seqlens_q = self.get_device_int32_arange(total_verify_tokens + 1)
+                if ragged_verify_layout.verify_lens_cpu is not None:
+                    extend_seq_lens_cpu = list(ragged_verify_layout.verify_lens_cpu)
+                else:
+                    extend_seq_lens_cpu = (
+                        ragged_verify_layout.verify_lens.cpu().tolist()
+                    )
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
-            seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
-                cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens,
-            )
-            page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
-            )
+                seqlens_expanded = seqlens_expand_triton(
+                    ragged_verify_layout.verify_lens,
+                    cache_seqlens_int32,
+                    total_verify_tokens,
+                    self.speculative_num_draft_tokens,
+                )
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=ragged_verify_layout.verify_lens, dim=0
+                )
+                dsa_extend_seq_lens_list = [1] * total_verify_tokens
+            else:
+                max_seqlen_q = 1
+                cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+
+                seqlens_expanded = seqlens_expand_triton(
+                    torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                    cache_seqlens_int32,
+                    self.speculative_num_draft_tokens * batch_size,
+                    self.speculative_num_draft_tokens,
+                )
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+                dsa_extend_seq_lens_list = [
+                    1
+                ] * batch_size * self.speculative_num_draft_tokens
         elif forward_batch.forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
@@ -836,6 +891,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
+            dsa_extend_seq_lens_list = [1] * sum(extend_seq_lens_cpu)
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -845,6 +901,7 @@ class DeepseekSparseAttnBackend(
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens
+            dsa_extend_seq_lens_list = extend_seq_lens_cpu
 
             seqlens_expanded = torch.cat(
                 [
@@ -991,7 +1048,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
-            dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,

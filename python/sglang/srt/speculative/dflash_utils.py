@@ -32,6 +32,71 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
+def _per_row_parameter(
+    value: Any,
+    *,
+    rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if torch.is_tensor(value):
+        tensor = value.to(device=device, dtype=dtype).reshape(-1)
+        if tensor.numel() == 1:
+            return tensor.expand(rows)
+        return tensor
+    return torch.full((rows,), value, device=device, dtype=dtype)
+
+
+def _torch_top_k_renorm_prob(
+    probs: torch.Tensor,
+    top_k: Any,
+) -> torch.Tensor:
+    rows, vocab_size = probs.shape
+    top_ks = _per_row_parameter(
+        top_k, rows=rows, device=probs.device, dtype=torch.int64
+    ).clamp_(min=1, max=vocab_size)
+
+    if bool(torch.all(top_ks == top_ks[0])):
+        k = int(top_ks[0].item())
+        _, topk_indices = torch.topk(probs, k=k, dim=-1)
+        mask = torch.zeros_like(probs, dtype=torch.bool)
+        mask.scatter_(1, topk_indices, True)
+        masked_probs = probs.masked_fill(~mask, 0)
+        return masked_probs / masked_probs.sum(dim=-1, keepdim=True).clamp_min(
+            1e-10
+        )
+
+    renorm_probs = torch.zeros_like(probs)
+    for i in range(rows):
+        k = int(top_ks[i].item())
+        _, topk_indices = torch.topk(probs[i], k=k, dim=-1)
+        row = torch.zeros_like(probs[i])
+        row[topk_indices] = probs[i, topk_indices]
+        renorm_probs[i] = row / row.sum().clamp_min(1e-10)
+    return renorm_probs
+
+
+def _torch_top_p_renorm_prob(
+    probs: torch.Tensor,
+    top_p: Any,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    rows, vocab_size = probs.shape
+    top_ps = _per_row_parameter(
+        top_p, rows=rows, device=probs.device, dtype=probs.dtype
+    ).clamp_(min=0.0, max=1.0)
+
+    sorted_probs, sorted_indices = torch.sort(probs, descending=False, dim=-1)
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    keep_sorted = cdf >= (1 - top_ps[:, None]) - eps
+    keep_sorted[:, -1] = True
+
+    mask = torch.zeros((rows, vocab_size), device=probs.device, dtype=torch.bool)
+    mask.scatter_(1, sorted_indices, keep_sorted)
+    masked_probs = probs.masked_fill(~mask, 0)
+    return masked_probs / masked_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+
 if is_cuda() or is_musa():
     try:
         from sgl_kernel import (
@@ -49,6 +114,11 @@ else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
+
+if top_k_renorm_prob is None:
+    top_k_renorm_prob = _torch_top_k_renorm_prob
+if top_p_renorm_prob is None:
+    top_p_renorm_prob = _torch_top_p_renorm_prob
 
 
 def is_dflash_sampling_verify_available() -> bool:
