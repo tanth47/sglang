@@ -62,9 +62,7 @@ def _torch_top_k_renorm_prob(
         mask = torch.zeros_like(probs, dtype=torch.bool)
         mask.scatter_(1, topk_indices, True)
         masked_probs = probs.masked_fill(~mask, 0)
-        return masked_probs / masked_probs.sum(dim=-1, keepdim=True).clamp_min(
-            1e-10
-        )
+        return masked_probs / masked_probs.sum(dim=-1, keepdim=True).clamp_min(1e-10)
 
     renorm_probs = torch.zeros_like(probs)
     for i in range(rows):

@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def test_dflash_verify_target_probs_uses_torch_renorm_fallback():

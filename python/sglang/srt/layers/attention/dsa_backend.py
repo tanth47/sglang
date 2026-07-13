@@ -841,9 +841,9 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
-                dsa_extend_seq_lens_list = [
-                    1
-                ] * batch_size * self.speculative_num_draft_tokens
+                dsa_extend_seq_lens_list = (
+                    [1] * batch_size * self.speculative_num_draft_tokens
+                )
         elif forward_batch.forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
