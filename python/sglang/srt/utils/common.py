@@ -130,6 +130,11 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+@lru_cache(maxsize=1)
+def has_visible_hip_device() -> bool:
+    return is_hip() and torch.cuda.is_available()
+
+
 if is_hip():
     HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX

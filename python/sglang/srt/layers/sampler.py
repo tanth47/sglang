@@ -18,6 +18,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
+    has_visible_hip_device,
     is_cuda,
     is_hip,
     is_musa,
@@ -42,7 +43,7 @@ if is_musa():
         top_p_renorm_prob,
     )
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 

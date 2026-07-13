@@ -24,13 +24,21 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    has_visible_hip_device,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+)
 
 _is_cuda = is_cuda()
-if _is_cuda:
+_is_hip = is_hip()
+_has_visible_hip_device = has_visible_hip_device()
+CUDA_CAPABILITY = (0, 0)
+
+if _is_cuda or _has_visible_hip_device:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-_is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 
 

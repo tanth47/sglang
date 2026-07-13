@@ -23,6 +23,7 @@ from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    has_visible_hip_device,
     is_cuda,
     is_hip,
     is_musa,
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 _is_musa = is_musa()
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.

@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
+    has_visible_hip_device,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -80,7 +81,7 @@ from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,

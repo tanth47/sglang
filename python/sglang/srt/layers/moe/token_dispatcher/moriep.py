@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
+    has_visible_hip_device,
     is_hip,
 )
 
@@ -46,7 +47,7 @@ FP8_BLOCK_SIZE = 128
 MXFP4_BLOCK_SIZE = 32
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 if _use_aiter:
     from aiter import QuantType, get_hip_quant

@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    has_visible_hip_device,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -77,13 +78,13 @@ if _is_cuda:
 else:
     pick_dsl_expand = None
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
-_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
+_use_aiter_preshuffle = _use_aiter and aiter_can_use_preshuffle_paged_mqa()
 if _use_aiter and not _use_aiter_preshuffle:
     logger.warning(
         "ROCm DSA indexer: aiter preshuffle paged-MQA path is unavailable "

@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    has_visible_hip_device,
     is_cpu,
     is_cuda,
     is_hip,
@@ -46,7 +47,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()

@@ -22,12 +22,14 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import has_visible_hip_device, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_has_visible_hip_device = has_visible_hip_device()
+CUDA_CAPABILITY = (0, 0)
 
-if _is_cuda or _is_hip:
+if _is_cuda or _has_visible_hip_device:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
@@ -177,7 +179,7 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+    if (_is_cuda or _has_visible_hip_device) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64

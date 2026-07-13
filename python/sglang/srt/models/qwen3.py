@@ -34,7 +34,14 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    has_visible_hip_device,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 Qwen3Config = None
 
@@ -42,7 +49,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
