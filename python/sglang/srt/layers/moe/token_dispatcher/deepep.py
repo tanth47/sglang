@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
+    has_visible_hip_device,
     is_blackwell,
     is_flashinfer_available,
     is_hip,
@@ -63,7 +64,7 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 logger = logging.getLogger(__name__)
 

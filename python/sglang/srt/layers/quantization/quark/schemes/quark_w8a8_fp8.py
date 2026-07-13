@@ -18,13 +18,18 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    has_visible_hip_device,
+    is_hip,
+    set_weight_attrs,
+)
 
 __all__ = ["QuarkW8A8Fp8"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 

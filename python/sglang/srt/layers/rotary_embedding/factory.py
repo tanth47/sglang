@@ -26,7 +26,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, has_visible_hip_device, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def _get_rope_param(rope_scaling, key, default, scaling_type):
 
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope

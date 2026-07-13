@@ -84,6 +84,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    has_visible_hip_device,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -118,8 +119,9 @@ _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
-_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+_has_visible_hip_device = has_visible_hip_device()
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _has_visible_hip_device
+_use_aiter = envs.SGLANG_USE_AITER.get() and _has_visible_hip_device
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 

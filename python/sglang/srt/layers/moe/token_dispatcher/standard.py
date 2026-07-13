@@ -33,11 +33,12 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
+    has_visible_hip_device,
     is_hip,
 )
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput

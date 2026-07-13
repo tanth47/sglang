@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d
 from sglang.srt.utils import (
     get_bool_env_var,
+    has_visible_hip_device,
     is_gfx95_supported,
     is_hip,
     round_up,
@@ -34,7 +35,7 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A8MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and has_visible_hip_device()
 if _use_aiter:
     from aiter.ops.shuffle import (
         shuffle_scale,
