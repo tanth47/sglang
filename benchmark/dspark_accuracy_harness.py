@@ -150,6 +150,42 @@ def make_generate_payload(text: str, args) -> dict[str, Any]:
     }
 
 
+def post_json(base_url: str, path: str, body: dict[str, Any], timeout_s: int) -> Any:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + path,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_json(base_url: str, path: str, timeout_s: int) -> Any:
+    req = urllib.request.Request(base_url.rstrip("/") + path, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def set_internal_state(base_url: str, server_args: dict[str, Any], timeout_s: int):
+    if not server_args:
+        return None
+    response = post_json(
+        base_url,
+        "/set_internal_state",
+        {"server_args": server_args},
+        timeout_s,
+    )
+    outs = response if isinstance(response, list) else [response]
+
+    def ok(out) -> bool:
+        return bool(out.get("updated")) if isinstance(out, dict) else bool(out)
+
+    if not outs or not all(ok(out) for out in outs):
+        raise RuntimeError(f"set_internal_state rejected {server_args}: {response}")
+    return response
+
+
 def request_signature(row: dict[str, Any], args) -> dict[str, Any]:
     payload = make_generate_payload(row["text"], args)
     return {
@@ -161,15 +197,12 @@ def request_signature(row: dict[str, Any], args) -> dict[str, Any]:
 
 
 def post_generate(base_url: str, text: str, args) -> dict[str, Any]:
-    body = make_generate_payload(text, args)
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/generate",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    return post_json(
+        base_url,
+        "/generate",
+        make_generate_payload(text, args),
+        args.timeout_s,
     )
-    with urllib.request.urlopen(req, timeout=args.timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
 
 def collect_one(row: dict[str, Any], args) -> dict[str, Any]:
@@ -262,6 +295,35 @@ def command_collect(args) -> None:
             "Nonzero temperature needs --sampling-seed unless "
             "--allow-nondeterministic-sampling is set."
         )
+    if args.dspark_force_budget_frac is not None and args.dspark_clear_forced_budget:
+        raise ValueError(
+            "--dspark-force-budget-frac and --dspark-clear-forced-budget are "
+            "mutually exclusive."
+        )
+
+    server_args: dict[str, Any] = {}
+    if args.dspark_force_budget_frac is not None:
+        server_args["dspark_force_budget_frac"] = args.dspark_force_budget_frac
+    elif args.dspark_clear_forced_budget:
+        server_args["dspark_force_budget_frac"] = None
+    if args.dspark_clear_info_records:
+        server_args["dspark_clear_info_records"] = True
+    control_response = set_internal_state(
+        args.base_url, server_args, args.timeout_s
+    )
+    if control_response is not None:
+        print(
+            json.dumps(
+                {
+                    "control": "set_internal_state",
+                    "server_args": server_args,
+                    "response": control_response,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     prompts = read_jsonl(args.prompts)
     if args.start_idx is not None:
         prompts = [row for row in prompts if row["idx"] >= args.start_idx]
@@ -301,9 +363,15 @@ def command_collect(args) -> None:
             "run_label": args.run_label,
             "output": str(output_path),
             "elapsed_s": time.perf_counter() - started,
+            "control_server_args": server_args,
         }
     )
     print(json.dumps(summary, sort_keys=True))
+    if args.server_info_output:
+        server_info = get_json(args.base_url, "/server_info", args.timeout_s)
+        with open(args.server_info_output, "w", encoding="utf-8") as f:
+            json.dump(server_info, f, indent=2, sort_keys=True)
+            f.write("\n")
 
 
 def quantile(values: list[float], pct: float) -> float:
@@ -604,6 +672,29 @@ def add_collect(subparsers) -> None:
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--retry-sleep-s", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--dspark-force-budget-frac",
+        type=float,
+        help=(
+            "Before collecting, set DSpark's runtime forced verify-token budget "
+            "fraction through /set_internal_state. Useful for non-uniform "
+            "ragged/cap-accept accuracy gates."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-clear-forced-budget",
+        action="store_true",
+        help="Before collecting, clear any DSpark forced budget fraction.",
+    )
+    parser.add_argument(
+        "--dspark-clear-info-records",
+        action="store_true",
+        help="Before collecting, clear DSpark debug/info records on the server.",
+    )
+    parser.add_argument(
+        "--server-info-output",
+        help="After collecting, write /server_info JSON for DSpark debug evidence.",
+    )
     parser.set_defaults(func=command_collect)
 
 

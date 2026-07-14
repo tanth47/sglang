@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,6 +59,20 @@ def _row(
     }
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class TestDSparkAccuracyHarness(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -100,6 +115,50 @@ class TestDSparkAccuracyHarness(CustomTestCase):
         self.assertAlmostEqual(summary["aggregate_accept_rate"], 0.5)
         self.assertEqual(summary["accept_rate_buckets"]["<0.3"], 1)
         self.assertEqual(summary["accept_rate_buckets"]["0.7-0.85"], 1)
+
+    def test_set_internal_state_posts_dspark_controls(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse({"updated": True})
+
+        with patch.object(self.harness.urllib.request, "urlopen", fake_urlopen):
+            response = self.harness.set_internal_state(
+                "http://localhost:30000",
+                {
+                    "dspark_force_budget_frac": 0.25,
+                    "dspark_clear_info_records": True,
+                },
+                7,
+            )
+
+        self.assertEqual(captured["url"], "http://localhost:30000/set_internal_state")
+        self.assertEqual(captured["timeout"], 7)
+        self.assertEqual(
+            captured["body"],
+            {
+                "server_args": {
+                    "dspark_force_budget_frac": 0.25,
+                    "dspark_clear_info_records": True,
+                }
+            },
+        )
+        self.assertEqual(response, {"updated": True})
+
+    def test_set_internal_state_rejects_failed_response(self):
+        def fake_urlopen(req, timeout):
+            return _FakeResponse([{"updated": True}, {"updated": False}])
+
+        with patch.object(self.harness.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaisesRegex(RuntimeError, "set_internal_state rejected"):
+                self.harness.set_internal_state(
+                    "http://localhost:30000",
+                    {"dspark_force_budget_frac": 0.25},
+                    7,
+                )
 
     def test_compare_reports_token_mismatch_and_threshold_failure(self):
         target_rows = [
