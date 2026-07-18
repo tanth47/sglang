@@ -99,6 +99,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     lag_steps: Optional[int] = None
     num_running_reqs: int = -1
     num_verify_tokens: int = -1
+    planned_num_verify_tokens: Optional[int] = None
     verify_tokens_local: int = -1
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
@@ -120,6 +121,7 @@ class DecodeStepObservation(msgspec.Struct):
     budget: Optional[int]
     lag_steps: Optional[int]
     num_verify_tokens: int
+    planned_num_verify_tokens: Optional[int]
     verify_tokens_local: int
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
@@ -146,6 +148,7 @@ class _PendingStep(msgspec.Struct):
     budget: Optional[int]
     lag_steps: Optional[int]
     num_verify_tokens: int
+    planned_num_verify_tokens: Optional[int]
     verify_tokens_local: int
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
@@ -252,6 +255,11 @@ class DsparkInfoDumper:
             budget=None if obs.budget is None else int(obs.budget),
             lag_steps=None if obs.lag_steps is None else int(obs.lag_steps),
             num_verify_tokens=int(obs.num_verify_tokens),
+            planned_num_verify_tokens=(
+                None
+                if obs.planned_num_verify_tokens is None
+                else int(obs.planned_num_verify_tokens)
+            ),
             verify_tokens_local=int(obs.verify_tokens_local),
             verify_tokens_dp_synced=int(obs.verify_tokens_dp_synced),
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
@@ -353,6 +361,7 @@ class DsparkInfoDumper:
             record.lag_steps = pending.lag_steps
             record.num_running_reqs = pending.bs
             record.num_verify_tokens = pending.num_verify_tokens
+            record.planned_num_verify_tokens = pending.planned_num_verify_tokens
             record.verify_tokens_local = pending.verify_tokens_local
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
@@ -914,6 +923,9 @@ class DsparkStepObservers:
             predicted_theta = (
                 None if budget_decision is None else budget_decision.predicted_theta
             )
+            planned_num_verify_tokens = (
+                None if budget_decision is None else bs + int(budget_decision.budget)
+            )
             num_verify_tokens = (
                 layout.graph_num_tokens
                 if layout is not None
@@ -927,6 +939,7 @@ class DsparkStepObservers:
                     budget=observed_budget,
                     lag_steps=planner.lag_steps,
                     num_verify_tokens=num_verify_tokens,
+                    planned_num_verify_tokens=planned_num_verify_tokens,
                     verify_tokens_local=verify_tier_num_tokens,
                     verify_tokens_dp_synced=(
                         -1 if dp_tier_num_tokens is None else int(dp_tier_num_tokens)
