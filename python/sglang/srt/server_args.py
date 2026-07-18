@@ -1720,6 +1720,15 @@ class ServerArgs:
         "constant-SPS table: the budget degenerates to verify-all (zero throughput "
         "gain by itself).",
     ] = None
+    speculative_dspark_sps_target_accept_length: A[
+        float,
+        "DSPARK ragged-verify only. Optional SPS budget cap: when positive, "
+        "choose no more than the smallest verify-token budget whose confidence "
+        "estimate reaches this per-request expected accept length. This can trim "
+        "expensive full-width verification when the SPS table is too flat. Off "
+        "by default; token correctness is unchanged because unverified draft "
+        "tokens are not committed.",
+    ] = 0.0
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
         "DSPARK only. Optional path to a per-position STS (sequential temperature "

@@ -1,0 +1,97 @@
+import math
+import unittest
+
+import torch
+
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkScheduleConfig,
+    compute_verify_token_budget,
+)
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    SpsAdditiveCostTable,
+    SpsCostTable,
+)
+
+
+def _flat_sps_table() -> SpsCostTable:
+    return SpsCostTable(
+        sample_batch_tokens=[1],
+        sample_steps_per_sec=[1.0],
+        max_batch_tokens=64,
+    )
+
+
+def _survival() -> torch.Tensor:
+    return torch.tensor(
+        [
+            [0.9, 0.8, 0.7],
+            [0.9, 0.8, 0.7],
+        ],
+        dtype=torch.float32,
+    )
+
+
+class TestDSparkPlanner(unittest.TestCase):
+    def test_sps_target_accept_length_default_keeps_sps_argmax(self):
+        decision = compute_verify_token_budget(
+            history_survival_probs=_survival(),
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3),
+        )
+
+        self.assertEqual(decision.budget, 6)
+        self.assertAlmostEqual(decision.predicted_theta, 6.8)
+
+    def test_sps_target_accept_length_caps_budget(self):
+        decision = compute_verify_token_budget(
+            history_survival_probs=_survival(),
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+        )
+
+        # tau_star = num_reqs + cumulative survival. The first budget reaching
+        # 2.0 expected accepted tokens per request is 3.
+        self.assertEqual(decision.budget, 3)
+        self.assertAlmostEqual(decision.predicted_theta, 4.6)
+
+    def test_sps_target_accept_length_unreachable_keeps_sps_argmax(self):
+        decision = compute_verify_token_budget(
+            history_survival_probs=_survival(),
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=10.0),
+        )
+
+        self.assertEqual(decision.budget, 6)
+        self.assertAlmostEqual(decision.predicted_theta, 6.8)
+
+    def test_sps_target_accept_length_updates_additive_prediction(self):
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.1,
+            bs_probes=[1, 2],
+            alpha_seconds=[0.01, 0.02],
+            m_probes=[1, 8],
+            theta_seconds=[0.001, 0.008],
+        )
+
+        decision = compute_verify_token_budget(
+            history_survival_probs=_survival(),
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+        )
+
+        self.assertEqual(decision.budget, 3)
+        self.assertTrue(
+            math.isclose(
+                decision.predicted_step_seconds,
+                table.step_time(num_reqs=2, budget=3),
+                rel_tol=1e-6,
+            )
+        )
+
+    def test_sps_target_accept_length_rejects_negative_value(self):
+        with self.assertRaisesRegex(ValueError, "sps_target_accept_length"):
+            DSparkScheduleConfig(gamma=3, sps_target_accept_length=-1).validate()
+
+
+if __name__ == "__main__":
+    unittest.main()

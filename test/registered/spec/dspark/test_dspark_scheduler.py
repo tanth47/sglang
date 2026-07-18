@@ -5,11 +5,15 @@ import unittest
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
+    rocm_dsa_graph_safe_sps_verify_len_caps,
+    rocm_dsa_should_compute_confidence_for_graph_safe_sps,
+    rocm_dsa_target_verify_layout_graph_safe,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -469,6 +473,123 @@ class TestGraphTierFillBudget(CustomTestCase):
             )
             total = int(verify_lens.to(torch.int64).sum().item())
             self.assertEqual(total, min(graph_num_tokens, bs * cap))
+
+
+class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
+    def test_pre_topk_uniform_full_layout_is_graph_safe(self):
+        self.assertTrue(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[1000, 1200],
+                verify_lens_cpu=[8, 8],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=16,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_pre_topk_multi_request_nonuniform_layout_is_not_graph_safe(self):
+        self.assertFalse(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[1000, 1200],
+                verify_lens_cpu=[8, 1],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=9,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_single_request_exact_compact_pre_topk_layout_is_graph_safe(self):
+        self.assertTrue(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[1000],
+                verify_lens_cpu=[3],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=3,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_padded_compact_layout_is_not_graph_safe(self):
+        self.assertFalse(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[1000],
+                verify_lens_cpu=[3],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=8,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_post_topk_uniform_full_layout_stays_eager(self):
+        self.assertFalse(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[2112],
+                verify_lens_cpu=[8],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=8,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_graph_safe_sps_caps_single_request_before_topk(self):
+        self.assertEqual(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[2044],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+            ),
+            [3],
+        )
+        self.assertTrue(
+            rocm_dsa_should_compute_confidence_for_graph_safe_sps(
+                seq_lens_cpu=[2044],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_graph_safe_sps_does_not_schedule_multi_request_dsa(self):
+        self.assertIsNone(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[1000, 1200],
+                tier_num_reqs=2,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+            )
+        )
+        self.assertFalse(
+            rocm_dsa_should_compute_confidence_for_graph_safe_sps(
+                seq_lens_cpu=[1000, 1200],
+                tier_num_reqs=2,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_graph_safe_sps_respects_min_verify_floor(self):
+        self.assertIsNone(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[2046],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                min_verify_len=2,
+                dsa_index_topk=2048,
+            )
+        )
+
+    def test_sps_confidence_stays_enabled_for_multi_request_batches(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = object()
+
+        self.assertTrue(
+            planner.should_compute_confidence_for_scheduling(
+                prefix_lens=torch.tensor([1000, 1200], dtype=torch.int64),
+                global_num_reqs=2,
+                dp_tier_num_tokens=None,
+            )
+        )
 
 
 class _FakeRaggedRunner(types.SimpleNamespace):

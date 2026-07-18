@@ -419,6 +419,30 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "a no-op.",
             ragged_mode.value,
         )
+    if server_args.speculative_dspark_sps_target_accept_length < 0:
+        raise ValueError(
+            "--speculative-dspark-sps-target-accept-length must be >= 0, "
+            f"got {server_args.speculative_dspark_sps_target_accept_length}."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length feeds the ragged-verify "
+            "budget scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; "
+            "it will be a no-op."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+    ):
+        logger.warning(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier may increase "
+            "the verify-token budget after "
+            "--speculative-dspark-sps-target-accept-length caps it, reducing the "
+            "effect of the target accept-length policy."
+        )
     fine_min = server_args.speculative_dspark_ragged_graph_fine_grained_min_tokens
     fine_max = server_args.speculative_dspark_ragged_graph_fine_grained_max_tokens
     if fine_min is not None and int(fine_min) < 1:

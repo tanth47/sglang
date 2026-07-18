@@ -326,6 +326,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
+                and not self._verify_planner.defers_confidence_from_draft_graph
                 else None
             ),
             out=(
@@ -528,8 +529,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
+        global_num_reqs = (
+            max(batch.global_num_tokens)
+            if self._draft_is_moe
+            and self.server_args.enable_dp_attention
+            and batch.global_num_tokens is not None
+            else None
+        )
+        dp_tier_num_tokens = self._dp_verify_tier_num_tokens(batch)
+
         confidence = proposal.confidence
-        if confidence is None:
+        should_compute_confidence = (
+            self._verify_planner.should_compute_confidence_for_scheduling(
+                prefix_lens=prefix_lens,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=dp_tier_num_tokens,
+            )
+        )
+        if confidence is None and should_compute_confidence:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
@@ -544,13 +561,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        global_num_reqs = (
-            max(batch.global_num_tokens)
-            if self._draft_is_moe
-            and self.server_args.enable_dp_attention
-            and batch.global_num_tokens is not None
-            else None
-        )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -558,7 +568,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence=confidence,
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            dp_tier_num_tokens=dp_tier_num_tokens,
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
@@ -650,7 +660,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            dp_tier_num_tokens=dp_tier_num_tokens,
             target_verify_cuda_graph=can_run_cuda_graph,
         )
 
