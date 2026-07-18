@@ -129,6 +129,7 @@ class DSparkVerifyPlanner:
             sps_min_schedule_batch_size=(
                 server_args.speculative_dspark_sps_min_schedule_batch_size
             ),
+            sps_dry_run=server_args.speculative_dspark_sps_dry_run,
         )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
@@ -1085,6 +1086,7 @@ class DSparkScheduleConfig(msgspec.Struct):
     survival_eps: float = 1e-6
     sps_target_accept_length: float = 0.0
     sps_min_schedule_batch_size: int = 1
+    sps_dry_run: bool = False
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -1116,6 +1118,7 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    dry_run: bool = False
 
 
 def compute_verify_token_budget(
@@ -1261,6 +1264,15 @@ class HostConfidenceBudgetPlanner:
             sps_table=self.sps_table,
             cfg=self.cfg,
         )
+        if self.cfg.sps_dry_run:
+            self.last_decision = VerifyBudgetDecision(
+                budget=decision.budget,
+                predicted_step_seconds=decision.predicted_step_seconds,
+                predicted_theta=decision.predicted_theta,
+                dry_run=True,
+            )
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            return full_budget
         self.last_decision = decision
         return decision.budget
 

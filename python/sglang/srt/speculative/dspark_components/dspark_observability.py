@@ -103,6 +103,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
     target_verify_cuda_graph: Optional[bool] = None
+    budget_dry_run: bool = False
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
     step_cpu_ms: Optional[float] = None
@@ -123,6 +124,7 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
     verify_lens: Optional[torch.Tensor]
@@ -148,6 +150,7 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
     step_cpu_ms: Optional[float]
@@ -253,6 +256,7 @@ class DsparkInfoDumper:
             verify_tokens_dp_synced=int(obs.verify_tokens_dp_synced),
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
             target_verify_cuda_graph=bool(obs.target_verify_cuda_graph),
+            budget_dry_run=bool(obs.budget_dry_run),
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
             step_cpu_ms=step_cpu_ms,
@@ -353,6 +357,7 @@ class DsparkInfoDumper:
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.target_verify_cuda_graph = pending.target_verify_cuda_graph
+            record.budget_dry_run = pending.budget_dry_run
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
         if InfoComponent.STEP_CPU_TIME in self._components:
@@ -380,7 +385,7 @@ class DsparkInfoDumper:
         self, *, pending: _PendingStep, step_gpu_ms: Optional[float]
     ) -> None:
         predicted = pending.predicted_step_ms
-        if predicted is None or step_gpu_ms is None:
+        if pending.budget_dry_run or predicted is None or step_gpu_ms is None:
             return
         matched = (
             pending.budget is not None
@@ -892,6 +897,14 @@ class DsparkStepObservers:
             )
         if self._info_dumper.enabled:
             budget_decision = planner.take_budget_decision()
+            budget_dry_run = (
+                False if budget_decision is None else budget_decision.dry_run
+            )
+            observed_budget = (
+                budget_decision.budget
+                if budget_dry_run and budget_decision is not None
+                else verify_token_budget
+            )
             predicted_step_ms = (
                 None
                 if budget_decision is None
@@ -911,7 +924,7 @@ class DsparkStepObservers:
                     forward_ct=forward_ct,
                     bs=bs,
                     mode=planner.mode_value,
-                    budget=verify_token_budget,
+                    budget=observed_budget,
                     lag_steps=planner.lag_steps,
                     num_verify_tokens=num_verify_tokens,
                     verify_tokens_local=verify_tier_num_tokens,
@@ -920,6 +933,7 @@ class DsparkStepObservers:
                     ),
                     verify_tokens_graph_key=num_verify_tokens,
                     target_verify_cuda_graph=target_verify_cuda_graph,
+                    budget_dry_run=budget_dry_run,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
                     verify_lens=layout.verify_lens if layout is not None else None,

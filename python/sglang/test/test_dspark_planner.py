@@ -215,6 +215,30 @@ class TestDSparkPlanner(unittest.TestCase):
 
         self.assertEqual(budget, 6)
 
+    def test_sps_dry_run_records_planned_budget_but_uses_full_verify(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(
+                gamma=3, sps_target_accept_length=2.0, sps_dry_run=True
+            ),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(accept_lens=torch.tensor([3, 3], dtype=torch.int32))
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+        decision = planner.take_last_decision()
+
+        self.assertEqual(budget, 6)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.budget, 3)
+        self.assertTrue(decision.dry_run)
+
 
 if __name__ == "__main__":
     unittest.main()
