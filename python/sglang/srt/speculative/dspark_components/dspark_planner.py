@@ -36,8 +36,10 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
     compute_sort_survival,
 )
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     RaggedVerifyLayout,
     RaggedVerifyMode,
+    classify_dsa_target_verify_graph_regime,
     read_ragged_verify_mode,
     round_up_grid,
 )
@@ -45,7 +47,7 @@ from sglang.srt.utils.async_probe import (
     maybe_assert_async,
     maybe_detect_in_closed_range,
 )
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import is_hip, require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +121,16 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma,
+            sps_target_accept_length=(
+                server_args.speculative_dspark_sps_target_accept_length
+            ),
+            sps_min_schedule_batch_size=(
+                server_args.speculative_dspark_sps_min_schedule_batch_size
+            ),
+            sps_dry_run=server_args.speculative_dspark_sps_dry_run,
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
@@ -222,6 +233,20 @@ class DSparkVerifyPlanner:
         return self._budget_planner is not None
 
     @property
+    def defers_confidence_from_draft_graph(self) -> bool:
+        if (
+            not self._align_verify_tokens_to_graph_tier
+            or self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            or not is_hip()
+        ):
+            return False
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        return bool(
+            getattr(attn_backend, "use_dsa", False)
+            and getattr(attn_backend, "dsa_index_topk", None) is not None
+        )
+
+    @property
     def is_compact_mode(self) -> bool:
         return self._ragged_verify_mode is RaggedVerifyMode.COMPACT
 
@@ -243,6 +268,15 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def observe_accept_lens(
+        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    ) -> None:
+        if self._budget_planner is None:
+            return
+        self._budget_planner.observe_accept_lens(
+            accept_lens=accept_lens, cap_trim_lens=cap_trim_lens
+        )
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -383,6 +417,19 @@ class DSparkVerifyPlanner:
             return None
         return self.prepare_verify_budget
 
+    def should_compute_confidence_for_scheduling(
+        self,
+        *,
+        prefix_lens: torch.Tensor,
+        global_num_reqs: Optional[int] = None,
+        dp_tier_num_tokens: Optional[int] = None,
+    ) -> bool:
+        del prefix_lens, global_num_reqs, dp_tier_num_tokens
+        # Confidence drives the logical SPS budget. ROCm DSA graph admission is a
+        # later execution choice; disabling confidence here silently degenerates
+        # multi-request compact mode to verify-all.
+        return self.schedules_verify_budget
+
     def _budget_from_resolved(
         self,
         *,
@@ -417,17 +464,25 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        budget_for_layout = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=budget_for_layout,
+        )
+        verify_lens, budget_for_layout = self._adjust_rocm_dsa_graph_safe_sps_layout(
+            prefix_lens=prefix_lens,
+            verify_lens=verify_lens,
+            budget=budget_for_layout,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -452,10 +507,10 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier and budget is not None:
+        elif self._dynamic_graph_tier and budget_for_layout is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
-                verify_token_budget=budget,
+                verify_token_budget=budget_for_layout,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 min_verify_len=self._schedule_cfg.min_verify_len,
             )
@@ -493,6 +548,69 @@ class DSparkVerifyPlanner:
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
         )
+
+    def _uses_rocm_dsa_graph_safe_sps_policy(
+        self, *, dp_tier_num_tokens: Optional[int]
+    ) -> bool:
+        if (
+            not self._align_verify_tokens_to_graph_tier
+            or self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            or dp_tier_num_tokens is not None
+            or not is_hip()
+        ):
+            return False
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        return bool(
+            getattr(attn_backend, "use_dsa", False)
+            and getattr(attn_backend, "dsa_index_topk", None) is not None
+            and ragged_capture_num_tokens(model_runner=self.model_runner) is not None
+        )
+
+    def _adjust_rocm_dsa_graph_safe_sps_layout(
+        self,
+        *,
+        prefix_lens: torch.Tensor,
+        verify_lens: Optional[torch.Tensor],
+        budget: Optional[int],
+        global_num_reqs: Optional[int],
+        dp_tier_num_tokens: Optional[int],
+    ) -> tuple[Optional[torch.Tensor], Optional[int]]:
+        if (
+            verify_lens is None
+            or budget is None
+            or not self._uses_rocm_dsa_graph_safe_sps_policy(
+                dp_tier_num_tokens=dp_tier_num_tokens
+            )
+        ):
+            return verify_lens, budget
+        tier_num_reqs = (
+            int(verify_lens.shape[0])
+            if global_num_reqs is None
+            else int(global_num_reqs)
+        )
+        if tier_num_reqs != 1:
+            return verify_lens, budget
+        seq_lens_cpu = [int(x) for x in prefix_lens.detach().cpu().tolist()]
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        dsa_index_topk = int(getattr(attn_backend, "dsa_index_topk"))
+        caps = rocm_dsa_graph_safe_sps_verify_len_caps(
+            seq_lens_cpu=seq_lens_cpu,
+            tier_num_reqs=tier_num_reqs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+            dsa_index_topk=dsa_index_topk,
+        )
+        if caps is None:
+            return verify_lens, budget
+
+        cap_tensor = torch.tensor(caps, dtype=torch.int32, device=verify_lens.device)
+        adjusted = torch.minimum(verify_lens, cap_tensor)
+        if torch.equal(adjusted, verify_lens):
+            return verify_lens, budget
+
+        floor = max(self._schedule_cfg.min_verify_len, 1)
+        adjusted_budget = max(0, int(adjusted.to(torch.int64).sum().item()) - floor)
+        return adjusted, adjusted_budget
 
     def _budget_aligned_to_graph_tier(
         self,
@@ -650,6 +768,70 @@ def graph_tier_fill_budget(
     fill_total = min(graph_num_tokens, bs * verify_num_draft_tokens)
     floor_tokens = bs * max(min_verify_len, 1)
     return max(0, fill_total - floor_tokens)
+
+
+def rocm_dsa_target_verify_layout_graph_safe(
+    *,
+    seq_lens_cpu: list[int],
+    verify_lens_cpu: list[int],
+    verify_num_draft_tokens: int,
+    graph_num_tokens: int,
+    dsa_index_topk: int,
+) -> bool:
+    total_verify_tokens = sum(int(v) for v in verify_lens_cpu)
+    if total_verify_tokens != int(graph_num_tokens):
+        return False
+
+    active_verify_lens = [int(v) for v in verify_lens_cpu if int(v) > 0]
+    if any(int(v) != int(verify_num_draft_tokens) for v in verify_lens_cpu):
+        if len(active_verify_lens) != 1:
+            return False
+        if active_verify_lens[0] != total_verify_tokens:
+            return False
+
+    regime = classify_dsa_target_verify_graph_regime(
+        seq_lens_cpu=seq_lens_cpu,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+    )
+    return regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+
+
+def rocm_dsa_graph_safe_sps_verify_len_caps(
+    *,
+    seq_lens_cpu: list[int],
+    tier_num_reqs: int,
+    verify_num_draft_tokens: int,
+    min_verify_len: int = 1,
+    dsa_index_topk: int,
+) -> Optional[list[int]]:
+    if int(tier_num_reqs) != 1 or len(seq_lens_cpu) != 1:
+        return None
+    max_pre_topk_len = int(dsa_index_topk) - int(seq_lens_cpu[0]) - 1
+    floor = max(int(min_verify_len), 1)
+    if max_pre_topk_len < floor:
+        return None
+    return [min(int(verify_num_draft_tokens), max_pre_topk_len)]
+
+
+def rocm_dsa_should_compute_confidence_for_graph_safe_sps(
+    *,
+    seq_lens_cpu: list[int],
+    tier_num_reqs: int,
+    verify_num_draft_tokens: int,
+    min_verify_len: int = 1,
+    dsa_index_topk: int,
+) -> bool:
+    return (
+        rocm_dsa_graph_safe_sps_verify_len_caps(
+            seq_lens_cpu=seq_lens_cpu,
+            tier_num_reqs=tier_num_reqs,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            min_verify_len=min_verify_len,
+            dsa_index_topk=dsa_index_topk,
+        )
+        is not None
+    )
 
 
 def dp_global_verify_tier_num_tokens(
@@ -900,6 +1082,9 @@ class DSparkScheduleConfig(msgspec.Struct):
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    sps_target_accept_length: float = 0.0
+    sps_min_schedule_batch_size: int = 1
+    sps_dry_run: bool = False
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -915,12 +1100,23 @@ class DSparkScheduleConfig(msgspec.Struct):
             )
         if self.survival_eps < 0:
             raise ValueError(f"survival_eps must be >= 0, got {self.survival_eps}.")
+        if self.sps_target_accept_length < 0:
+            raise ValueError(
+                "sps_target_accept_length must be >= 0, "
+                f"got {self.sps_target_accept_length}."
+            )
+        if self.sps_min_schedule_batch_size < 1:
+            raise ValueError(
+                "sps_min_schedule_batch_size must be >= 1, "
+                f"got {self.sps_min_schedule_batch_size}."
+            )
 
 
 class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    dry_run: bool = False
 
 
 def compute_verify_token_budget(
@@ -956,6 +1152,16 @@ def compute_verify_token_budget(
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
+    if cfg.sps_target_accept_length > 0:
+        target_total = float(cfg.sps_target_accept_length) * float(num_requests)
+        target_matches = torch.nonzero(tau_star >= target_total, as_tuple=False)
+        if target_matches.numel() > 0:
+            idx = min(idx, int(target_matches[0].item()))
+            if isinstance(sps_table, SpsAdditiveCostTable):
+                predicted_step_seconds = float(step_time[idx])
+            else:
+                sps_at_idx = float(sps[idx])
+                predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
         budget=idx,
         predicted_step_seconds=predicted_step_seconds,
@@ -1015,6 +1221,8 @@ class HostConfidenceBudgetPlanner:
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
         self._carry_pos = 0
+        self._accept_len_ewma: Optional[float] = None
+        self._accept_guard_cooldown = 0
 
     def compute_budget(
         self,
@@ -1034,17 +1242,35 @@ class HostConfidenceBudgetPlanner:
             lagged_generation=lagged_generation,
             current_generation=current_generation,
         )
+        num_requests = survival.shape[0]
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
+        if int(num_requests) < int(self.cfg.sps_min_schedule_batch_size):
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
+        if self._should_protect_target_accept_length():
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
         )
+        if self.cfg.sps_dry_run:
+            self.last_decision = VerifyBudgetDecision(
+                budget=decision.budget,
+                predicted_step_seconds=decision.predicted_step_seconds,
+                predicted_theta=decision.predicted_theta,
+                dry_run=True,
+            )
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            return full_budget
         self.last_decision = decision
         return decision.budget
 
@@ -1055,6 +1281,34 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
+
+    def observe_accept_lens(
+        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    ) -> None:
+        if self.cfg.sps_target_accept_length <= 0 or accept_lens.numel() == 0:
+            return
+        if cap_trim_lens is not None and cap_trim_lens.numel() > 0:
+            cap_trimmed = bool(torch.any(cap_trim_lens.to(torch.int32) > 0).item())
+            if cap_trimmed:
+                self._accept_guard_cooldown = max(
+                    self._accept_guard_cooldown, self.lag_steps + 1
+                )
+        observed = float(accept_lens.to(torch.float32).mean().item())
+        if self._accept_len_ewma is None:
+            self._accept_len_ewma = observed
+        else:
+            self._accept_len_ewma = 0.9 * self._accept_len_ewma + 0.1 * observed
+
+    def _should_protect_target_accept_length(self) -> bool:
+        target = float(self.cfg.sps_target_accept_length)
+        if target <= 0:
+            return False
+        if self._accept_guard_cooldown > 0:
+            self._accept_guard_cooldown -= 1
+            return True
+        if self._accept_len_ewma is None:
+            return True
+        return self._accept_len_ewma < target
 
     def _shift_to_lag(
         self,

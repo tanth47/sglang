@@ -419,6 +419,54 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "a no-op.",
             ragged_mode.value,
         )
+    if server_args.speculative_dspark_sps_target_accept_length < 0:
+        raise ValueError(
+            "--speculative-dspark-sps-target-accept-length must be >= 0, "
+            f"got {server_args.speculative_dspark_sps_target_accept_length}."
+        )
+    if server_args.speculative_dspark_sps_min_schedule_batch_size < 1:
+        raise ValueError(
+            "--speculative-dspark-sps-min-schedule-batch-size must be >= 1, "
+            f"got {server_args.speculative_dspark_sps_min_schedule_batch_size}."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length feeds the ragged-verify "
+            "budget scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; "
+            "it will be a no-op."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and not server_args.speculative_dspark_sps_dry_run
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length is experimental in "
+            "active scheduling mode. Miscalibrated confidence can reduce DSpark "
+            "accept length; validate AR/AL with --speculative-dspark-sps-dry-run "
+            "before serving."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+    ):
+        logger.warning(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier may increase "
+            "the verify-token budget after "
+            "--speculative-dspark-sps-target-accept-length caps it, reducing the "
+            "effect of the target accept-length policy."
+        )
+    if (
+        server_args.speculative_dspark_sps_min_schedule_batch_size > 1
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-min-schedule-batch-size feeds the ragged-verify "
+            "budget scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; "
+            "it will be a no-op."
+        )
     fine_min = server_args.speculative_dspark_ragged_graph_fine_grained_min_tokens
     fine_max = server_args.speculative_dspark_ragged_graph_fine_grained_max_tokens
     if fine_min is not None and int(fine_min) < 1:

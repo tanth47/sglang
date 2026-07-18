@@ -204,9 +204,7 @@ class TestStaticFullVerifyLayout(unittest.TestCase):
         )
 
         self.assertEqual(layout.graph_num_tokens, 32)
-        self.assertTrue(
-            is_static_full_verify_layout(layout, num_tokens_per_req=8)
-        )
+        self.assertTrue(is_static_full_verify_layout(layout, num_tokens_per_req=8))
 
     def test_single_full_width_layout_is_static(self):
         layout = RaggedVerifyLayout.from_verify_lens(
@@ -215,9 +213,7 @@ class TestStaticFullVerifyLayout(unittest.TestCase):
             grid=[8, 16, 32, 64],
         )
 
-        self.assertTrue(
-            is_static_full_verify_layout(layout, num_tokens_per_req=8)
-        )
+        self.assertTrue(is_static_full_verify_layout(layout, num_tokens_per_req=8))
 
     def test_non_full_width_layout_stays_ragged(self):
         layout = RaggedVerifyLayout.from_verify_lens(
@@ -226,9 +222,7 @@ class TestStaticFullVerifyLayout(unittest.TestCase):
             grid=[8, 16, 32, 64],
         )
 
-        self.assertFalse(
-            is_static_full_verify_layout(layout, num_tokens_per_req=8)
-        )
+        self.assertFalse(is_static_full_verify_layout(layout, num_tokens_per_req=8))
 
 
 class TestCaptureVerifyLens(unittest.TestCase):

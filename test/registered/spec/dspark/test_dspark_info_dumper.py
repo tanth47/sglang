@@ -49,9 +49,12 @@ def make_obs(
     forward_ct,
     bs=4,
     num_verify_tokens=24,
+    planned_num_verify_tokens=None,
     predicted_step_ms=None,
     predicted_theta=None,
 ):
+    if planned_num_verify_tokens is None:
+        planned_num_verify_tokens = num_verify_tokens
     return DecodeStepObservation(
         forward_ct=forward_ct,
         bs=bs,
@@ -59,9 +62,12 @@ def make_obs(
         budget=100,
         lag_steps=0,
         num_verify_tokens=num_verify_tokens,
+        planned_num_verify_tokens=planned_num_verify_tokens,
         verify_tokens_local=num_verify_tokens,
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
+        target_verify_cuda_graph=False,
+        budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
         verify_lens=torch.full((bs,), 6, dtype=torch.int32),
@@ -164,7 +170,22 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["bs"], 3)
         self.assertEqual(record["num_running_reqs"], 3)
         self.assertEqual(record["num_verify_tokens"], 18)
+        self.assertEqual(record["planned_num_verify_tokens"], 18)
         self.assertEqual(record["mode"], "static")
+
+    def test_core_fields_report_dry_run_planned_verify_tokens(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                bs=4,
+                num_verify_tokens=32,
+                planned_num_verify_tokens=21,
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(record["num_verify_tokens"], 32)
+        self.assertEqual(record["planned_num_verify_tokens"], 21)
 
     def test_core_only_omits_timing_fields(self):
         dumper, clock = make_dumper({"core"})
@@ -254,9 +275,12 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         budget=budget,
         lag_steps=1,
         num_verify_tokens=num_verify_tokens,
+        planned_num_verify_tokens=bs + budget,
         verify_tokens_local=num_verify_tokens,
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
+        target_verify_cuda_graph=False,
+        budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=1.0,
         step_cpu_ms=None,
@@ -335,9 +359,12 @@ class TestReqsAndGpuTiming(CustomTestCase):
             budget=obs.budget,
             lag_steps=obs.lag_steps,
             num_verify_tokens=obs.num_verify_tokens,
+            planned_num_verify_tokens=obs.planned_num_verify_tokens,
             verify_tokens_local=obs.verify_tokens_local,
             verify_tokens_dp_synced=obs.verify_tokens_dp_synced,
             verify_tokens_graph_key=obs.verify_tokens_graph_key,
+            target_verify_cuda_graph=obs.target_verify_cuda_graph,
+            budget_dry_run=obs.budget_dry_run,
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
             verify_lens=obs.verify_lens.cuda(),

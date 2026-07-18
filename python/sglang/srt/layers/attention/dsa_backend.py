@@ -941,9 +941,7 @@ class DeepseekSparseAttnBackend(
                     + k_offset
                 )
                 token_to_batch_idx.append(
-                    torch.full(
-                        (verify_len,), i, dtype=torch.int32, device=self.device
-                    )
+                    torch.full((verify_len,), i, dtype=torch.int32, device=self.device)
                 )
             k_offset += kv_len
 
@@ -1927,9 +1925,7 @@ class DeepseekSparseAttnBackend(
                 )
                 target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
-                seqlens_expanded = metadata.dsa_seqlens_expanded[
-                    :total_verify_tokens
-                ]
+                seqlens_expanded = metadata.dsa_seqlens_expanded[:total_verify_tokens]
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[
                     :total_verify_tokens
                 ]

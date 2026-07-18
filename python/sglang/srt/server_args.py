@@ -1720,6 +1720,30 @@ class ServerArgs:
         "constant-SPS table: the budget degenerates to verify-all (zero throughput "
         "gain by itself).",
     ] = None
+    speculative_dspark_sps_target_accept_length: A[
+        float,
+        "DSPARK ragged-verify only. Optional SPS budget cap: when positive, "
+        "choose no more than the smallest verify-token budget whose confidence "
+        "estimate reaches this per-request expected accept length. This can trim "
+        "expensive full-width verification when the SPS table is too flat. This "
+        "is experimental: miscalibrated confidence can reduce accept length even "
+        "though unverified draft tokens are not committed. Use "
+        "--speculative-dspark-sps-dry-run first and validate AR/AL before active "
+        "serving. Off by default.",
+    ] = 0.0
+    speculative_dspark_sps_min_schedule_batch_size: A[
+        int,
+        "DSPARK ragged-verify only. Minimum live batch size required before the "
+        "SPS/confidence scheduler may trim verify tokens. Smaller batches use "
+        "full verify width to preserve accept length when scheduling overhead or "
+        "confidence noise outweighs expected throughput gain.",
+    ] = 1
+    speculative_dspark_sps_dry_run: A[
+        bool,
+        "DSPARK ragged-verify only. Compute and report SPS/confidence verify-token "
+        "budget decisions, but apply full verify width. This is useful for "
+        "calibrating SPS/STS policy without risking accept-length regressions.",
+    ] = False
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
         "DSPARK only. Optional path to a per-position STS (sequential temperature "

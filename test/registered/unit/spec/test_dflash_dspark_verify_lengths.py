@@ -7,15 +7,15 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import DSAIndexerMetadata, DSAMetadata
-from sglang.srt.speculative.ragged_verify import (
-    build_ragged_verify_token_buckets,
-)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import _copy_prefix_seq_lens_cpu
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_verify_token_buckets,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     create_dummy_verify_input,
