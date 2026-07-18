@@ -1725,9 +1725,11 @@ class ServerArgs:
         "DSPARK ragged-verify only. Optional SPS budget cap: when positive, "
         "choose no more than the smallest verify-token budget whose confidence "
         "estimate reaches this per-request expected accept length. This can trim "
-        "expensive full-width verification when the SPS table is too flat. Off "
-        "by default; token correctness is unchanged because unverified draft "
-        "tokens are not committed.",
+        "expensive full-width verification when the SPS table is too flat. This "
+        "is experimental: miscalibrated confidence can reduce accept length even "
+        "though unverified draft tokens are not committed. Use "
+        "--speculative-dspark-sps-dry-run first and validate AR/AL before active "
+        "serving. Off by default.",
     ] = 0.0
     speculative_dspark_sps_min_schedule_batch_size: A[
         int,

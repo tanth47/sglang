@@ -440,6 +440,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
     if (
         server_args.speculative_dspark_sps_target_accept_length > 0
+        and not server_args.speculative_dspark_sps_dry_run
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length is experimental in "
+            "active scheduling mode. Miscalibrated confidence can reduce DSpark "
+            "accept length; validate AR/AL with --speculative-dspark-sps-dry-run "
+            "before serving."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
         and server_args.speculative_dspark_align_verify_tokens_to_graph_tier
     ):
         logger.warning(
