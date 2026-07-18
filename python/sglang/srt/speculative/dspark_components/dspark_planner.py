@@ -477,14 +477,12 @@ class DSparkVerifyPlanner:
             confidence=confidence,
             budget=budget_for_layout,
         )
-        verify_lens, budget_for_layout = (
-            self._adjust_rocm_dsa_graph_safe_sps_layout(
-                prefix_lens=prefix_lens,
-                verify_lens=verify_lens,
-                budget=budget_for_layout,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            )
+        verify_lens, budget_for_layout = self._adjust_rocm_dsa_graph_safe_sps_layout(
+            prefix_lens=prefix_lens,
+            verify_lens=verify_lens,
+            budget=budget_for_layout,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (

@@ -241,9 +241,7 @@ def resolve_graph_ragged_verify_layout(
     layout = resolve_ragged_verify_layout(forward_batch)
     if layout is None:
         return None
-    if is_static_full_verify_layout(
-        layout, num_tokens_per_req=num_tokens_per_req
-    ):
+    if is_static_full_verify_layout(layout, num_tokens_per_req=num_tokens_per_req):
         return None
     return layout
 
@@ -253,9 +251,7 @@ def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: 
     layout = getattr(spec_info, "ragged_verify_layout", None)
     if layout is None:
         return spec_info
-    if not is_static_full_verify_layout(
-        layout, num_tokens_per_req=num_tokens_per_req
-    ):
+    if not is_static_full_verify_layout(layout, num_tokens_per_req=num_tokens_per_req):
         return spec_info
     spec_info = copy.copy(spec_info)
     spec_info.ragged_verify_layout = None
@@ -714,11 +710,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if context_len <= self.num_tokens_per_req:
             return None
         capture_seq_len = context_len - self.num_tokens_per_req
-        threshold = (
-            int(dsa_index_topk)
-            + rocm_dsa_target_verify_post_topk_graph_guard_tokens(
-                num_tokens_per_req=self.num_tokens_per_req
-            )
+        threshold = int(
+            dsa_index_topk
+        ) + rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+            num_tokens_per_req=self.num_tokens_per_req
         )
         if capture_seq_len < threshold:
             return None
@@ -1003,9 +998,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not self.attn_backend.supports_ragged_verify_graph:
             self._log_graph_reject(forward_batch, "ragged_backend_unsupported")
             return False
-        backend_admit = getattr(
-            self.attn_backend, "can_run_ragged_verify_graph", None
-        )
+        backend_admit = getattr(self.attn_backend, "can_run_ragged_verify_graph", None)
         if backend_admit is not None:
             ok, reason = backend_admit(
                 forward_batch=forward_batch,
@@ -1164,9 +1157,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
         mrope_positions = _slot("mrope_positions")
-        capture_seq_len_fill_value = self._capture_seq_len_fill_value(
-            graph_extra_label
-        )
+        capture_seq_len_fill_value = self._capture_seq_len_fill_value(graph_extra_label)
         seq_lens.fill_(capture_seq_len_fill_value)
         seq_lens_cpu.fill_(capture_seq_len_fill_value)
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
@@ -1385,10 +1376,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 for num_tokens in self.capture_num_tokens
             ]
             if self.ragged_verify_mode
-            else [
-                (bs, bs * self.num_tokens_per_req)
-                for bs in self.capture_bs
-            ]
+            else [(bs, bs * self.num_tokens_per_req) for bs in self.capture_bs]
         )
         # Reverse so cuda graphs share memory better.
         capture_range = (

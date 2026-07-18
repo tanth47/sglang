@@ -5,8 +5,8 @@ import unittest
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_planner import (
-    DSparkVerifyPlanner,
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
