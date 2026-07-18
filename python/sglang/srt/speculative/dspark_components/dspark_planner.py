@@ -126,6 +126,9 @@ class DSparkVerifyPlanner:
             sps_target_accept_length=(
                 server_args.speculative_dspark_sps_target_accept_length
             ),
+            sps_min_schedule_batch_size=(
+                server_args.speculative_dspark_sps_min_schedule_batch_size
+            ),
         )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
@@ -264,6 +267,15 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def observe_accept_lens(
+        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    ) -> None:
+        if self._budget_planner is None:
+            return
+        self._budget_planner.observe_accept_lens(
+            accept_lens=accept_lens, cap_trim_lens=cap_trim_lens
+        )
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -1072,6 +1084,7 @@ class DSparkScheduleConfig(msgspec.Struct):
     max_verify_len: int = 0
     survival_eps: float = 1e-6
     sps_target_accept_length: float = 0.0
+    sps_min_schedule_batch_size: int = 1
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -1091,6 +1104,11 @@ class DSparkScheduleConfig(msgspec.Struct):
             raise ValueError(
                 "sps_target_accept_length must be >= 0, "
                 f"got {self.sps_target_accept_length}."
+            )
+        if self.sps_min_schedule_batch_size < 1:
+            raise ValueError(
+                "sps_min_schedule_batch_size must be >= 1, "
+                f"got {self.sps_min_schedule_batch_size}."
             )
 
 
@@ -1202,6 +1220,8 @@ class HostConfidenceBudgetPlanner:
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
         self._carry_pos = 0
+        self._accept_len_ewma: Optional[float] = None
+        self._accept_guard_cooldown = 0
 
     def compute_budget(
         self,
@@ -1221,12 +1241,21 @@ class HostConfidenceBudgetPlanner:
             lagged_generation=lagged_generation,
             current_generation=current_generation,
         )
+        num_requests = survival.shape[0]
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
+        if int(num_requests) < int(self.cfg.sps_min_schedule_batch_size):
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
+        if self._should_protect_target_accept_length():
+            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
@@ -1242,6 +1271,34 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
+
+    def observe_accept_lens(
+        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    ) -> None:
+        if self.cfg.sps_target_accept_length <= 0 or accept_lens.numel() == 0:
+            return
+        if cap_trim_lens is not None and cap_trim_lens.numel() > 0:
+            cap_trimmed = bool(torch.any(cap_trim_lens.to(torch.int32) > 0).item())
+            if cap_trimmed:
+                self._accept_guard_cooldown = max(
+                    self._accept_guard_cooldown, self.lag_steps + 1
+                )
+        observed = float(accept_lens.to(torch.float32).mean().item())
+        if self._accept_len_ewma is None:
+            self._accept_len_ewma = observed
+        else:
+            self._accept_len_ewma = 0.9 * self._accept_len_ewma + 0.1 * observed
+
+    def _should_protect_target_accept_length(self) -> bool:
+        target = float(self.cfg.sps_target_accept_length)
+        if target <= 0:
+            return False
+        if self._accept_guard_cooldown > 0:
+            self._accept_guard_cooldown -= 1
+            return True
+        if self._accept_len_ewma is None:
+            return True
+        return self._accept_len_ewma < target
 
     def _shift_to_lag(
         self,

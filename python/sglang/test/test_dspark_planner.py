@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    HostConfidenceBudgetPlanner,
     compute_verify_token_budget,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -91,6 +92,128 @@ class TestDSparkPlanner(unittest.TestCase):
     def test_sps_target_accept_length_rejects_negative_value(self):
         with self.assertRaisesRegex(ValueError, "sps_target_accept_length"):
             DSparkScheduleConfig(gamma=3, sps_target_accept_length=-1).validate()
+
+    def test_sps_min_schedule_batch_size_rejects_non_positive_value(self):
+        with self.assertRaisesRegex(ValueError, "sps_min_schedule_batch_size"):
+            DSparkScheduleConfig(gamma=3, sps_min_schedule_batch_size=0).validate()
+
+    def test_sps_min_schedule_batch_size_uses_full_budget_below_floor(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(
+                gamma=3,
+                sps_target_accept_length=2.0,
+                sps_min_schedule_batch_size=3,
+            ),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(accept_lens=torch.tensor([3, 3], dtype=torch.int32))
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 6)
+
+    def test_sps_min_schedule_batch_size_allows_trim_at_floor(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(
+                gamma=3,
+                sps_target_accept_length=2.0,
+                sps_min_schedule_batch_size=2,
+            ),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(accept_lens=torch.tensor([3, 3], dtype=torch.int32))
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 3)
+
+    def test_sps_target_accept_length_cold_start_uses_full_budget(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 6)
+
+    def test_sps_target_accept_length_allows_trim_after_healthy_acceptance(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(accept_lens=torch.tensor([3, 3], dtype=torch.int32))
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 3)
+
+    def test_sps_target_accept_length_protects_cap_trimmed_blocks(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(
+            accept_lens=torch.tensor([3, 3], dtype=torch.int32),
+            cap_trim_lens=torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 6)
+
+    def test_sps_target_accept_length_protects_low_observed_acceptance(self):
+        planner = HostConfidenceBudgetPlanner(
+            sps_table=_flat_sps_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+            model_runner=None,
+            relay_lag_steps=1024,
+        )
+        planner.observe_accept_lens(accept_lens=torch.tensor([1, 1], dtype=torch.int32))
+
+        budget = planner.compute_budget(
+            confidence=_survival(),
+            generation=torch.ones(2, dtype=torch.int64),
+            current_generation=torch.ones(2, dtype=torch.int64),
+            req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 6)
 
 
 if __name__ == "__main__":

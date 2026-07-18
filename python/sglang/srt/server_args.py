@@ -1729,6 +1729,13 @@ class ServerArgs:
         "by default; token correctness is unchanged because unverified draft "
         "tokens are not committed.",
     ] = 0.0
+    speculative_dspark_sps_min_schedule_batch_size: A[
+        int,
+        "DSPARK ragged-verify only. Minimum live batch size required before the "
+        "SPS/confidence scheduler may trim verify tokens. Smaller batches use "
+        "full verify width to preserve accept length when scheduling overhead or "
+        "confidence noise outweighs expected throughput gain.",
+    ] = 1
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
         "DSPARK only. Optional path to a per-position STS (sequential temperature "

@@ -620,6 +620,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        self._verify_planner.observe_accept_lens(
+            accept_lens=accept.commit_lens,
+            cap_trim_lens=accept.cap_trim_lens,
+        )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
