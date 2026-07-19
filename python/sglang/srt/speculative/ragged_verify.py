@@ -27,6 +27,9 @@ DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT = (
 DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
     "rocm_dsa_target_verify_post_topk_above_capture_contract"
 )
+DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
+    "rocm_dsa_target_verify_post_topk_capture_seq_len_mismatch"
+)
 
 
 def read_ragged_verify_mode() -> RaggedVerifyMode:
@@ -129,7 +132,7 @@ def classify_dsa_target_verify_graph_regime(
     post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
     if all(
         seq_len + 1 >= post_topk_graph_threshold
-        and seq_len <= post_topk_capture_seq_len
+        and seq_len == post_topk_capture_seq_len
         for seq_len, _ in windows
     ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
@@ -179,6 +182,7 @@ def classify_dsa_target_verify_graph_reject_reason(
             return DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
         if any(seq_len > post_topk_capture_seq_len for seq_len, _ in windows):
             return DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT
+        return DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
 
     return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
 

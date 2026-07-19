@@ -96,6 +96,7 @@ from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
@@ -396,6 +397,11 @@ def dsa_target_verify_graph_debug_info(
             graph_regime_label = "post_topk_no_capture_contract"
         elif graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT:
             graph_regime_label = "post_topk_above_capture_contract"
+        elif (
+            graph_reject_reason
+            == DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
+        ):
+            graph_regime_label = "post_topk_capture_seq_len_mismatch"
         else:
             graph_regime_label = "mixed_or_transition"
     details = {

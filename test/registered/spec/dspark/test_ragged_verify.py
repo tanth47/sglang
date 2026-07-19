@@ -5,6 +5,7 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
@@ -66,10 +67,19 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertIsNone(regime)
 
-    def test_post_topk_window_can_use_explicit_capture_contract(self):
+    def test_post_topk_window_rejects_capture_seq_len_mismatch(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2048, 3000],
             verify_lens_cpu=[1, 8],
+            dsa_index_topk=2048,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertIsNone(regime)
+
+    def test_post_topk_window_can_use_exact_capture_contract(self):
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[4096],
+            verify_lens_cpu=[8],
             dsa_index_topk=2048,
             post_topk_capture_seq_len=4096,
         )
@@ -101,9 +111,19 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertIsNone(regime)
 
-    def test_post_topk_guard_allows_far_post_window_with_capture_contract(self):
+    def test_post_topk_guard_rejects_far_post_window_capture_mismatch(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2112],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertIsNone(regime)
+
+    def test_post_topk_guard_allows_exact_capture_contract(self):
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[4096],
             verify_lens_cpu=[8],
             dsa_index_topk=2048,
             post_topk_guard_tokens=64,
@@ -171,6 +191,16 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertEqual(reason, DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT)
 
+    def test_reject_reason_splits_post_topk_capture_seq_len_mismatch(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[2112],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertEqual(reason, DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT)
+
     def test_reject_reason_keeps_true_transition_separate(self):
         reason = classify_dsa_target_verify_graph_reject_reason(
             seq_lens_cpu=[2044],
@@ -182,7 +212,7 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
 
     def test_reject_reason_is_none_for_graphable_post_topk(self):
         reason = classify_dsa_target_verify_graph_reject_reason(
-            seq_lens_cpu=[2112],
+            seq_lens_cpu=[4096],
             verify_lens_cpu=[8],
             dsa_index_topk=2048,
             post_topk_guard_tokens=64,
