@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import logging
 import math
 from pathlib import Path
@@ -43,6 +44,149 @@ def expected_calibration_error(
     denom = count.clamp_min(1.0)
     bin_error = (pred_sum / denom - target_sum / denom).abs()
     return float((bin_error * count).sum().item() / total)
+
+
+def survival_probabilities(
+    *, logits: torch.Tensor, temperatures: Optional[list[float]] = None
+) -> torch.Tensor:
+    logits = logits.to(torch.float64)
+    if temperatures is not None:
+        temperature_tensor = torch.tensor(
+            temperatures,
+            dtype=torch.float64,
+            device=logits.device,
+        )
+        if temperature_tensor.numel() != logits.shape[1]:
+            raise ValueError(
+                f"STS temperature count {temperature_tensor.numel()} does not match "
+                f"logits gamma {logits.shape[1]}."
+            )
+        if bool((temperature_tensor <= 0).any().item()):
+            raise ValueError(f"STS temperatures must all be > 0, got {temperatures}.")
+        logits = logits / temperature_tensor.view(1, -1)
+    return torch.cumprod(torch.sigmoid(logits), dim=1)
+
+
+def _brier_scores(*, probs: torch.Tensor, targets: torch.Tensor) -> list[float]:
+    return ((probs - targets.to(torch.float64)) ** 2).mean(dim=0).tolist()
+
+
+def reliability_bins(
+    *,
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    num_bins: int,
+) -> list[list[dict[str, Optional[float] | int]]]:
+    probs = probs.to(torch.float64).clamp(_EPS_PROB, 1.0 - _EPS_PROB)
+    targets = targets.to(torch.float64)
+    all_bins: list[list[dict[str, Optional[float] | int]]] = []
+    for position in range(probs.shape[1]):
+        position_probs = probs[:, position].reshape(-1)
+        position_targets = targets[:, position].reshape(-1)
+        bin_index = (position_probs * num_bins).long().clamp_(0, num_bins - 1)
+        count = torch.zeros(num_bins, dtype=torch.float64)
+        pred_sum = torch.zeros(num_bins, dtype=torch.float64)
+        target_sum = torch.zeros(num_bins, dtype=torch.float64)
+        count.scatter_add_(0, bin_index, torch.ones_like(position_probs))
+        pred_sum.scatter_add_(0, bin_index, position_probs)
+        target_sum.scatter_add_(0, bin_index, position_targets)
+
+        position_bins: list[dict[str, Optional[float] | int]] = []
+        for bin_id in range(num_bins):
+            bin_count = int(count[bin_id].item())
+            if bin_count == 0:
+                mean_predicted: Optional[float] = None
+                mean_target: Optional[float] = None
+            else:
+                mean_predicted = float((pred_sum[bin_id] / bin_count).item())
+                mean_target = float((target_sum[bin_id] / bin_count).item())
+            position_bins.append(
+                {
+                    "bin": bin_id,
+                    "lower": float(bin_id / num_bins),
+                    "upper": float((bin_id + 1) / num_bins),
+                    "count": bin_count,
+                    "mean_predicted": mean_predicted,
+                    "mean_target": mean_target,
+                }
+            )
+        all_bins.append(position_bins)
+    return all_bins
+
+
+def evaluate_sts_calibration(
+    *,
+    logits: torch.Tensor,
+    prefix_mask: torch.Tensor,
+    temperatures: list[float],
+    num_bins: int,
+) -> dict:
+    if logits.shape != prefix_mask.shape:
+        raise ValueError(
+            "STS eval logits / prefix_mask shape mismatch: "
+            f"{tuple(logits.shape)} vs {tuple(prefix_mask.shape)}."
+        )
+    num_samples, gamma = logits.shape
+    if num_samples == 0:
+        raise ValueError("evaluate_sts_calibration requires at least one sample.")
+
+    targets = prefix_mask.to(torch.float64)
+    probs_before = survival_probabilities(logits=logits)
+    probs_after = survival_probabilities(
+        logits=logits,
+        temperatures=temperatures,
+    )
+    brier_before = _brier_scores(probs=probs_before, targets=targets)
+    brier_after = _brier_scores(probs=probs_after, targets=targets)
+    bins_before = reliability_bins(
+        probs=probs_before,
+        targets=targets,
+        num_bins=num_bins,
+    )
+    bins_after = reliability_bins(
+        probs=probs_after,
+        targets=targets,
+        num_bins=num_bins,
+    )
+
+    per_position = []
+    for position in range(gamma):
+        position_targets = targets[:, position]
+        per_position.append(
+            {
+                "position": position,
+                "temperature": float(temperatures[position]),
+                "num_samples": int(num_samples),
+                "ece_before": expected_calibration_error(
+                    probs=probs_before[:, position],
+                    targets=position_targets,
+                    num_bins=num_bins,
+                ),
+                "ece_after": expected_calibration_error(
+                    probs=probs_after[:, position],
+                    targets=position_targets,
+                    num_bins=num_bins,
+                ),
+                "brier_before": float(brier_before[position]),
+                "brier_after": float(brier_after[position]),
+                "mean_predicted_survival_before": float(
+                    probs_before[:, position].mean().item()
+                ),
+                "mean_predicted_survival_after": float(
+                    probs_after[:, position].mean().item()
+                ),
+                "mean_target": float(position_targets.mean().item()),
+                "reliability_bins_before": bins_before[position],
+                "reliability_bins_after": bins_after[position],
+            }
+        )
+
+    return {
+        "num_samples": int(num_samples),
+        "gamma": int(gamma),
+        "num_bins": int(num_bins),
+        "per_position": per_position,
+    }
 
 
 def fit_sts_temperatures(
@@ -146,6 +290,8 @@ def fit(
     out: Path,
     num_bins: int = 15,
     gamma: Optional[int] = None,
+    report_out: Optional[Path] = None,
+    eval_data_glob: Optional[str] = None,
 ) -> None:
     logits, prefix_mask = load_collected_shards(data_glob=data_glob)
     resolved_gamma = int(logits.shape[1])
@@ -169,6 +315,42 @@ def fit(
         ece_after=result["ece_after"],
     )
     out.write_text(calibration.to_json(), encoding="utf-8")
+
+    if report_out is not None:
+        eval_logits = logits
+        eval_prefix_mask = prefix_mask
+        resolved_eval_data_glob = data_glob
+        if eval_data_glob is not None:
+            eval_logits, eval_prefix_mask = load_collected_shards(
+                data_glob=eval_data_glob
+            )
+            resolved_eval_data_glob = eval_data_glob
+            if int(eval_logits.shape[1]) != resolved_gamma:
+                raise ValueError(
+                    f"Eval shards have gamma={int(eval_logits.shape[1])} but "
+                    f"fit shards have gamma={resolved_gamma}."
+                )
+        report = {
+            "fit": {
+                "data_glob": data_glob,
+                "num_samples": num_samples,
+                "gamma": resolved_gamma,
+            },
+            "eval": {
+                "data_glob": resolved_eval_data_glob,
+                **evaluate_sts_calibration(
+                    logits=eval_logits,
+                    prefix_mask=eval_prefix_mask,
+                    temperatures=result["temperatures"],
+                    num_bins=num_bins,
+                ),
+            },
+        }
+        report_out.parent.mkdir(parents=True, exist_ok=True)
+        report_out.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     print(
         f"Fit STS temperatures over {num_samples} samples (gamma={resolved_gamma}) "
@@ -213,13 +395,29 @@ def main() -> None:
         default=None,
         help="Optional gamma override to validate the shards against.",
     )
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=None,
+        help="Optional output JSON path for fit/eval calibration metrics.",
+    )
+    parser.add_argument(
+        "--eval-data-glob",
+        default=None,
+        help="Optional held-out shard glob used for --report-out metrics. "
+        "Defaults to --data-glob when omitted.",
+    )
     args = parser.parse_args()
+    if args.eval_data_glob is not None and args.report_out is None:
+        parser.error("--eval-data-glob requires --report-out.")
 
     fit(
         data_glob=args.data_glob,
         out=args.out,
         num_bins=args.num_bins,
         gamma=args.gamma,
+        report_out=args.report_out,
+        eval_data_glob=args.eval_data_glob,
     )
 
 
