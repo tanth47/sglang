@@ -789,6 +789,7 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        self._sts_compact_warned: bool = False
 
     # --- step lifecycle -------------------------------------------------
 
@@ -809,6 +810,7 @@ class DsparkStepObservers:
     # --- scheduler-facing hooks ------------------------------------------
 
     def dump_info_records(self) -> Optional[dict]:
+        self._flush_sts_recorder()
         dumped = self._info_dumper.dump()
         if dumped is None:
             return None
@@ -818,7 +820,12 @@ class DsparkStepObservers:
         return dumped
 
     def clear_info_records(self) -> None:
+        self._flush_sts_recorder()
         self._info_dumper.clear()
+
+    def _flush_sts_recorder(self) -> None:
+        if self._sts_recorder is not None:
+            self._sts_recorder.flush()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
         if self._block_accept_recorder is None:
@@ -973,6 +980,18 @@ class DsparkStepObservers:
             return
         if not self._planner.carries_confidence:
             return
+        if self._planner.is_compact_mode:
+            if not self._sts_compact_warned:
+                logger.warning(
+                    "SGLANG_DSPARK_STS_COLLECT_PATH is ignored under "
+                    "SGLANG_RAGGED_VERIFY_MODE=compact (padded or trimmed verify "
+                    "rows can corrupt per-position STS labels); collect STS shards "
+                    "with static or cap-accept mode."
+                )
+                self._sts_compact_warned = True
+            return
+        if target_logits is None:
+            return
         confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
@@ -981,6 +1000,10 @@ class DsparkStepObservers:
                 path_stem=self._sts_collect_path,
                 gamma=self._gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
+                metadata={
+                    "collect_mode": self._planner.mode_value,
+                    "verify_num_draft_tokens": self._verify_num_draft_tokens,
+                },
             )
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self._verify_num_draft_tokens

@@ -11,6 +11,7 @@ from sglang.benchmark.dspark_sts_fit import (
     expected_calibration_error,
     fit,
     fit_sts_temperatures,
+    load_collected_shards,
     survival_probabilities,
 )
 from sglang.srt.models.dspark import DSparkConfidenceHead
@@ -263,7 +264,12 @@ class TestStsDataRecorder(CustomTestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             stem = str(Path(tmp) / "shard")
-            recorder = StsDataRecorder(path_stem=stem, gamma=gamma, flush_every=10)
+            recorder = StsDataRecorder(
+                path_stem=stem,
+                gamma=gamma,
+                flush_every=10,
+                metadata={"collect_mode": "static"},
+            )
             recorder.record(
                 confidence_raw=confidence_raw,
                 num_correct_drafts=num_correct_drafts,
@@ -272,6 +278,84 @@ class TestStsDataRecorder(CustomTestCase):
             shard = torch.load(f"{stem}.0.pt")
         self.assertTrue(torch.equal(shard["prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.equal(shard["logits"], confidence_raw.to(torch.float32)))
+        self.assertEqual(shard["metadata"]["schema_version"], 1)
+        self.assertEqual(shard["metadata"]["gamma"], gamma)
+        self.assertEqual(shard["metadata"]["num_samples"], 4)
+        self.assertEqual(shard["metadata"]["shard_index"], 0)
+        self.assertEqual(shard["metadata"]["collect_mode"], "static")
+
+    def test_load_collected_shards_accepts_old_and_new_shards(self):
+        old_logits = torch.randn(2, 3)
+        old_prefix_mask = torch.ones(2, 3)
+        new_logits = torch.randn(1, 3)
+        new_num_correct = torch.tensor([2], dtype=torch.int32)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            torch.save(
+                {"logits": old_logits, "prefix_mask": old_prefix_mask},
+                tmp_path / "a_old.0.pt",
+            )
+            recorder = StsDataRecorder(
+                path_stem=str(tmp_path / "b_new"),
+                gamma=3,
+                flush_every=10,
+                metadata={"collect_mode": "static"},
+            )
+            recorder.record(
+                confidence_raw=new_logits,
+                num_correct_drafts=new_num_correct,
+            )
+            recorder.flush()
+
+            logits, prefix_mask = load_collected_shards(data_glob=str(tmp_path / "*.pt"))
+
+        self.assertEqual(tuple(logits.shape), (3, 3))
+        self.assertEqual(tuple(prefix_mask.shape), (3, 3))
+        self.assertTrue(torch.equal(logits[:2], old_logits))
+        self.assertTrue(torch.equal(prefix_mask[:2], old_prefix_mask))
+
+    def test_load_collected_shards_rejects_bad_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shard_path = Path(tmp) / "bad.0.pt"
+            torch.save(
+                {
+                    "logits": torch.zeros(2, 3),
+                    "prefix_mask": torch.zeros(2, 3),
+                    "metadata": {"gamma": 4, "num_samples": 2},
+                },
+                shard_path,
+            )
+            with self.assertRaisesRegex(ValueError, "metadata gamma"):
+                load_collected_shards(data_glob=str(shard_path))
+
+            torch.save(
+                {
+                    "logits": torch.zeros(2, 3),
+                    "prefix_mask": torch.zeros(2, 3),
+                    "metadata": {"gamma": 3, "num_samples": 4},
+                },
+                shard_path,
+            )
+            with self.assertRaisesRegex(ValueError, "metadata num_samples"):
+                load_collected_shards(data_glob=str(shard_path))
+
+    def test_rejects_shape_mismatch(self):
+        recorder = StsDataRecorder(path_stem="/tmp/unused", gamma=4, flush_every=10)
+        with self.assertRaises(ValueError):
+            recorder.record(
+                confidence_raw=torch.randn(4),
+                num_correct_drafts=torch.tensor([1], dtype=torch.int32),
+            )
+        with self.assertRaises(ValueError):
+            recorder.record(
+                confidence_raw=torch.randn(2, 3),
+                num_correct_drafts=torch.tensor([1, 2], dtype=torch.int32),
+            )
+        with self.assertRaises(ValueError):
+            recorder.record(
+                confidence_raw=torch.randn(2, 4),
+                num_correct_drafts=torch.tensor([1, 2, 3], dtype=torch.int32),
+            )
 
 
 if __name__ == "__main__":
