@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,8 +7,11 @@ import torch
 
 from sglang.benchmark.dspark_sts_fit import (
     default_temperature_grid,
+    evaluate_sts_calibration,
     expected_calibration_error,
+    fit,
     fit_sts_temperatures,
+    survival_probabilities,
 )
 from sglang.srt.models.dspark import DSparkConfidenceHead
 from sglang.srt.speculative.dspark_components.dspark_sts import (
@@ -114,6 +118,138 @@ class TestFitStsTemperatures(CustomTestCase):
         mean_before = sum(result["ece_before"]) / gamma
         mean_after = sum(result["ece_after"]) / gamma
         self.assertLess(mean_after, 0.25 * mean_before)
+
+
+class TestStsEvaluationReport(CustomTestCase):
+    def test_evaluation_report_contains_per_position_metrics_and_bins(self):
+        logits = torch.tensor(
+            [
+                [0.0, 1.0],
+                [2.0, -1.0],
+                [-2.0, 0.5],
+            ],
+            dtype=torch.float32,
+        )
+        prefix_mask = torch.tensor(
+            [
+                [1.0, 1.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        temperatures = [1.0, 2.0]
+
+        report = evaluate_sts_calibration(
+            logits=logits,
+            prefix_mask=prefix_mask,
+            temperatures=temperatures,
+            num_bins=5,
+        )
+
+        self.assertEqual(report["num_samples"], 3)
+        self.assertEqual(report["gamma"], 2)
+        self.assertEqual(len(report["per_position"]), 2)
+        for position_report in report["per_position"]:
+            self.assertIn("ece_before", position_report)
+            self.assertIn("ece_after", position_report)
+            self.assertIn("brier_before", position_report)
+            self.assertIn("brier_after", position_report)
+            self.assertIn("mean_predicted_survival_before", position_report)
+            self.assertIn("mean_predicted_survival_after", position_report)
+            self.assertIn("mean_target", position_report)
+            self.assertEqual(len(position_report["reliability_bins_before"]), 5)
+            self.assertEqual(len(position_report["reliability_bins_after"]), 5)
+
+        expected_before = survival_probabilities(logits=logits)[:, 1].mean().item()
+        expected_after = (
+            survival_probabilities(logits=logits, temperatures=temperatures)[:, 1]
+            .mean()
+            .item()
+        )
+        self.assertAlmostEqual(
+            report["per_position"][1]["mean_predicted_survival_before"],
+            expected_before,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            report["per_position"][1]["mean_predicted_survival_after"],
+            expected_after,
+            places=6,
+        )
+
+    def test_fit_writes_holdout_report_json(self):
+        train_logits = torch.tensor(
+            [
+                [2.0, 1.0],
+                [1.0, -0.5],
+                [-1.0, 0.5],
+                [0.5, 0.2],
+            ],
+            dtype=torch.float32,
+        )
+        train_prefix_mask = torch.tensor(
+            [
+                [1.0, 1.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        eval_logits = torch.tensor(
+            [
+                [1.5, 0.7],
+                [-0.5, 0.4],
+                [0.2, -0.3],
+            ],
+            dtype=torch.float32,
+        )
+        eval_prefix_mask = torch.tensor(
+            [
+                [1.0, 1.0],
+                [0.0, 0.0],
+                [1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            train_path = tmp_path / "train.0.pt"
+            eval_path = tmp_path / "eval.0.pt"
+            out_path = tmp_path / "sts.json"
+            report_path = tmp_path / "sts_report.json"
+            torch.save(
+                {"logits": train_logits, "prefix_mask": train_prefix_mask},
+                train_path,
+            )
+            torch.save(
+                {"logits": eval_logits, "prefix_mask": eval_prefix_mask},
+                eval_path,
+            )
+
+            fit(
+                data_glob=str(train_path),
+                out=out_path,
+                num_bins=4,
+                gamma=2,
+                report_out=report_path,
+                eval_data_glob=str(eval_path),
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["fit"]["num_samples"], 4)
+        self.assertEqual(report["fit"]["gamma"], 2)
+        self.assertEqual(report["eval"]["num_samples"], 3)
+        self.assertEqual(report["eval"]["gamma"], 2)
+        self.assertEqual(report["eval"]["num_bins"], 4)
+        self.assertEqual(len(report["eval"]["per_position"]), 2)
+        self.assertEqual(
+            report["eval"]["per_position"][0]["num_samples"],
+            report["eval"]["num_samples"],
+        )
 
 
 class TestStsDataRecorder(CustomTestCase):
