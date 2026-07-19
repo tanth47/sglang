@@ -266,11 +266,35 @@ def load_collected_shards(*, data_glob: str) -> tuple[torch.Tensor, torch.Tensor
         shard = torch.load(shard_path, map_location="cpu")
         shard_logits = shard["logits"]
         shard_prefix_mask = shard["prefix_mask"]
+        metadata = shard.get("metadata")
         if shard_logits.shape != shard_prefix_mask.shape:
             raise ValueError(
                 f"Shard {shard_path!r} logits / prefix_mask shape mismatch: "
                 f"{tuple(shard_logits.shape)} vs {tuple(shard_prefix_mask.shape)}."
             )
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                raise ValueError(
+                    f"Shard {shard_path!r} metadata must be a dict, got "
+                    f"{type(metadata).__name__}."
+                )
+            metadata_gamma = metadata.get("gamma")
+            if metadata_gamma is not None and int(metadata_gamma) != int(
+                shard_logits.shape[1]
+            ):
+                raise ValueError(
+                    f"Shard {shard_path!r} metadata gamma {int(metadata_gamma)} "
+                    f"disagrees with tensor gamma {int(shard_logits.shape[1])}."
+                )
+            metadata_samples = metadata.get("num_samples")
+            if metadata_samples is not None and int(metadata_samples) != int(
+                shard_logits.shape[0]
+            ):
+                raise ValueError(
+                    f"Shard {shard_path!r} metadata num_samples "
+                    f"{int(metadata_samples)} disagrees with tensor samples "
+                    f"{int(shard_logits.shape[0])}."
+                )
         if shard_gamma is None:
             shard_gamma = int(shard_logits.shape[1])
         elif int(shard_logits.shape[1]) != shard_gamma:

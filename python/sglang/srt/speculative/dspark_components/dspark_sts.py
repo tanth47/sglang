@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Optional
 
 import msgspec
 import torch
+
+STS_DATA_SHARD_SCHEMA_VERSION = 1
 
 
 class DSparkStsCalibration(msgspec.Struct, frozen=True, omit_defaults=True):
@@ -37,10 +40,18 @@ def load_sts_calibration_from_path(path: str) -> DSparkStsCalibration:
 
 
 class StsDataRecorder:
-    def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
+    def __init__(
+        self,
+        *,
+        path_stem: str,
+        gamma: int,
+        flush_every: int,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.path_stem = path_stem
         self.gamma = int(gamma)
         self.flush_every = int(flush_every)
+        self.metadata = dict(metadata or {})
         self._logits_buffer: list[torch.Tensor] = []
         self._prefix_mask_buffer: list[torch.Tensor] = []
         self._shard_ct = 0
@@ -49,10 +60,25 @@ class StsDataRecorder:
         self, *, confidence_raw: torch.Tensor, num_correct_drafts: torch.Tensor
     ) -> None:
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
+        if logits.ndim != 2:
+            raise ValueError(
+                "STS confidence logits must be a rank-2 tensor with shape "
+                f"[num_samples, gamma], got shape {tuple(logits.shape)}."
+            )
+        if int(logits.shape[1]) != self.gamma:
+            raise ValueError(
+                f"STS confidence logits gamma {int(logits.shape[1])} does not match "
+                f"recorder gamma {self.gamma}."
+            )
         positions = torch.arange(self.gamma).view(1, -1)
         counts = (
             num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1, 1)
         )
+        if int(counts.shape[0]) != int(logits.shape[0]):
+            raise ValueError(
+                f"STS num_correct_drafts rows {int(counts.shape[0])} do not match "
+                f"logits rows {int(logits.shape[0])}."
+            )
         prefix_mask = (positions < counts).to(torch.float32)
         self._logits_buffer.append(logits)
         self._prefix_mask_buffer.append(prefix_mask)
@@ -64,10 +90,20 @@ class StsDataRecorder:
             return
         shard_path = Path(f"{self.path_stem}.{self._shard_ct}.pt")
         shard_path.parent.mkdir(parents=True, exist_ok=True)
+        logits = torch.cat(self._logits_buffer, dim=0)
+        prefix_mask = torch.cat(self._prefix_mask_buffer, dim=0)
         torch.save(
             {
-                "logits": torch.cat(self._logits_buffer, dim=0),
-                "prefix_mask": torch.cat(self._prefix_mask_buffer, dim=0),
+                "logits": logits,
+                "prefix_mask": prefix_mask,
+                "metadata": {
+                    **self.metadata,
+                    "schema_version": STS_DATA_SHARD_SCHEMA_VERSION,
+                    "gamma": self.gamma,
+                    "num_samples": int(logits.shape[0]),
+                    "path_stem": self.path_stem,
+                    "shard_index": self._shard_ct,
+                },
             },
             shard_path,
         )
