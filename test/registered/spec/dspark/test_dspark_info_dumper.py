@@ -50,6 +50,14 @@ def make_obs(
     bs=4,
     num_verify_tokens=24,
     planned_num_verify_tokens=None,
+    target_verify_cuda_graph=False,
+    compact_verify=None,
+    proposal_folded=None,
+    fold_eligible=None,
+    folded_accept=None,
+    folded_commit=None,
+    folded_accept_reject_reason=None,
+    folded_commit_reject_reason=None,
     predicted_step_ms=None,
     predicted_theta=None,
 ):
@@ -66,7 +74,7 @@ def make_obs(
         verify_tokens_local=num_verify_tokens,
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
-        target_verify_cuda_graph=False,
+        target_verify_cuda_graph=target_verify_cuda_graph,
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
@@ -80,6 +88,13 @@ def make_obs(
         cap_trim_lens=torch.zeros((bs,), dtype=torch.int32),
         commit_lens=torch.full((bs,), 4, dtype=torch.int32),
         rids=[f"r{i}" for i in range(bs)],
+        compact_verify=compact_verify,
+        proposal_folded=proposal_folded,
+        fold_eligible=fold_eligible,
+        folded_accept=folded_accept,
+        folded_commit=folded_commit,
+        folded_accept_reject_reason=folded_accept_reject_reason,
+        folded_commit_reject_reason=folded_commit_reject_reason,
     )
 
 
@@ -172,6 +187,33 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["num_verify_tokens"], 18)
         self.assertEqual(record["planned_num_verify_tokens"], 18)
         self.assertEqual(record["mode"], "static")
+
+    def test_core_records_folded_path_diagnostics(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=True,
+                compact_verify=True,
+                proposal_folded=True,
+                fold_eligible=True,
+                folded_accept=True,
+                folded_commit=False,
+                folded_commit_reject_reason="pool_missing_fused_swa_commit",
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertTrue(record["target_verify_cuda_graph"])
+        self.assertTrue(record["compact_verify"])
+        self.assertTrue(record["proposal_folded"])
+        self.assertTrue(record["fold_eligible"])
+        self.assertTrue(record["folded_accept"])
+        self.assertFalse(record["folded_commit"])
+        self.assertNotIn("folded_accept_reject_reason", record)
+        self.assertEqual(
+            record["folded_commit_reject_reason"],
+            "pool_missing_fused_swa_commit",
+        )
 
     def test_core_fields_report_dry_run_planned_verify_tokens(self):
         dumper, _ = make_dumper({"core"})

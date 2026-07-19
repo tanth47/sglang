@@ -104,6 +104,13 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
     target_verify_cuda_graph: Optional[bool] = None
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
     budget_dry_run: bool = False
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
@@ -139,6 +146,13 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -160,6 +174,13 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
 
 
 class DsparkInfoDumper:
@@ -269,6 +290,13 @@ class DsparkInfoDumper:
             predicted_theta=obs.predicted_theta,
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
+            compact_verify=obs.compact_verify,
+            proposal_folded=obs.proposal_folded,
+            fold_eligible=obs.fold_eligible,
+            folded_accept=obs.folded_accept,
+            folded_commit=obs.folded_commit,
+            folded_accept_reject_reason=obs.folded_accept_reject_reason,
+            folded_commit_reject_reason=obs.folded_commit_reject_reason,
             future=future,
             segment_events=self._current_segments,
         )
@@ -366,6 +394,17 @@ class DsparkInfoDumper:
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.target_verify_cuda_graph = pending.target_verify_cuda_graph
+            record.compact_verify = pending.compact_verify
+            record.proposal_folded = pending.proposal_folded
+            record.fold_eligible = pending.fold_eligible
+            record.folded_accept = pending.folded_accept
+            record.folded_commit = pending.folded_commit
+            record.folded_accept_reject_reason = (
+                pending.folded_accept_reject_reason
+            )
+            record.folded_commit_reject_reason = (
+                pending.folded_commit_reject_reason
+            )
             record.budget_dry_run = pending.budget_dry_run
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
@@ -858,6 +897,12 @@ class DsparkStepObservers:
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
         target_verify_cuda_graph: bool,
+        compact_verify: bool,
+        fold_eligible: bool,
+        folded_accept: bool,
+        folded_commit: bool,
+        folded_accept_reject_reason: Optional[str],
+        folded_commit_reject_reason: Optional[str],
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -946,6 +991,13 @@ class DsparkStepObservers:
                     ),
                     verify_tokens_graph_key=num_verify_tokens,
                     target_verify_cuda_graph=target_verify_cuda_graph,
+                    compact_verify=compact_verify,
+                    proposal_folded=proposal_folded,
+                    fold_eligible=fold_eligible,
+                    folded_accept=folded_accept,
+                    folded_commit=folded_commit,
+                    folded_accept_reject_reason=folded_accept_reject_reason,
+                    folded_commit_reject_reason=folded_commit_reject_reason,
                     budget_dry_run=budget_dry_run,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,

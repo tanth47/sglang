@@ -39,19 +39,25 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
-def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+def verify_logits_adjustments_noop_reject_reason(sampling_info) -> Optional[str]:
     if sampling_info is None:
-        return True
+        return None
     if sampling_info.has_custom_logit_processor:
-        return False
+        return "custom_logit_processor"
     if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
+        return "acc_linear_penalties"
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
-        return False
+        return "penalizer_required"
     if getattr(sampling_info, "vocab_mask", None) is not None:
-        return False
+        return "vocab_mask"
     if getattr(sampling_info, "logit_bias", None) is not None:
+        return "logit_bias"
+    return None
+
+
+def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+    if verify_logits_adjustments_noop_reject_reason(sampling_info) is not None:
         return False
     return True
 
@@ -523,11 +529,19 @@ class DsparkVerifyEpilogue:
         )
 
     @property
-    def folds_commit(self) -> bool:
+    def commit_fold_reject_reason(self) -> Optional[str]:
         if self.commit_ctx is None:
-            return False
+            return "no_commit_context"
         pool = self.commit_ctx.resolve_pool()
-        return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            return "pool_missing_fused_swa_commit"
+        if getattr(pool, "full_to_swa_index_mapping", None) is None:
+            return "missing_full_to_swa_index_mapping"
+        return None
+
+    @property
+    def folds_commit(self) -> bool:
+        return self.commit_fold_reject_reason is None
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor
