@@ -924,7 +924,13 @@ class DsparkStepObservers:
                 None if budget_decision is None else budget_decision.predicted_theta
             )
             planned_num_verify_tokens = (
-                None if budget_decision is None else bs + int(budget_decision.budget)
+                None
+                if budget_decision is None
+                else (
+                    int(budget_decision.priced_num_verify_tokens)
+                    if budget_decision.priced_num_verify_tokens is not None
+                    else bs + int(budget_decision.budget)
+                )
             )
             num_verify_tokens = (
                 layout.graph_num_tokens
