@@ -3,11 +3,15 @@ import unittest
 import torch
 
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
     classify_dsa_target_verify_graph_regime,
+    classify_dsa_target_verify_graph_reject_reason,
     is_static_full_verify_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -139,6 +143,52 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
             dsa_index_topk=2048,
         )
         self.assertIsNone(regime)
+
+    def test_reject_reason_is_none_for_graphable_pre_topk(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[1000, 1200],
+            verify_lens_cpu=[8, 1],
+            dsa_index_topk=2048,
+        )
+        self.assertIsNone(reason)
+
+    def test_reject_reason_splits_post_topk_without_capture_contract(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[2112, 3000],
+            verify_lens_cpu=[1, 8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(reason, DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT)
+
+    def test_reject_reason_splits_post_topk_above_capture_contract(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[4097],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertEqual(reason, DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT)
+
+    def test_reject_reason_keeps_true_transition_separate(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[2044],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(reason, DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT)
+
+    def test_reject_reason_is_none_for_graphable_post_topk(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[2112],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertIsNone(reason)
 
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):

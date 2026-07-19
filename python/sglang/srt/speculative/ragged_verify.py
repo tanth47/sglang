@@ -18,6 +18,15 @@ class RaggedVerifyMode(str, Enum):
 
 DSA_TARGET_VERIFY_PRE_TOPK_GRAPH = "dsa_pre_topk"
 DSA_TARGET_VERIFY_POST_TOPK_GRAPH = "dsa_post_topk"
+DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT = (
+    "rocm_dsa_target_verify_index_topk_mixed_transition"
+)
+DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT = (
+    "rocm_dsa_target_verify_post_topk_no_capture_contract"
+)
+DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
+    "rocm_dsa_target_verify_post_topk_above_capture_contract"
+)
 
 
 def read_ragged_verify_mode() -> RaggedVerifyMode:
@@ -125,6 +134,53 @@ def classify_dsa_target_verify_graph_regime(
     ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
+
+
+def classify_dsa_target_verify_graph_reject_reason(
+    *,
+    seq_lens_cpu: Sequence[int],
+    verify_lens_cpu: Sequence[int],
+    dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
+) -> Optional[str]:
+    """Return a precise ROCm DSA target-verify graph reject reason.
+
+    ``classify_dsa_target_verify_graph_regime`` intentionally keeps the public
+    admission result compact: either a safe graph label or ``None``. For
+    observability and graph-admission fast-fail paths, split the ``None`` case
+    into mixed/transition windows versus fully post-topk windows that simply do
+    not have a validated capture contract yet.
+    """
+    regime = classify_dsa_target_verify_graph_regime(
+        seq_lens_cpu=seq_lens_cpu,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
+    )
+    if regime is not None or dsa_index_topk <= 0:
+        return None
+
+    windows = [
+        (int(seq_len), int(verify_len))
+        for seq_len, verify_len in zip(seq_lens_cpu, verify_lens_cpu, strict=True)
+        if int(verify_len) > 0
+    ]
+    if not windows:
+        return None
+
+    post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
+    fully_post_topk = all(
+        seq_len + 1 >= post_topk_graph_threshold for seq_len, _ in windows
+    )
+    if fully_post_topk:
+        if post_topk_capture_seq_len is None:
+            return DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
+        if any(seq_len > post_topk_capture_seq_len for seq_len, _ in windows):
+            return DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT
+
+    return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
 
 
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):

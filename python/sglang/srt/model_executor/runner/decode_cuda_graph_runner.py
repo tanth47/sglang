@@ -94,10 +94,12 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     build_ragged_verify_token_buckets,
     classify_dsa_target_verify_graph_regime,
+    classify_dsa_target_verify_graph_reject_reason,
     is_static_full_verify_layout,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
@@ -379,9 +381,17 @@ def dsa_target_verify_graph_debug_info(
         post_topk_guard_tokens=post_topk_guard_tokens,
         post_topk_capture_seq_len=post_topk_capture_seq_len,
     )
+    graph_reject_reason = classify_dsa_target_verify_graph_reject_reason(
+        seq_lens_cpu=seq_lens_cpu_list,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
+    )
     details = {
         "dsa_index_topk": int(dsa_index_topk),
         "graph_regime": graph_regime or "mixed_or_transition",
+        "graph_reject_reason": graph_reject_reason,
         "num_tokens_per_req": int(num_tokens_per_req),
         "post_topk_capture_seq_len": post_topk_capture_seq_len,
         "post_topk_guard_tokens": int(post_topk_guard_tokens),
@@ -829,13 +839,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.ragged_verify_mode
             else None
         )
-        ragged_layout = (
-            resolve_graph_ragged_verify_layout(
-                forward_batch, num_tokens_per_req=self.num_tokens_per_req
-            )
-            if raw_ragged_layout is not None
-            else None
-        )
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -867,17 +870,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else:
                     graph_regime = None
                 if raw_ragged_layout is not None and graph_regime is None:
+                    debug_info = dsa_target_verify_graph_debug_info(
+                        forward_batch,
+                        raw_ragged_layout,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                        post_topk_guard_tokens=post_topk_guard_tokens,
+                        post_topk_capture_seq_len=post_topk_capture_seq_len,
+                    )
+                    reject_reason = (
+                        debug_info.pop("graph_reject_reason", None)
+                        or DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
+                    )
                     self._log_graph_reject(
                         forward_batch,
-                        "rocm_dsa_target_verify_index_topk_mixed_transition",
-                        **dsa_target_verify_graph_debug_info(
-                            forward_batch,
-                            raw_ragged_layout,
-                            num_tokens_per_req=self.num_tokens_per_req,
-                            dsa_index_topk=int(dsa_index_topk),
-                            post_topk_guard_tokens=post_topk_guard_tokens,
-                            post_topk_capture_seq_len=post_topk_capture_seq_len,
-                        ),
+                        reject_reason,
+                        **debug_info,
                     )
                     return False
                 if raw_ragged_layout is None:
@@ -902,6 +910,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             post_topk_guard_tokens=post_topk_guard_tokens,
                         )
                         return False
+
+        ragged_layout = (
+            resolve_graph_ragged_verify_layout(
+                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+            )
+            if raw_ragged_layout is not None
+            else None
+        )
 
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
