@@ -203,6 +203,55 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         )
         self.assertGreater(decision.predicted_theta, 0.0)
 
+    def test_graph_tier_pricing_uses_rounded_batch_tokens(self):
+        survival = torch.ones((1, 7), dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=7)
+        table = SpsCostTable(
+            sample_batch_tokens=[1, 8],
+            sample_steps_per_sec=[1.0, 0.01],
+            max_batch_tokens=64,
+        )
+
+        unrounded = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+        )
+        rounded = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            budget_to_batch_tokens=lambda budget: 1 if budget == 0 else 8,
+        )
+
+        self.assertEqual(unrounded.budget, 6)
+        self.assertEqual(unrounded.priced_num_verify_tokens, None)
+        self.assertEqual(rounded.budget, 0)
+        self.assertEqual(rounded.priced_num_verify_tokens, 1)
+        self.assertGreater(unrounded.predicted_theta, rounded.predicted_theta)
+
+    def test_additive_graph_tier_pricing_uses_rounded_batch_tokens(self):
+        survival = torch.ones((1, 4), dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=4)
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.0,
+            bs_probes=[1, 16],
+            alpha_seconds=[0.0, 0.0],
+            m_probes=[1, 16],
+            theta_seconds=[0.001, 0.016],
+        )
+
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            budget_to_batch_tokens=lambda budget: 1 if budget == 0 else 8,
+        )
+
+        self.assertEqual(decision.budget, 0)
+        self.assertEqual(decision.priced_num_verify_tokens, 1)
+        self.assertAlmostEqual(decision.predicted_step_seconds, 0.001, places=9)
+
 
 def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     return HostConfidenceBudgetPlanner(
@@ -673,6 +722,27 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+    def test_planner_prices_budget_by_rounded_graph_tier(self):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = True
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._dynamic_graph_tier = True
+        planner.model_runner = _fake_model_runner([8, 16, 32], max_bs=8)
+        planner.verify_num_draft_tokens = 8
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7, min_verify_len=1)
+
+        budget_to_batch_tokens = planner._graph_tier_budget_to_batch_tokens(
+            num_reqs=4
+        )
+
+        self.assertIsNotNone(budget_to_batch_tokens)
+        self.assertEqual(budget_to_batch_tokens(0), 8)
+        self.assertEqual(budget_to_batch_tokens(4), 8)
+        self.assertEqual(budget_to_batch_tokens(5), 16)
+        self.assertEqual(budget_to_batch_tokens(28), 32)
 
 
 if __name__ == "__main__":

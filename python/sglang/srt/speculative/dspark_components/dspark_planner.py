@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import msgspec
 import torch
@@ -448,6 +448,9 @@ class DSparkVerifyPlanner:
                 generation=resolved.generation,
                 current_generation=current_generation,
                 req_pool_indices_cpu=req_pool_indices_cpu,
+                budget_to_batch_tokens=self._graph_tier_budget_to_batch_tokens(
+                    num_reqs=int(req_pool_indices_cpu.numel())
+                ),
             )
         )
 
@@ -611,6 +614,44 @@ class DSparkVerifyPlanner:
         floor = max(self._schedule_cfg.min_verify_len, 1)
         adjusted_budget = max(0, int(adjusted.to(torch.int64).sum().item()) - floor)
         return adjusted, adjusted_budget
+
+    def _graph_tier_budget_to_batch_tokens(
+        self, *, num_reqs: int
+    ) -> Optional[BudgetToBatchTokensFn]:
+        if (
+            not self._align_verify_tokens_to_graph_tier
+            or self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            or not self._dynamic_graph_tier
+        ):
+            return None
+        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if capture_num_tokens is None:
+            return None
+        num_reqs = int(num_reqs)
+        verify_num_draft_tokens = int(self.verify_num_draft_tokens)
+        min_verify_len = int(self._schedule_cfg.min_verify_len)
+
+        def budget_to_batch_tokens(budget: int) -> int:
+            tier_num_tokens = local_verify_tier_num_tokens(
+                bs=num_reqs,
+                verify_token_budget=int(budget),
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                min_verify_len=min_verify_len,
+            )
+            graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
+                num_reqs=num_reqs,
+                ragged_verify_mode=self._ragged_verify_mode,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                model_runner=self.model_runner,
+                tier_num_tokens=tier_num_tokens,
+            )
+            if graph_num_tokens_floor <= 0:
+                return max(num_reqs, int(tier_num_tokens))
+            if graph_num_tokens_floor > capture_num_tokens[-1]:
+                return int(graph_num_tokens_floor)
+            return int(round_up_grid(graph_num_tokens_floor, capture_num_tokens))
+
+        return budget_to_batch_tokens
 
     def _budget_aligned_to_graph_tier(
         self,
@@ -1116,7 +1157,11 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    priced_num_verify_tokens: Optional[int] = None
     dry_run: bool = False
+
+
+BudgetToBatchTokensFn = Callable[[int], int]
 
 
 def compute_verify_token_budget(
@@ -1124,6 +1169,7 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
+    budget_to_batch_tokens: Optional[BudgetToBatchTokensFn] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -1136,17 +1182,22 @@ def compute_verify_token_budget(
     tau_star = num_requests + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+    batch_tokens = _budget_batch_tokens(
+        num_requests=int(num_requests),
+        num_budgets=int(tau_star.numel()),
+        budget_to_batch_tokens=budget_to_batch_tokens,
+    )
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
             num_budgets=int(tau_star.numel()),
+            batch_tokens=batch_tokens,
         )
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
         theta = tau_star * sps
         idx = int(torch.argmax(theta))
@@ -1166,6 +1217,23 @@ def compute_verify_token_budget(
         budget=idx,
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
+        priced_num_verify_tokens=(
+            None if budget_to_batch_tokens is None else int(batch_tokens[idx].item())
+        ),
+    )
+
+
+def _budget_batch_tokens(
+    *,
+    num_requests: int,
+    num_budgets: int,
+    budget_to_batch_tokens: Optional[BudgetToBatchTokensFn],
+) -> torch.Tensor:
+    if budget_to_batch_tokens is None:
+        return int(num_requests) + torch.arange(num_budgets, dtype=torch.int64)
+    return torch.tensor(
+        [int(budget_to_batch_tokens(budget)) for budget in range(num_budgets)],
+        dtype=torch.int64,
     )
 
 
@@ -1180,16 +1248,22 @@ def _lookup_sps_tensor(
 
 
 def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    num_budgets: int,
+    batch_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
     m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
     theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
-        min=float(table.m_probes[0]), max=float(table.m_probes[-1])
-    )
+    if batch_tokens is None:
+        m = num_requests + torch.arange(num_budgets, dtype=torch.float64)
+    else:
+        m = batch_tokens.to(torch.float64)
+    m = m.clamp_(min=float(table.m_probes[0]), max=float(table.m_probes[-1]))
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
     lo = hi - 1
     span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
@@ -1231,6 +1305,7 @@ class HostConfidenceBudgetPlanner:
         generation: torch.Tensor,
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
+        budget_to_batch_tokens: Optional[BudgetToBatchTokensFn] = None,
     ) -> int:
         lagged_confidence, lagged_generation = self._shift_to_lag(
             confidence=confidence,
@@ -1261,12 +1336,14 @@ class HostConfidenceBudgetPlanner:
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
+            budget_to_batch_tokens=budget_to_batch_tokens,
         )
         if self.cfg.sps_dry_run:
             self.last_decision = VerifyBudgetDecision(
                 budget=decision.budget,
                 predicted_step_seconds=decision.predicted_step_seconds,
                 predicted_theta=decision.predicted_theta,
+                priced_num_verify_tokens=decision.priced_num_verify_tokens,
                 dry_run=True,
             )
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
