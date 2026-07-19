@@ -54,7 +54,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_noop_reject_reason,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
-            and is_cuda()
+            and (is_cuda() or is_hip())
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
