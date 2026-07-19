@@ -702,7 +702,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
-    def _dsa_target_verify_graph_extra_labels(self) -> list[Optional[str]]:
+    def _dsa_target_verify_post_topk_graph_enabled_for_bs(self, bs: int) -> bool:
+        if not envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get():
+            return False
+        max_safe_bs = (
+            envs.SGLANG_DSA_TARGET_VERIFY_GRAPH_TOPK_TRANSITION_MAX_SAFE_BS.get()
+        )
+        return max_safe_bs > 0 and int(bs) <= int(max_safe_bs)
+
+    def _dsa_target_verify_graph_extra_labels(self, bs: int) -> list[Optional[str]]:
         if not (
             self.ragged_verify_mode
             and self.capture_forward_mode.is_target_verify()
@@ -714,7 +722,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # TODO(GLM/ROCm DSA): this is an experimental, test-only contract for
         # validating post-topk target-verify graph replay on MI350. Keep it
         # opt-in until long-context post-topk replay is proven stable.
-        if not envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get():
+        if not self._dsa_target_verify_post_topk_graph_enabled_for_bs(bs):
             return [None]
         if self._dsa_target_verify_post_topk_capture_seq_len() is None:
             return [None]
@@ -770,7 +778,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_topk_capture_seq_len=(
                 self._dsa_target_verify_post_topk_capture_seq_len()
-                if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                if self._dsa_target_verify_post_topk_graph_enabled_for_bs(
+                    forward_batch.batch_size
+                )
                 else None
             ),
         )
@@ -865,7 +875,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 post_topk_capture_seq_len = (
                     self._dsa_target_verify_post_topk_capture_seq_len()
-                    if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                    if self._dsa_target_verify_post_topk_graph_enabled_for_bs(
+                        forward_batch.batch_size
+                    )
                     else None
                 )
                 if raw_ragged_layout is not None:
@@ -1427,7 +1439,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{avail_mem=:.2f} GB)"
                 )
 
-            for extra_label in self._dsa_target_verify_graph_extra_labels():
+            for extra_label in self._dsa_target_verify_graph_extra_labels(bs):
                 for variant_label, _variant_has_lora in lora_variants:
                     _set_capture_lora_variant(variant_label)
                     with torch_compile_decoration.patch_model(
