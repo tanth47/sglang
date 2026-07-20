@@ -11,10 +11,12 @@ from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
+    DsaTargetVerifyGraphGroup,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
     classify_dsa_target_verify_graph_regime,
     classify_dsa_target_verify_graph_reject_reason,
+    group_dsa_target_verify_graph_regions,
     is_static_full_verify_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -220,6 +222,85 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
             post_topk_guard_tokens=64,
         )
         self.assertEqual(reason, DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT)
+
+    def test_graph_region_grouping_splits_mixed_batch(self):
+        groups = group_dsa_target_verify_graph_regions(
+            seq_lens_cpu=[1000, 3000],
+            verify_lens_cpu=[8, 8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(
+            groups,
+            [
+                DsaTargetVerifyGraphGroup(
+                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+                ),
+                DsaTargetVerifyGraphGroup(
+                    indices=(1,),
+                    reject_reason=DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
+                ),
+            ],
+        )
+
+    def test_graph_region_grouping_keeps_original_indices(self):
+        groups = group_dsa_target_verify_graph_regions(
+            seq_lens_cpu=[3000, 1000, 2044, 1200],
+            verify_lens_cpu=[8, 8, 8, 1],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(
+            groups,
+            [
+                DsaTargetVerifyGraphGroup(
+                    indices=(1, 3), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+                ),
+                DsaTargetVerifyGraphGroup(
+                    indices=(0,),
+                    reject_reason=DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
+                ),
+                DsaTargetVerifyGraphGroup(
+                    indices=(2,),
+                    reject_reason=DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
+                ),
+            ],
+        )
+
+    def test_graph_region_grouping_allows_post_topk_capture_contract(self):
+        groups = group_dsa_target_verify_graph_regions(
+            seq_lens_cpu=[4096, 1000],
+            verify_lens_cpu=[8, 8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertEqual(
+            groups,
+            [
+                DsaTargetVerifyGraphGroup(
+                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_POST_TOPK_GRAPH
+                ),
+                DsaTargetVerifyGraphGroup(
+                    indices=(1,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+                ),
+            ],
+        )
+
+    def test_graph_region_grouping_ignores_zero_verify_padding(self):
+        groups = group_dsa_target_verify_graph_regions(
+            seq_lens_cpu=[1000, 1],
+            verify_lens_cpu=[8, 0],
+            dsa_index_topk=2048,
+        )
+        self.assertEqual(
+            groups,
+            [
+                DsaTargetVerifyGraphGroup(
+                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+                )
+            ],
+        )
 
     def test_reject_reason_is_none_for_graphable_post_topk(self):
         reason = classify_dsa_target_verify_graph_reject_reason(

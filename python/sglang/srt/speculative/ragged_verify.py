@@ -38,6 +38,12 @@ DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
 )
 
 
+class DsaTargetVerifyGraphGroup(msgspec.Struct, frozen=True):
+    indices: Tuple[int, ...]
+    graph_regime: Optional[str] = None
+    reject_reason: Optional[str] = None
+
+
 def read_ragged_verify_mode() -> RaggedVerifyMode:
     value = envs.SGLANG_RAGGED_VERIFY_MODE.get()
     for mode in RaggedVerifyMode:
@@ -204,6 +210,63 @@ def classify_dsa_target_verify_graph_reject_reason(
     if any_pre_topk and any_post_topk:
         return DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
     return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
+
+
+def group_dsa_target_verify_graph_regions(
+    *,
+    seq_lens_cpu: Sequence[int],
+    verify_lens_cpu: Sequence[int],
+    dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
+) -> list[DsaTargetVerifyGraphGroup]:
+    """Group request indices by DSA target-verify graph compatibility.
+
+    This is the scheduler/executor-side primitive for the next GLM/ROCm DSA
+    coverage step: graph-compatible requests can be replayed together, while
+    unsupported transition/post-topk requests stay on eager fallback and get
+    scattered back to the original request order by the caller.
+    """
+    graph_groups: dict[str, list[int]] = {}
+    eager_groups: dict[str, list[int]] = {}
+
+    for idx, (seq_len, verify_len) in enumerate(
+        zip(seq_lens_cpu, verify_lens_cpu, strict=True)
+    ):
+        seq_len = int(seq_len)
+        verify_len = int(verify_len)
+        if verify_len <= 0:
+            continue
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[seq_len],
+            verify_lens_cpu=[verify_len],
+            dsa_index_topk=dsa_index_topk,
+            post_topk_guard_tokens=post_topk_guard_tokens,
+            post_topk_capture_seq_len=post_topk_capture_seq_len,
+        )
+        if regime is not None:
+            graph_groups.setdefault(regime, []).append(idx)
+            continue
+
+        reject_reason = (
+            classify_dsa_target_verify_graph_reject_reason(
+                seq_lens_cpu=[seq_len],
+                verify_lens_cpu=[verify_len],
+                dsa_index_topk=dsa_index_topk,
+                post_topk_guard_tokens=post_topk_guard_tokens,
+                post_topk_capture_seq_len=post_topk_capture_seq_len,
+            )
+            or DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
+        )
+        eager_groups.setdefault(reject_reason, []).append(idx)
+
+    return [
+        DsaTargetVerifyGraphGroup(indices=tuple(indices), graph_regime=regime)
+        for regime, indices in graph_groups.items()
+    ] + [
+        DsaTargetVerifyGraphGroup(indices=tuple(indices), reject_reason=reason)
+        for reason, indices in eager_groups.items()
+    ]
 
 
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
