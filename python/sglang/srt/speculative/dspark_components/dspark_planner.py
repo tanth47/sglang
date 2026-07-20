@@ -202,10 +202,19 @@ class DSparkVerifyPlanner:
                 if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
                     sps_table
                 ):
+                    verify_budget_note = (
+                        "the verify budget degenerates to verify-all "
+                        "(zero scheduling gain)"
+                    )
+                    if self._align_verify_tokens_to_graph_tier:
+                        verify_budget_note += (
+                            ", except for conservative graph-safety caps near "
+                            "backend-specific attention boundaries"
+                        )
                     logger.warning(
-                        "DSpark SPS table is uninitialized (flat): the verify "
-                        "budget degenerates to verify-all (zero scheduling gain). "
-                        "Pass a profiled --speculative-dspark-sps-table-path."
+                        "DSpark SPS table is uninitialized (flat): %s. Pass a "
+                        "profiled --speculative-dspark-sps-table-path.",
+                        verify_budget_note,
                     )
 
     def _require_prep_in_cuda_graph(self) -> None:
@@ -490,6 +499,14 @@ class DSparkVerifyPlanner:
                 "the gathered hint and the local budget diverged"
             )
             if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+                graph_safe_layout = self._rocm_dsa_graph_safe_uniform_layout(
+                    prefix_lens=prefix_lens,
+                    device=device,
+                    global_num_reqs=global_num_reqs,
+                    dp_tier_num_tokens=dp_tier_num_tokens,
+                )
+                if graph_safe_layout is not None:
+                    return graph_safe_layout
                 return uniform_ragged_layout(
                     bs=len(req_pool_indices),
                     device=device,
@@ -549,7 +566,7 @@ class DSparkVerifyPlanner:
             graph_num_tokens_floor=graph_num_tokens_floor,
         )
 
-    def _uses_rocm_dsa_graph_safe_sps_policy(
+    def _uses_rocm_dsa_graph_safe_policy(
         self, *, dp_tier_num_tokens: Optional[int]
     ) -> bool:
         if (
@@ -566,6 +583,53 @@ class DSparkVerifyPlanner:
             and ragged_capture_num_tokens(model_runner=self.model_runner) is not None
         )
 
+    def _rocm_dsa_graph_safe_uniform_layout(
+        self,
+        *,
+        prefix_lens: torch.Tensor,
+        device: torch.device,
+        global_num_reqs: Optional[int],
+        dp_tier_num_tokens: Optional[int],
+    ) -> Optional[RaggedVerifyLayout]:
+        if not self._uses_rocm_dsa_graph_safe_policy(
+            dp_tier_num_tokens=dp_tier_num_tokens
+        ):
+            return None
+        tier_num_reqs = (
+            int(prefix_lens.shape[0])
+            if global_num_reqs is None
+            else int(global_num_reqs)
+        )
+        if tier_num_reqs != 1:
+            # TODO(GLM/ROCm DSA): Handle mixed pre/post-topk request batches with a
+            # DeepSeek-style grouped target-verify replay path instead of forcing a
+            # single graph contract across incompatible attention regions.
+            return None
+        seq_lens_cpu = [int(x) for x in prefix_lens.detach().cpu().tolist()]
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        dsa_index_topk = int(getattr(attn_backend, "dsa_index_topk"))
+        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if capture_num_tokens is None:
+            return None
+        verify_lens_cpu = rocm_dsa_graph_safe_sps_verify_len_caps(
+            seq_lens_cpu=seq_lens_cpu,
+            tier_num_reqs=tier_num_reqs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+            dsa_index_topk=dsa_index_topk,
+            capture_num_tokens=capture_num_tokens,
+        )
+        if verify_lens_cpu is None or verify_lens_cpu == [
+            self.verify_num_draft_tokens
+        ]:
+            return None
+        return RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens_cpu,
+            device=device,
+            grid=capture_num_tokens,
+            graph_num_tokens_floor=sum(verify_lens_cpu),
+        )
+
     def _adjust_rocm_dsa_graph_safe_sps_layout(
         self,
         *,
@@ -578,7 +642,7 @@ class DSparkVerifyPlanner:
         if (
             verify_lens is None
             or budget is None
-            or not self._uses_rocm_dsa_graph_safe_sps_policy(
+            or not self._uses_rocm_dsa_graph_safe_policy(
                 dp_tier_num_tokens=dp_tier_num_tokens
             )
         ):
@@ -599,6 +663,9 @@ class DSparkVerifyPlanner:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             min_verify_len=self._schedule_cfg.min_verify_len,
             dsa_index_topk=dsa_index_topk,
+            capture_num_tokens=ragged_capture_num_tokens(
+                model_runner=self.model_runner
+            ),
         )
         if caps is None:
             return verify_lens, budget
@@ -804,6 +871,7 @@ def rocm_dsa_graph_safe_sps_verify_len_caps(
     verify_num_draft_tokens: int,
     min_verify_len: int = 1,
     dsa_index_topk: int,
+    capture_num_tokens: Optional[list[int]] = None,
 ) -> Optional[list[int]]:
     if int(tier_num_reqs) != 1 or len(seq_lens_cpu) != 1:
         return None
@@ -811,7 +879,21 @@ def rocm_dsa_graph_safe_sps_verify_len_caps(
     floor = max(int(min_verify_len), 1)
     if max_pre_topk_len < floor:
         return None
-    return [min(int(verify_num_draft_tokens), max_pre_topk_len)]
+    caps = [min(int(verify_num_draft_tokens), max_pre_topk_len)]
+    graph_num_tokens = sum(caps)
+    if capture_num_tokens is not None and graph_num_tokens not in {
+        int(x) for x in capture_num_tokens
+    }:
+        return None
+    if not rocm_dsa_target_verify_layout_graph_safe(
+        seq_lens_cpu=seq_lens_cpu,
+        verify_lens_cpu=caps,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        graph_num_tokens=graph_num_tokens,
+        dsa_index_topk=dsa_index_topk,
+    ):
+        return None
+    return caps
 
 
 def rocm_dsa_should_compute_confidence_for_graph_safe_sps(
