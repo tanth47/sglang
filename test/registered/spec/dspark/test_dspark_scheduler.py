@@ -531,6 +531,17 @@ class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
             )
         )
 
+    def test_mixed_transition_exact_compact_layout_is_not_graph_safe(self):
+        self.assertFalse(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[2044],
+                verify_lens_cpu=[4],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=4,
+                dsa_index_topk=2048,
+            )
+        )
+
     def test_graph_safe_sps_caps_single_request_before_topk(self):
         self.assertEqual(
             rocm_dsa_graph_safe_sps_verify_len_caps(

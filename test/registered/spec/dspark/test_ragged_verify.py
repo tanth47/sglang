@@ -220,6 +220,20 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertIsNone(reason)
 
+    def test_post_topk_capture_contract_does_not_admit_mixed_transition(self):
+        kwargs = dict(
+            seq_lens_cpu=[4096, 2044],
+            verify_lens_cpu=[3, 4],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+            post_topk_capture_seq_len=4096,
+        )
+        self.assertIsNone(classify_dsa_target_verify_graph_regime(**kwargs))
+        self.assertEqual(
+            classify_dsa_target_verify_graph_reject_reason(**kwargs),
+            DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
+        )
+
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
     def test_padded_layout_grows_bs_and_fills_bucket(self):

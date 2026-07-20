@@ -219,6 +219,7 @@ logger = logging.getLogger(__name__)
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    cuda_graph_reject_reason: Optional[str] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -1296,11 +1297,18 @@ class ModelRunner:
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
-            can_run_graph = bool(
-                mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
-            )
+            cuda_graph_reject_reason = None
+            if mode_check() and self.decode_cuda_graph_runner:
+                can_run_graph = bool(
+                    self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                )
+                cuda_graph_reject_reason = getattr(
+                    self.decode_cuda_graph_runner,
+                    "last_graph_reject_reason",
+                    None,
+                )
+            else:
+                can_run_graph = False
 
             if (
                 forward_batch.forward_mode.is_decode()
@@ -1316,7 +1324,11 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    cuda_graph_reject_reason=cuda_graph_reject_reason,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -1376,7 +1388,11 @@ class ModelRunner:
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                cuda_graph_reject_reason=cuda_graph_reject_reason,
+            )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

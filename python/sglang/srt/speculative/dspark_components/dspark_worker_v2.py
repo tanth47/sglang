@@ -646,6 +646,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        cuda_graph_reject_reason = target_verify.cuda_graph_reject_reason
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
@@ -728,6 +729,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=dp_tier_num_tokens,
             target_verify_cuda_graph=can_run_cuda_graph,
+            target_verify_cuda_graph_reject_reason=cuda_graph_reject_reason,
             compact_verify=run_compact,
             fold_eligible=fold_eligible,
             folded_accept=folded_accept,

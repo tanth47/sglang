@@ -51,6 +51,7 @@ def make_obs(
     num_verify_tokens=24,
     planned_num_verify_tokens=None,
     target_verify_cuda_graph=False,
+    target_verify_cuda_graph_reject_reason=None,
     compact_verify=None,
     proposal_folded=None,
     fold_eligible=None,
@@ -75,6 +76,9 @@ def make_obs(
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
         target_verify_cuda_graph=target_verify_cuda_graph,
+        target_verify_cuda_graph_reject_reason=(
+            target_verify_cuda_graph_reject_reason
+        ),
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
@@ -213,6 +217,24 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(
             record["folded_commit_reject_reason"],
             "pool_missing_fused_swa_commit",
+        )
+
+    def test_core_records_target_verify_graph_reject_reason(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=False,
+                target_verify_cuda_graph_reject_reason=(
+                    "rocm_dsa_target_verify_index_topk_mixed_transition"
+                ),
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertFalse(record["target_verify_cuda_graph"])
+        self.assertEqual(
+            record["target_verify_cuda_graph_reject_reason"],
+            "rocm_dsa_target_verify_index_topk_mixed_transition",
         )
 
     def test_core_fields_report_dry_run_planned_verify_tokens(self):
