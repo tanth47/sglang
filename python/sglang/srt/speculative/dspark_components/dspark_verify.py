@@ -397,21 +397,20 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
-    ) -> None:
+    ) -> str:
         if run_compact:
-            self.kv_injector.inject_ragged(
+            return self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
             )
-            return
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
-        self.kv_injector.inject_target_hidden(
+        return self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_window.verify_cache_loc,
             cache_loc_2d=verify_window.verify_cache_loc_2d,

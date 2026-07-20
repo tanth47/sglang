@@ -114,6 +114,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     folded_accept_reject_reason: Optional[str] = None
     folded_commit_reject_reason: Optional[str] = None
     commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
     budget_dry_run: bool = False
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
@@ -157,6 +158,7 @@ class DecodeStepObservation(msgspec.Struct):
     folded_accept_reject_reason: Optional[str] = None
     folded_commit_reject_reason: Optional[str] = None
     commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
     target_verify_cuda_graph_reject_details: Optional[dict] = None
 
@@ -188,6 +190,7 @@ class _PendingStep(msgspec.Struct):
     folded_accept_reject_reason: Optional[str] = None
     folded_commit_reject_reason: Optional[str] = None
     commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
     target_verify_cuda_graph_reject_details: Optional[dict] = None
 
@@ -315,6 +318,7 @@ class DsparkInfoDumper:
             commit_fold_capability_reject_reason=(
                 obs.commit_fold_capability_reject_reason
             ),
+            commit_inject_path=obs.commit_inject_path,
             future=future,
             segment_events=self._current_segments,
         )
@@ -432,6 +436,7 @@ class DsparkInfoDumper:
             record.commit_fold_capability_reject_reason = (
                 pending.commit_fold_capability_reject_reason
             )
+            record.commit_inject_path = pending.commit_inject_path
             record.budget_dry_run = pending.budget_dry_run
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
@@ -933,6 +938,7 @@ class DsparkStepObservers:
         folded_accept_reject_reason: Optional[str],
         folded_commit_reject_reason: Optional[str],
         commit_fold_capability_reject_reason: Optional[str],
+        commit_inject_path: Optional[str],
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -1037,6 +1043,7 @@ class DsparkStepObservers:
                     commit_fold_capability_reject_reason=(
                         commit_fold_capability_reject_reason
                     ),
+                    commit_inject_path=commit_inject_path,
                     budget_dry_run=budget_dry_run,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,

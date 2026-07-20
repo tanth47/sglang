@@ -61,6 +61,7 @@ def make_obs(
     folded_accept_reject_reason=None,
     folded_commit_reject_reason=None,
     commit_fold_capability_reject_reason=None,
+    commit_inject_path=None,
     predicted_step_ms=None,
     predicted_theta=None,
 ):
@@ -107,6 +108,7 @@ def make_obs(
         commit_fold_capability_reject_reason=(
             commit_fold_capability_reject_reason
         ),
+        commit_inject_path=commit_inject_path,
     )
 
 
@@ -215,6 +217,7 @@ class TestCoreAndCpuTiming(CustomTestCase):
                 commit_fold_capability_reject_reason=(
                     "pool_missing_fused_swa_commit"
                 ),
+                commit_inject_path="generic_prefix_valid",
             )
         )
         record = dumper.dump()["records"][0]
@@ -233,6 +236,7 @@ class TestCoreAndCpuTiming(CustomTestCase):
             record["commit_fold_capability_reject_reason"],
             "pool_missing_fused_swa_commit",
         )
+        self.assertEqual(record["commit_inject_path"], "generic_prefix_valid")
 
     def test_core_separates_commit_step_reject_from_capability_reject(self):
         dumper, _ = make_dumper({"core"})
@@ -249,6 +253,7 @@ class TestCoreAndCpuTiming(CustomTestCase):
                 commit_fold_capability_reject_reason=(
                     "pool_missing_fused_swa_commit"
                 ),
+                commit_inject_path="generic_prefix_valid",
             )
         )
         record = dumper.dump()["records"][0]
@@ -259,6 +264,25 @@ class TestCoreAndCpuTiming(CustomTestCase):
             record["commit_fold_capability_reject_reason"],
             "pool_missing_fused_swa_commit",
         )
+        self.assertEqual(record["commit_inject_path"], "generic_prefix_valid")
+
+    def test_core_records_folded_commit_inject_path(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=True,
+                compact_verify=True,
+                proposal_folded=True,
+                fold_eligible=True,
+                folded_accept=True,
+                folded_commit=True,
+                commit_inject_path="folded_graph",
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertTrue(record["folded_commit"])
+        self.assertEqual(record["commit_inject_path"], "folded_graph")
 
     def test_core_records_target_verify_graph_reject_reason(self):
         dumper, _ = make_dumper({"core"})

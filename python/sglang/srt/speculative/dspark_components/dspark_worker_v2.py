@@ -719,8 +719,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_fold_reject_reason=commit_fold_reject_reason,
             commit_fold_allowed=can_run_cuda_graph,
         )
+        commit_inject_path = "folded_graph" if folded_commit else None
         if not folded_commit:
-            self._verify_executor.commit_hidden(
+            commit_inject_path = self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
@@ -763,6 +764,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             folded_accept_reject_reason=folded_accept_reject_reason,
             folded_commit_reject_reason=folded_commit_reject_reason,
             commit_fold_capability_reject_reason=commit_fold_reject_reason,
+            commit_inject_path=commit_inject_path,
         )
 
         next_draft_input = make_next_draft_input(
