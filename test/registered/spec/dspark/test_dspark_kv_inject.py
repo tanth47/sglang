@@ -7,8 +7,11 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    CommitInjectCtx,
+    DsparkVerifyEpilogue,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -19,6 +22,37 @@ class FakeDraftModel:
 
     def write_target_hidden_kv(self, **kwargs):
         self.calls.append(kwargs)
+
+
+class FakeGenericDraftModel:
+    def __init__(self):
+        self.calls = []
+
+    def write_target_hidden_kv(
+        self,
+        *,
+        target_hidden,
+        pool,
+        positions,
+        cache_loc,
+        cache_loc_2d=None,
+        commit_lens=None,
+    ):
+        self.calls.append(
+            dict(
+                target_hidden=target_hidden,
+                pool=pool,
+                positions=positions,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+            )
+        )
+
+
+class FakeGenericPool:
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise AssertionError("The fake draft model should receive the pool.")
 
 
 class FakeFusedPool:
@@ -45,7 +79,7 @@ def make_injector(*, draft_model, pool, req_to_token=None, stride=3):
     )
 
 
-class TestTargetHiddenKvInjector(CustomTestCase):
+class TestTargetHiddenKvInjector(unittest.TestCase):
     def test_generic_target_hidden_path_forwards_commit_lens(self):
         draft_model = FakeDraftModel()
         pool = object()
@@ -133,6 +167,62 @@ class TestTargetHiddenKvInjector(CustomTestCase):
         torch.testing.assert_close(call["main_hidden"], hidden_strided)
         torch.testing.assert_close(call["positions"], expected_positions)
         torch.testing.assert_close(call["swa_loc"], expected_swa_loc)
+
+    def test_epilogue_generic_folded_commit_uses_prefix_valid_layout(self):
+        stride = 3
+        draft_model = FakeGenericDraftModel()
+        pool = FakeGenericPool()
+        req_to_token = torch.stack(
+            [
+                torch.arange(0, 10, dtype=torch.int64),
+                torch.arange(10, 20, dtype=torch.int64),
+            ]
+        )
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=2,
+            verify_num_draft_tokens=stride,
+            device=torch.device("cpu"),
+            commit_ctx=CommitInjectCtx(
+                draft_model=draft_model,
+                block_pos_offsets=torch.arange(stride, dtype=torch.int64),
+                resolve_pool=lambda: pool,
+                resolve_req_to_token=lambda: req_to_token,
+            ),
+        )
+        self.assertTrue(epilogue.folds_commit)
+        self.assertIsNone(epilogue.commit_fold_reject_reason)
+
+        hidden = torch.arange(12, dtype=torch.float32).view(6, 2)
+        commit_lens = torch.tensor([2, 0], dtype=torch.int32)
+        verify_lens = torch.tensor([3, 3], dtype=torch.int64)
+        seq_lens = torch.tensor([2, 4], dtype=torch.int64)
+        req_pool_indices = torch.tensor([1, 0], dtype=torch.int64)
+        epilogue.strided_hidden = hidden
+        epilogue.inject_gate_buf.fill_(1)
+
+        epilogue._commit_inject(
+            commit_lens=commit_lens,
+            verify_lens=verify_lens,
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            bs=2,
+        )
+
+        self.assertEqual(len(draft_model.calls), 1)
+        call = draft_model.calls[0]
+        self.assertIs(call["pool"], pool)
+        torch.testing.assert_close(call["target_hidden"], hidden)
+        torch.testing.assert_close(
+            call["cache_loc_2d"],
+            torch.tensor([[12, 13, 14], [4, 5, 6]], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            call["cache_loc"], torch.tensor([12, 13, 14, 4, 5, 6], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            call["positions"], torch.tensor([2, 3, 4, 4, 5, 6], dtype=torch.int64)
+        )
+        torch.testing.assert_close(call["commit_lens"], commit_lens)
 
 
 if __name__ == "__main__":

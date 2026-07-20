@@ -1,19 +1,15 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -50,6 +46,11 @@ from sglang.srt.speculative.ragged_verify import (
     scatter_grouped_strided_rows,
 )
 from sglang.srt.utils import is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+    from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 
 
 def _rocm_dsa_target_verify_post_topk_graph_guard_tokens(
@@ -347,6 +348,10 @@ class TargetVerifyExecutor:
         )
 
         if sampling_info is not None:
+            from sglang.srt.speculative.dflash_utils import (
+                apply_dflash_verify_logits_adjustments,
+            )
+
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -897,6 +902,16 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_req_to_token: object
 
 
+def _callable_accepts_keyword(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+
+
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -949,6 +964,8 @@ class DsparkVerifyEpilogue:
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
             return
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
@@ -986,14 +1003,42 @@ class DsparkVerifyEpilogue:
 
     @property
     def commit_fold_reject_reason(self) -> Optional[str]:
+        _kind, reason = self._commit_fold_kind_and_reject_reason()
+        return reason
+
+    def _commit_fold_kind_and_reject_reason(self) -> tuple[Optional[str], Optional[str]]:
         if self.commit_ctx is None:
-            return "no_commit_context"
+            return None, "no_commit_context"
+        writer = getattr(self.commit_ctx.draft_model, "write_target_hidden_kv", None)
+        if writer is None:
+            return None, "missing_draft_commit_writer"
         pool = self.commit_ctx.resolve_pool()
-        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            return "pool_missing_fused_swa_commit"
-        if getattr(pool, "full_to_swa_index_mapping", None) is None:
-            return "missing_full_to_swa_index_mapping"
-        return None
+        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            if getattr(pool, "full_to_swa_index_mapping", None) is None:
+                return None, "missing_full_to_swa_index_mapping"
+            if not all(
+                _callable_accepts_keyword(writer, name)
+                for name in ("main_hidden", "swa_loc", "positions", "pool")
+            ):
+                return None, "draft_writer_missing_swa_commit_signature"
+            return "swa_fused", None
+
+        if hasattr(pool, "set_kv_buffer_prefix_valid"):
+            if not all(
+                _callable_accepts_keyword(writer, name)
+                for name in (
+                    "target_hidden",
+                    "cache_loc",
+                    "cache_loc_2d",
+                    "positions",
+                    "commit_lens",
+                    "pool",
+                )
+            ):
+                return None, "draft_writer_missing_prefix_valid_commit_signature"
+            return "generic_prefix_valid", None
+
+        return None, "pool_missing_fused_swa_commit"
 
     @property
     def folds_commit(self) -> bool:
@@ -1097,24 +1142,49 @@ class DsparkVerifyEpilogue:
     ) -> None:
         ctx = self.commit_ctx
         pool = ctx.resolve_pool()
+        commit_kind, reject_reason = self._commit_fold_kind_and_reject_reason()
+        if reject_reason is not None:
+            return
         gated_commit_lens = (
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
+        if commit_kind == "swa_fused":
+            inject_layout = BuildCommitInjectLayout.execute(
+                req_pool_indices=req_pool_indices,
+                req_to_token=ctx.resolve_req_to_token(),
+                prefix_lens=seq_lens[:bs],
+                block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                commit_lens=gated_commit_lens,
+                stride=self.stride,
+            )
+            with torch.inference_mode():
+                ctx.draft_model.write_target_hidden_kv(
+                    main_hidden=self.strided_hidden[: bs * self.stride],
+                    swa_loc=inject_layout.swa_loc,
+                    positions=inject_layout.positions,
+                    pool=pool,
+                )
+            return
+
         inject_layout = BuildCommitInjectLayout.execute(
             req_pool_indices=req_pool_indices,
             req_to_token=ctx.resolve_req_to_token(),
             prefix_lens=seq_lens[:bs],
             block_pos_offsets=ctx.block_pos_offsets[: self.stride],
-            full_to_swa_mapping=pool.full_to_swa_index_mapping,
+            full_to_swa_mapping=None,
             commit_lens=gated_commit_lens,
             stride=self.stride,
         )
+        cache_loc_2d = inject_layout.cache_loc_2d
         with torch.inference_mode():
             ctx.draft_model.write_target_hidden_kv(
-                main_hidden=self.strided_hidden[: bs * self.stride],
-                swa_loc=inject_layout.swa_loc,
+                target_hidden=self.strided_hidden[: bs * self.stride],
+                cache_loc=cache_loc_2d.reshape(-1),
+                cache_loc_2d=cache_loc_2d,
                 positions=inject_layout.positions,
+                commit_lens=gated_commit_lens,
                 pool=pool,
             )
 

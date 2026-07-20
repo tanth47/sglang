@@ -216,6 +216,13 @@ def _case_commit_inject_layout(tc):
     swa_2d = edge.swa_loc.view(2, stride)
     tc.assertTrue(bool((swa_2d[0] == -1).all()))
     tc.assertTrue(bool((swa_2d[1] >= 0).all()))
+    tc.assertEqual(edge.cache_loc_2d.shape, (2, stride))
+
+    generic_kw = dict(kw)
+    generic_kw["full_to_swa_mapping"] = None
+    got, ref = tc._parity(dspark_verify_window.BuildCommitInjectLayout, **generic_kw)
+    tc.assertEqual(got.swa_loc.numel(), 0)
+    tc.assertEqual(ref.swa_loc.numel(), 0)
 
 
 def _case_commit_kv_proj(tc):

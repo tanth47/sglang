@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Optional
+
 import msgspec
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
@@ -610,6 +614,7 @@ def scatter_compact_to_strided_triton(
 
 class CommitInjectLayoutResult(msgspec.Struct):
     swa_loc: torch.Tensor
+    cache_loc_2d: torch.Tensor
     positions: torch.Tensor
 
 
@@ -628,7 +633,7 @@ class BuildCommitInjectLayout:
         req_to_token: torch.Tensor,
         prefix_lens: torch.Tensor,
         block_pos_offsets: torch.Tensor,
-        full_to_swa_mapping: torch.Tensor,
+        full_to_swa_mapping: Optional[torch.Tensor],
         commit_lens: torch.Tensor,
         stride: int,
     ) -> CommitInjectLayoutResult:
@@ -650,7 +655,7 @@ class BuildCommitInjectLayout:
         req_to_token: torch.Tensor,
         prefix_lens: torch.Tensor,
         block_pos_offsets: torch.Tensor,
-        full_to_swa_mapping: torch.Tensor,
+        full_to_swa_mapping: Optional[torch.Tensor],
         commit_lens: torch.Tensor,
         stride: int,
     ) -> CommitInjectLayoutResult:
@@ -671,36 +676,33 @@ def build_commit_inject_layout(
     req_to_token: torch.Tensor,
     prefix_lens: torch.Tensor,
     block_pos_offsets: torch.Tensor,
-    full_to_swa_mapping: torch.Tensor,
+    full_to_swa_mapping: Optional[torch.Tensor],
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
-
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
 
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
+    cache_loc_2d = req_to_token[
+        req_pool_indices.to(dtype=torch.long).view(bs, 1),
+        positions_2d.to(dtype=torch.long),
+    ].to(dtype=torch.int64)
+    cache_loc = cache_loc_2d.reshape(-1)
 
-    cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + stride,
-        batch_size=bs,
-        draft_token_num=stride,
-        device=device,
-    ).to(dtype=torch.int64)
-    swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
+    if full_to_swa_mapping is None:
+        swa_loc = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
 
-    col = torch.arange(stride, device=device).view(1, -1)
-    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-    swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
+        col = torch.arange(stride, device=device).view(1, -1)
+        committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+        swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
 
-    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+    return CommitInjectLayoutResult(
+        swa_loc=swa_loc, cache_loc_2d=cache_loc_2d, positions=positions
+    )
 
 
 @triton.jit
@@ -712,10 +714,12 @@ def _commit_inject_layout_kernel(
     full_to_swa_ptr,
     commit_lens_ptr,
     swa_loc_ptr,
+    cache_loc_ptr,
     positions_ptr,
     rt_stride,
     stride,
     n,
+    has_swa: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -729,12 +733,14 @@ def _commit_inject_layout_kernel(
     full_loc = tl.load(
         req_to_token_ptr + rp * rt_stride + prefix + pos_off, mask=mask, other=0
     ).to(tl.int64)
-    swa = tl.load(full_to_swa_ptr + full_loc, mask=mask, other=-1).to(tl.int32)
+    if has_swa:
+        swa = tl.load(full_to_swa_ptr + full_loc, mask=mask, other=-1).to(tl.int32)
 
-    commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
-    swa = tl.where(c.to(tl.int64) < commit_len, swa, -1)
+        commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
+        swa = tl.where(c.to(tl.int64) < commit_len, swa, -1)
 
-    tl.store(swa_loc_ptr + offs, swa, mask=mask)
+        tl.store(swa_loc_ptr + offs, swa, mask=mask)
+    tl.store(cache_loc_ptr + offs, full_loc, mask=mask)
     tl.store(positions_ptr + offs, prefix + pos_off, mask=mask)
 
 
@@ -744,7 +750,7 @@ def build_commit_inject_layout_triton(
     req_to_token: torch.Tensor,
     prefix_lens: torch.Tensor,
     block_pos_offsets: torch.Tensor,
-    full_to_swa_mapping: torch.Tensor,
+    full_to_swa_mapping: Optional[torch.Tensor],
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
@@ -752,7 +758,13 @@ def build_commit_inject_layout_triton(
     n = bs * stride
     device = req_pool_indices.device
 
-    swa_loc = torch.empty(n, dtype=torch.int32, device=device)
+    has_swa = full_to_swa_mapping is not None
+    if full_to_swa_mapping is None:
+        full_to_swa_mapping = req_to_token
+        swa_loc = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        swa_loc = torch.empty(n, dtype=torch.int32, device=device)
+    cache_loc = torch.empty(n, dtype=torch.int64, device=device)
     positions = torch.empty(n, dtype=torch.int64, device=device)
     BLOCK = 256
     _commit_inject_layout_kernel[(triton.cdiv(n, BLOCK),)](
@@ -763,13 +775,17 @@ def build_commit_inject_layout_triton(
         full_to_swa_mapping,
         commit_lens,
         swa_loc,
+        cache_loc,
         positions,
         req_to_token.stride(0),
         stride,
         n,
+        has_swa,
         BLOCK=BLOCK,
     )
-    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+    return CommitInjectLayoutResult(
+        swa_loc=swa_loc, cache_loc_2d=cache_loc.view(bs, stride), positions=positions
+    )
 
 
 class BuildOutTokens:
