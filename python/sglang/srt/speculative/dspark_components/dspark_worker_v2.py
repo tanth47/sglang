@@ -762,6 +762,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             folded_commit=folded_commit,
             folded_accept_reject_reason=folded_accept_reject_reason,
             folded_commit_reject_reason=folded_commit_reject_reason,
+            commit_fold_capability_reject_reason=commit_fold_reject_reason,
         )
 
         next_draft_input = make_next_draft_input(
