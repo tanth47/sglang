@@ -285,7 +285,9 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
-            cuda_graph_reject_reason=target_out.cuda_graph_reject_reason,
+            cuda_graph_reject_reason=getattr(
+                target_out, "cuda_graph_reject_reason", None
+            ),
         )
 
     def commit_hidden(
