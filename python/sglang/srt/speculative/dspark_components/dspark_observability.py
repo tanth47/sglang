@@ -105,6 +105,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_graph_key: int = -1
     target_verify_cuda_graph: Optional[bool] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
     compact_verify: Optional[bool] = None
     proposal_folded: Optional[bool] = None
     fold_eligible: Optional[bool] = None
@@ -155,6 +156,7 @@ class DecodeStepObservation(msgspec.Struct):
     folded_accept_reject_reason: Optional[str] = None
     folded_commit_reject_reason: Optional[str] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -184,6 +186,7 @@ class _PendingStep(msgspec.Struct):
     folded_accept_reject_reason: Optional[str] = None
     folded_commit_reject_reason: Optional[str] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
 
 
 class DsparkInfoDumper:
@@ -290,6 +293,9 @@ class DsparkInfoDumper:
             target_verify_cuda_graph=bool(obs.target_verify_cuda_graph),
             target_verify_cuda_graph_reject_reason=(
                 obs.target_verify_cuda_graph_reject_reason
+            ),
+            target_verify_cuda_graph_reject_details=(
+                obs.target_verify_cuda_graph_reject_details
             ),
             budget_dry_run=bool(obs.budget_dry_run),
             predicted_step_ms=obs.predicted_step_ms,
@@ -402,6 +408,9 @@ class DsparkInfoDumper:
             record.target_verify_cuda_graph = pending.target_verify_cuda_graph
             record.target_verify_cuda_graph_reject_reason = (
                 pending.target_verify_cuda_graph_reject_reason
+            )
+            record.target_verify_cuda_graph_reject_details = (
+                pending.target_verify_cuda_graph_reject_details
             )
             record.compact_verify = pending.compact_verify
             record.proposal_folded = pending.proposal_folded
@@ -907,6 +916,7 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
         target_verify_cuda_graph: bool,
         target_verify_cuda_graph_reject_reason: Optional[str],
+        target_verify_cuda_graph_reject_details: Optional[dict],
         compact_verify: bool,
         fold_eligible: bool,
         folded_accept: bool,
@@ -1003,6 +1013,9 @@ class DsparkStepObservers:
                     target_verify_cuda_graph=target_verify_cuda_graph,
                     target_verify_cuda_graph_reject_reason=(
                         target_verify_cuda_graph_reject_reason
+                    ),
+                    target_verify_cuda_graph_reject_details=(
+                        target_verify_cuda_graph_reject_details
                     ),
                     compact_verify=compact_verify,
                     proposal_folded=proposal_folded,

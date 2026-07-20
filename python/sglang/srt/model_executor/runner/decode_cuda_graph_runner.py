@@ -547,6 +547,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._ragged_graph_size = 0
         self._logged_graph_reject_keys = set()
         self.last_graph_reject_reason: Optional[str] = None
+        self.last_graph_reject_details: Optional[dict] = None
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -863,6 +864,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         self.last_graph_reject_reason = None
+        self.last_graph_reject_details = None
 
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -1116,6 +1118,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _log_graph_reject(self, forward_batch: ForwardBatch, reason: str, **kwargs):
         self.last_graph_reject_reason = reason
+        self.last_graph_reject_details = dict(kwargs) if kwargs else None
         if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
             return
         details = tuple(sorted(kwargs.items()))

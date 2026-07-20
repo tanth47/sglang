@@ -52,6 +52,7 @@ def make_obs(
     planned_num_verify_tokens=None,
     target_verify_cuda_graph=False,
     target_verify_cuda_graph_reject_reason=None,
+    target_verify_cuda_graph_reject_details=None,
     compact_verify=None,
     proposal_folded=None,
     fold_eligible=None,
@@ -78,6 +79,9 @@ def make_obs(
         target_verify_cuda_graph=target_verify_cuda_graph,
         target_verify_cuda_graph_reject_reason=(
             target_verify_cuda_graph_reject_reason
+        ),
+        target_verify_cuda_graph_reject_details=(
+            target_verify_cuda_graph_reject_details
         ),
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
@@ -235,6 +239,34 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(
             record["target_verify_cuda_graph_reject_reason"],
             "rocm_dsa_target_verify_index_topk_mixed_transition",
+        )
+
+    def test_core_records_target_verify_graph_reject_details(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=False,
+                target_verify_cuda_graph_reject_reason=(
+                    "rocm_dsa_target_verify_index_topk_window_transition"
+                ),
+                target_verify_cuda_graph_reject_details={
+                    "dsa_index_topk": 2048,
+                    "graph_regime": "window_transition",
+                    "verify_lens": [8, 8, 8],
+                    "verify_len_total": 24,
+                },
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(
+            record["target_verify_cuda_graph_reject_details"],
+            {
+                "dsa_index_topk": 2048,
+                "graph_regime": "window_transition",
+                "verify_lens": [8, 8, 8],
+                "verify_len_total": 24,
+            },
         )
 
     def test_core_fields_report_dry_run_planned_verify_tokens(self):

@@ -14,10 +14,12 @@ from sglang.srt.speculative.ragged_verify import (
     DsaTargetVerifyGraphGroup,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    can_group_dsa_target_verify_reject,
     classify_dsa_target_verify_graph_regime,
     classify_dsa_target_verify_graph_reject_reason,
     group_dsa_target_verify_graph_regions,
     is_static_full_verify_layout,
+    scatter_grouped_strided_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -52,6 +54,42 @@ class TestRaggedTargetVerifyGeometry(unittest.TestCase):
         self.assertEqual(geometry.cache_seqlens_int32.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_q.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_k.dtype, torch.int32)
+
+
+class TestGroupedStridedScatter(unittest.TestCase):
+    def test_grouped_logits_return_to_original_order(self):
+        stride = 3
+        full = torch.empty((4 * stride, 2), dtype=torch.int64)
+        group = torch.tensor(
+            [
+                [20, 200],
+                [21, 201],
+                [22, 202],
+                [10, 100],
+                [11, 101],
+                [12, 102],
+            ],
+            dtype=torch.int64,
+        )
+        scatter_grouped_strided_rows(
+            full=full,
+            group=group,
+            row_indices=torch.tensor([2, 1], dtype=torch.long),
+            bs=4,
+            stride=stride,
+        )
+        self.assertEqual(full.view(4, stride, 2)[2].tolist(), group[:3].tolist())
+        self.assertEqual(full.view(4, stride, 2)[1].tolist(), group[3:].tolist())
+
+    def test_grouped_scatter_rejects_shape_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "group first dimension"):
+            scatter_grouped_strided_rows(
+                full=torch.empty((6, 2)),
+                group=torch.empty((4, 2)),
+                row_indices=torch.tensor([0], dtype=torch.long),
+                bs=2,
+                stride=3,
+            )
 
 
 class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
@@ -324,6 +362,24 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         self.assertEqual(
             classify_dsa_target_verify_graph_reject_reason(**kwargs),
             DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
+        )
+
+    def test_grouped_partial_source_rejects_include_window_transition(self):
+        self.assertTrue(
+            can_group_dsa_target_verify_reject(
+                DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
+            )
+        )
+        self.assertTrue(
+            can_group_dsa_target_verify_reject(
+                DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT
+            )
+        )
+        self.assertFalse(can_group_dsa_target_verify_reject(None))
+        self.assertFalse(
+            can_group_dsa_target_verify_reject(
+                DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
+            )
         )
 
 

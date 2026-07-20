@@ -36,12 +36,25 @@ DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
 DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
     "rocm_dsa_target_verify_post_topk_capture_seq_len_mismatch"
 )
+DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT = (
+    "rocm_dsa_target_verify_grouped_partial"
+)
+DSA_TARGET_VERIFY_GROUPED_PARTIAL_SOURCE_REJECTS = frozenset(
+    (
+        DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
+        DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
+    )
+)
 
 
 class DsaTargetVerifyGraphGroup(msgspec.Struct, frozen=True):
     indices: Tuple[int, ...]
     graph_regime: Optional[str] = None
     reject_reason: Optional[str] = None
+
+
+def can_group_dsa_target_verify_reject(reason: Optional[str]) -> bool:
+    return reason in DSA_TARGET_VERIFY_GROUPED_PARTIAL_SOURCE_REJECTS
 
 
 def read_ragged_verify_mode() -> RaggedVerifyMode:
@@ -411,6 +424,33 @@ def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     if layout.total_verify_tokens is not None:
         return int(layout.total_verify_tokens)
     return sum(materialize_verify_lens_cpu(layout))
+
+
+def scatter_grouped_strided_rows(
+    *,
+    full: torch.Tensor,
+    group: torch.Tensor,
+    row_indices: torch.Tensor,
+    bs: int,
+    stride: int,
+) -> None:
+    """Scatter group-local strided rows back to full request order."""
+    if row_indices.numel() == 0:
+        return
+    group_bs = int(row_indices.numel())
+    expected_rows = group_bs * int(stride)
+    if group.shape[0] != expected_rows:
+        raise ValueError(
+            f"group first dimension {group.shape[0]} != "
+            f"group_bs({group_bs}) * stride({stride})"
+        )
+    if full.shape[0] != int(bs) * int(stride):
+        raise ValueError(
+            f"full first dimension {full.shape[0]} != bs({bs}) * stride({stride})"
+        )
+    full_view = full.view(int(bs), int(stride), *full.shape[1:])
+    group_view = group.view(group_bs, int(stride), *group.shape[1:])
+    full_view.index_copy_(0, row_indices.to(full.device, dtype=torch.long), group_view)
 
 
 def is_static_full_verify_layout(

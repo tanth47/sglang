@@ -220,6 +220,7 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     cuda_graph_reject_reason: Optional[str] = None
+    cuda_graph_reject_details: Optional[dict] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -1298,6 +1299,7 @@ class ModelRunner:
                 else forward_batch.forward_mode.is_cuda_graph
             )
             cuda_graph_reject_reason = None
+            cuda_graph_reject_details = None
             if mode_check() and self.decode_cuda_graph_runner:
                 can_run_graph = bool(
                     self.decode_cuda_graph_runner.can_run_graph(forward_batch)
@@ -1305,6 +1307,11 @@ class ModelRunner:
                 cuda_graph_reject_reason = getattr(
                     self.decode_cuda_graph_runner,
                     "last_graph_reject_reason",
+                    None,
+                )
+                cuda_graph_reject_details = getattr(
+                    self.decode_cuda_graph_runner,
+                    "last_graph_reject_details",
                     None,
                 )
             else:
@@ -1328,6 +1335,7 @@ class ModelRunner:
                     logits_output=ret,
                     can_run_graph=can_run_graph,
                     cuda_graph_reject_reason=cuda_graph_reject_reason,
+                    cuda_graph_reject_details=cuda_graph_reject_details,
                 )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1392,6 +1400,7 @@ class ModelRunner:
                 logits_output=ret,
                 can_run_graph=can_run_graph,
                 cuda_graph_reject_reason=cuda_graph_reject_reason,
+                cuda_graph_reject_details=cuda_graph_reject_details,
             )
 
     def _preprocess_logits(

@@ -51,6 +51,7 @@ class GenerationBatchResult:
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
     cuda_graph_reject_reason: Optional[str] = None
+    cuda_graph_reject_details: Optional[dict] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
