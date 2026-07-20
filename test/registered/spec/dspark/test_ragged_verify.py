@@ -3,12 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
     DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
     classify_dsa_target_verify_graph_regime,
@@ -208,7 +210,16 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
             dsa_index_topk=2048,
             post_topk_guard_tokens=64,
         )
-        self.assertEqual(reason, DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT)
+        self.assertEqual(reason, DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT)
+
+    def test_reject_reason_splits_batch_mixed_regions(self):
+        reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[1000, 3000],
+            verify_lens_cpu=[8, 8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(reason, DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT)
 
     def test_reject_reason_is_none_for_graphable_post_topk(self):
         reason = classify_dsa_target_verify_graph_reject_reason(
@@ -231,7 +242,7 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         self.assertIsNone(classify_dsa_target_verify_graph_regime(**kwargs))
         self.assertEqual(
             classify_dsa_target_verify_graph_reject_reason(**kwargs),
-            DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
+            DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
         )
 
 

@@ -94,12 +94,14 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
     DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
     build_ragged_verify_token_buckets,
     classify_dsa_target_verify_graph_regime,
     classify_dsa_target_verify_graph_reject_reason,
@@ -402,6 +404,10 @@ def dsa_target_verify_graph_debug_info(
             == DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
         ):
             graph_regime_label = "post_topk_capture_seq_len_mismatch"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT:
+            graph_regime_label = "window_transition"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT:
+            graph_regime_label = "batch_mixed_regions"
         else:
             graph_regime_label = "mixed_or_transition"
     details = {

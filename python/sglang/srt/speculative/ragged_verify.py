@@ -21,6 +21,12 @@ DSA_TARGET_VERIFY_POST_TOPK_GRAPH = "dsa_post_topk"
 DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT = (
     "rocm_dsa_target_verify_index_topk_mixed_transition"
 )
+DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT = (
+    "rocm_dsa_target_verify_index_topk_batch_mixed_regions"
+)
+DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT = (
+    "rocm_dsa_target_verify_index_topk_window_transition"
+)
 DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT = (
     "rocm_dsa_target_verify_post_topk_no_capture_contract"
 )
@@ -184,6 +190,19 @@ def classify_dsa_target_verify_graph_reject_reason(
             return DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT
         return DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
 
+    any_pre_topk = False
+    any_post_topk = False
+    for seq_len, verify_len in windows:
+        if seq_len + verify_len < dsa_index_topk:
+            any_pre_topk = True
+            continue
+        if seq_len + 1 >= post_topk_graph_threshold:
+            any_post_topk = True
+            continue
+        return DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT
+
+    if any_pre_topk and any_post_topk:
+        return DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
     return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
 
 
