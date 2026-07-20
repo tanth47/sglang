@@ -555,6 +555,10 @@ class TargetVerifyExecutor:
         post_topk_guard_tokens = _rocm_dsa_target_verify_post_topk_graph_guard_tokens(
             num_tokens_per_req=self.verify_num_draft_tokens
         )
+        # Do not opt into post-topk replay from grouped GLM/ROCm DSA verify yet.
+        # The lower-level classifier supports an explicit capture seq-len
+        # contract, but the executor only validates pre-topk graph replay plus
+        # eager fallback groups until the DSA verify metadata contract is proven.
         post_topk_capture_seq_len = None
         reject_reason = classify_dsa_target_verify_graph_reject_reason(
             seq_lens_cpu=seq_lens_cpu,

@@ -13,6 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
     DsaTargetVerifyGraphGroup,
@@ -107,6 +108,12 @@ class TestGroupedTargetVerifyAdmission(unittest.TestCase):
                 for group in groups
             )
         )
+        self.assertTrue(
+            any(
+                group.reject_reason == DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
+                for group in groups
+            )
+        )
 
     def test_all_window_transition_batch_stays_ungrouped(self):
         executor = self._executor()
@@ -124,6 +131,26 @@ class TestGroupedTargetVerifyAdmission(unittest.TestCase):
                 batch=self._batch([2106]),
                 layout=layout,
                 bs=1,
+            )
+
+        self.assertIsNone(groups)
+
+    def test_all_post_topk_batch_stays_ungrouped_without_capture_contract(self):
+        executor = self._executor()
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 8],
+            device=torch.device("cpu"),
+            grid=[8, 16, 24, 32],
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_verify.is_hip",
+            return_value=True,
+        ):
+            groups = executor._grouped_dsa_target_verify_groups(
+                batch=self._batch([2531, 2600]),
+                layout=layout,
+                bs=2,
             )
 
         self.assertIsNone(groups)
