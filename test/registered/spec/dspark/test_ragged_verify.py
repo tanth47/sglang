@@ -369,7 +369,6 @@ class TestCaptureVerifyLens(unittest.TestCase):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
 
 
-
 class TestCompactTargetVerifyExecution(unittest.TestCase):
     def test_compact_verify_invokes_target_path_once(self):
         executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
