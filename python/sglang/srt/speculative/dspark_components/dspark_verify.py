@@ -131,7 +131,6 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
     cuda_graph_reject_reason: Optional[str] = None
     cuda_graph_reject_details: Optional[dict] = None
-    precomputed_accept: Optional[object] = None
 
 
 class TargetVerifyExecutor:
@@ -160,7 +159,6 @@ class TargetVerifyExecutor:
         self,
         *,
         folded_accept: bool,
-        precomputed_accept=None,
         bs: int,
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
@@ -179,35 +177,8 @@ class TargetVerifyExecutor:
         override.
         """
         if folded_accept:
-            if precomputed_accept is not None:
-                return precomputed_accept
             return self.verify_epilogue.read_accept(bs)
 
-        return self._build_accept_outs(
-            verify_ids_2d=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            bs=bs,
-        )
-
-    def _build_accept_outs(
-        self,
-        *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: torch.Tensor,
-        draft_block: DraftBlockResult,
-        sampling_info,
-        draft_input: DFlashDraftInputV2,
-        layout: Optional[RaggedVerifyLayout],
-        prefix_lens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        bs: int,
-    ) -> "AcceptOuts":
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -662,11 +633,6 @@ class TargetVerifyExecutor:
         bs: int,
         device: str,
         sampling_info,
-        fold_accept: bool = False,
-        verify_ids_2d: Optional[torch.Tensor] = None,
-        draft_block: Optional[DraftBlockResult] = None,
-        draft_input: Optional[DFlashDraftInputV2] = None,
-        prefix_lens: Optional[torch.Tensor] = None,
     ) -> Optional[tuple[TargetVerifyResult, torch.Tensor]]:
         groups = self._grouped_dsa_target_verify_groups(
             batch=batch, layout=layout, bs=bs
@@ -768,51 +734,28 @@ class TargetVerifyExecutor:
         )
         merged_logits_output.next_token_logits = full_logits
         merged_logits_output.hidden_states = full_hidden
-        precomputed_accept = None
-        if (
-            fold_accept
-            and verify_ids_2d is not None
-            and draft_block is not None
-            and draft_input is not None
-            and prefix_lens is not None
-        ):
-            precomputed_accept = self._build_accept_outs(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=full_logits,
-                draft_block=draft_block,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-                layout=layout,
-                prefix_lens=prefix_lens,
-                draft_tokens=draft_tokens,
-                bs=bs,
-            )
-        details = {
-            "group_count": len(groups),
-            "graph_group_count": sum(
-                1 for group in groups if group.graph_regime is not None
-            ),
-            "eager_group_count": sum(
-                1 for group in groups if group.graph_regime is None
-            ),
-            "groups": [
-                {
-                    "indices": list(group.indices),
-                    "graph_regime": group.graph_regime,
-                    "reject_reason": group.reject_reason,
-                }
-                for group in groups
-            ],
-        }
-        if precomputed_accept is not None:
-            details["precomputed_accept"] = True
         return (
             TargetVerifyResult(
                 logits_output=merged_logits_output,
                 can_run_cuda_graph=False,
                 cuda_graph_reject_reason=DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT,
-                cuda_graph_reject_details=details,
-                precomputed_accept=precomputed_accept,
+                cuda_graph_reject_details={
+                    "group_count": len(groups),
+                    "graph_group_count": sum(
+                        1 for group in groups if group.graph_regime is not None
+                    ),
+                    "eager_group_count": sum(
+                        1 for group in groups if group.graph_regime is None
+                    ),
+                    "groups": [
+                        {
+                            "indices": list(group.indices),
+                            "graph_regime": group.graph_regime,
+                            "reject_reason": group.reject_reason,
+                        }
+                        for group in groups
+                    ],
+                },
             ),
             full_hidden,
         )
@@ -828,10 +771,6 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
-        verify_ids_2d: Optional[torch.Tensor] = None,
-        draft_block: Optional[DraftBlockResult] = None,
-        draft_input: Optional[DFlashDraftInputV2] = None,
-        prefix_lens: Optional[torch.Tensor] = None,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         grouped = self._run_grouped_compact_if_supported(
             batch=batch,
@@ -841,11 +780,6 @@ class TargetVerifyExecutor:
             bs=bs,
             device=device,
             sampling_info=sampling_info,
-            fold_accept=inject_gate,
-            verify_ids_2d=verify_ids_2d,
-            draft_block=draft_block,
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
         )
         if grouped is not None:
             return grouped
