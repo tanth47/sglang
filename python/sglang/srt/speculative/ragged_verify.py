@@ -350,6 +350,19 @@ def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     return sum(materialize_verify_lens_cpu(layout))
 
 
+def required_padded_verify_slots(
+    layout: RaggedVerifyLayout, *, num_tokens_per_req: int
+) -> int:
+    """Slots needed to pad a graph tier without enlarging a live request."""
+    if num_tokens_per_req < 1:
+        raise ValueError("num_tokens_per_req must be positive")
+    slack_tokens = layout.graph_num_tokens - materialize_total_verify_tokens(layout)
+    if slack_tokens <= 0:
+        return layout.bs
+    padding_slots = (slack_tokens + num_tokens_per_req - 1) // num_tokens_per_req
+    return layout.bs + padding_slots
+
+
 def is_static_full_verify_layout(
     layout: RaggedVerifyLayout, *, num_tokens_per_req: int
 ) -> bool:
@@ -427,6 +440,27 @@ def build_ragged_target_verify_geometry(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
+    )
+
+
+def expand_target_verify_page_table(
+    *,
+    page_table: torch.Tensor,
+    verify_lens: torch.Tensor,
+    output_num_tokens: int,
+) -> torch.Tensor:
+    """Expand request-keyed page rows into query-token order.
+
+    ``output_num_tokens`` is an explicit graph-tier size, so repeat_interleave
+    does not need to read the device-side sum of ``verify_lens`` on the host.
+    """
+    if page_table.shape[0] != verify_lens.shape[0]:
+        raise ValueError(
+            f"page-table rows ({page_table.shape[0]}) must match verify_lens "
+            f"({verify_lens.shape[0]})"
+        )
+    return torch.repeat_interleave(
+        page_table, repeats=verify_lens, dim=0, output_size=output_num_tokens
     )
 
 

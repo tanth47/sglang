@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -59,8 +60,11 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.ragged_verify import (
+    build_capture_verify_lens,
     compute_ragged_extend_lengths,
+    compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
+    expand_target_verify_page_table,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
     resolve_ragged_verify_layout,
@@ -197,6 +201,12 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+
+    # TARGET_VERIFY can keep one page-table row per request (ragged indexer) or
+    # one row per query token (paged indexer). The latter gives ROCm CUDA graphs
+    # a static indexer workspace while cu_seqlens_q carries the live ragged
+    # request partition.
+    page_table_is_token_expanded: bool = False
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -337,7 +347,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
                     cu_seqlens_q,
                 )
         else:
-            cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
+            # A token-expanded page table gives each query token its own
+            # decode-shaped row. Feed the fused transform the matching static
+            # arange offsets instead of the logical request segmentation.
+            cu_seqlens_q_topk = (
+                self.attn_metadata.dsa_cu_seqlens_q[: logits.shape[0] + 1]
+                if self.attn_metadata.page_table_is_token_expanded
+                else self.attn_metadata.cu_seqlens_q
+            )
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
         if ke_offset is not None:
             seq_lens_topk = ke_offset
@@ -357,9 +374,53 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         )
 
 
+class _DSAGraphBucket(enum.Enum):
+    DECODE_OR_IDLE = "decode_or_idle"
+    TARGET_VERIFY = "target_verify"
+    DRAFT_EXTEND = "draft_extend"
+
+    @classmethod
+    def of(cls, forward_mode: ForwardMode):
+        if forward_mode.is_decode_or_idle():
+            return cls.DECODE_OR_IDLE
+        if forward_mode.is_target_verify():
+            return cls.TARGET_VERIFY
+        if forward_mode.is_draft_extend_v2():
+            return cls.DRAFT_EXTEND
+        raise NotImplementedError(f"unsupported {forward_mode=}")
+
+
+_DSAGraphMetadataKey: TypeAlias = Tuple[_DSAGraphBucket, int, int]
+
+
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
 ]
+
+
+def _supports_rocm_regime_neutral_target_verify_graph(
+    *,
+    ragged_graph_requested: bool,
+    use_fused_topk: bool,
+    dsa_topk_backend: DSATopKBackend,
+    dsa_decode_impl: _DSA_IMPL_T,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    dsa_index_topk: Optional[int],
+    hisparse_enabled: bool,
+    gfx95_supported: bool,
+) -> bool:
+    return (
+        ragged_graph_requested
+        and use_fused_topk
+        and dsa_topk_backend.is_sgl_kernel()
+        and dsa_decode_impl == "tilelang"
+        and kv_cache_dtype == torch.bfloat16
+        and page_size == 64
+        and dsa_index_topk == 2048
+        and not hisparse_enabled
+        and gfx95_supported
+    )
 
 
 class DeepseekSparseAttnBackend(
@@ -369,11 +430,15 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
-    # Static DSpark target-verify graphs are stable on ROCm DSA, but compact
-    # ragged target-verify graph replay currently faults after repeated replays
-    # on MI350. Keep compact/ragged verify on the eager target path until the
-    # DSA ragged graph metadata/input contract is fixed end-to-end.
+    # Compact/ragged ROCm target-verify graphs remain opt-in. Physical-shape
+    # compatibility and dense/sparse transition replay are separate capabilities;
+    # unsupported kernel routes retain whole-batch eager fallback.
     supports_ragged_verify_graph: bool = False
+    supports_unified_dsa_target_verify_graph: bool = False
+    # Token-expanded verify metadata makes ragged physical shapes graphable,
+    # but it does not prove that a graph captured below index_topk can replay
+    # through the dense/sparse DSA transition. Keep that capability separate.
+    supports_dsa_target_verify_post_topk_graph: bool = False
 
     def ragged_verify_capture_slots(
         self,
@@ -382,6 +447,8 @@ class DeepseekSparseAttnBackend(
         max_bs: int,
         num_tokens_per_req: int,
     ) -> int:
+        if self.supports_unified_dsa_target_verify_graph:
+            return min(max_bs, num_tokens)
         # DSA kernels capture metadata that depends on per-request q shape
         # (notably max_seq_len_q), so do not pack a small token tier across more
         # slots than full-block verify needs. Otherwise graph key 8 captures
@@ -396,6 +463,9 @@ class DeepseekSparseAttnBackend(
         ragged_layout,
         num_tokens_per_req: int,
     ) -> tuple[bool, str]:
+        if self.supports_unified_dsa_target_verify_graph:
+            return True, ""
+
         total_verify_tokens = materialize_total_verify_tokens(ragged_layout)
         graph_num_tokens = int(ragged_layout.graph_num_tokens)
         if total_verify_tokens != graph_num_tokens:
@@ -445,12 +515,14 @@ class DeepseekSparseAttnBackend(
         self.supports_ragged_verify_graph = (
             envs.SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH.get()
         )
+        rocm_regime_neutral_graph_requested = (
+            _is_hip and self.supports_ragged_verify_graph
+        )
         if self.supports_ragged_verify_graph:
             logger.warning(
                 "SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH=1 enables an "
-                "experimental ROCm DSA compact/ragged target-verify graph path. "
-                "Static target-verify graphs are stable; ragged graph replay is "
-                "still under validation on MI350."
+                "experimental ROCm DSA compact/ragged target-verify graph path; "
+                "only explicitly validated kernel contracts may cross index_topk."
             )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
@@ -540,6 +612,31 @@ class DeepseekSparseAttnBackend(
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+            )
+        regime_neutral_graph_supported = (
+            _supports_rocm_regime_neutral_target_verify_graph(
+                ragged_graph_requested=rocm_regime_neutral_graph_requested,
+                use_fused_topk=self.use_fused_topk,
+                dsa_topk_backend=self.dsa_topk_backend,
+                dsa_decode_impl=self.dsa_decode_impl,
+                kv_cache_dtype=model_runner.kv_cache_dtype,
+                page_size=self.real_page_size,
+                dsa_index_topk=self.dsa_index_topk,
+                hisparse_enabled=self.hisparse_coordinator is not None,
+                gfx95_supported=_IS_GFX95,
+            )
+        )
+        self.supports_unified_dsa_target_verify_graph = (
+            regime_neutral_graph_supported
+        )
+        self.supports_dsa_target_verify_post_topk_graph = (
+            regime_neutral_graph_supported
+        )
+        if self.supports_dsa_target_verify_post_topk_graph:
+            logger.warning(
+                "ROCm DSA target-verify graph replay is enabled across the "
+                "index_topk transition for the validated fused-SGL/TileLang "
+                "contract; unsupported routes keep whole-batch eager fallback."
             )
 
         self.device_capability = torch.cuda.get_device_capability()
@@ -789,6 +886,29 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
+    def _cuda_graph_metadata_key(
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> _DSAGraphMetadataKey:
+        bucket = _DSAGraphBucket.of(forward_mode)
+        shape_key = bs
+        num_tokens = bs
+        if (
+            bucket is _DSAGraphBucket.TARGET_VERIFY
+            and self.supports_unified_dsa_target_verify_graph
+        ):
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            shape_key, num_tokens = compute_target_verify_graph_key(
+                bs=bs,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                ragged_layout=ragged_layout,
+            )
+        elif bucket is _DSAGraphBucket.DRAFT_EXTEND:
+            num_tokens = bs * self.speculative_num_draft_tokens
+        return bucket, shape_key, num_tokens
+
     def _target_verify_lens_for_graph(
         self,
         bs: int,
@@ -804,8 +924,31 @@ class DeepseekSparseAttnBackend(
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
+        elif self.supports_unified_dsa_target_verify_graph:
+            ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+            verify_lens = ragged_layout.verify_lens[:bs].to(
+                device=seq_lens.device, dtype=torch.int32
+            )
+            # Rebuild the capture-time physical partition from static shape
+            # constants. It sizes fused top-k without materializing the live
+            # verify_lens tensor on the host; cu_seqlens_q carries the live
+            # request partition on device.
+            verify_lens_cpu = build_capture_verify_lens(
+                num_tokens=ragged_layout.graph_num_tokens,
+                num_slots=bs,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+            )
         else:
             verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
+            if any(
+                verify_len < 0
+                or verify_len > self.speculative_num_draft_tokens
+                for verify_len in verify_lens_cpu
+            ):
+                raise RuntimeError(
+                    "physical target-verify layout exceeds the draft window: "
+                    f"verify_lens={verify_lens_cpu}"
+                )
             verify_lens = ragged_layout.verify_lens[:bs].to(
                 device=seq_lens.device, dtype=torch.int32
             )
@@ -818,9 +961,14 @@ class DeepseekSparseAttnBackend(
                 padded_verify_lens[: verify_lens.numel()].copy_(verify_lens)
                 verify_lens = padded_verify_lens
         total_verify_tokens = (
-            materialize_total_verify_tokens(ragged_layout)
+            ragged_layout.graph_num_tokens
             if ragged_layout is not None
-            else sum(verify_lens_cpu)
+            and self.supports_unified_dsa_target_verify_graph
+            else (
+                materialize_total_verify_tokens(ragged_layout)
+                if ragged_layout is not None
+                else sum(verify_lens_cpu)
+            )
         )
         return verify_lens, verify_lens_cpu, total_verify_tokens
 
@@ -1071,6 +1219,7 @@ class DeepseekSparseAttnBackend(
         ]
 
         page_table_1_flattened = None
+        page_table_is_token_expanded = False
         topk_indices_offset = None
 
         # Centralized dispatch: decide all strategies for this batch
@@ -1154,11 +1303,6 @@ class DeepseekSparseAttnBackend(
                 self.speculative_num_draft_tokens,
             )
 
-            # Keep target-verify metadata prefill-consistent: one page-table row
-            # per request plus per-request extend lengths. The page-table
-            # expansion happens inside the top-k/page-table transform. This avoids
-            # mixing token-expanded page tables with per-request cu_seqlens and
-            # leaves a clear hook for a future GLM DSA verify-specific kernel.
             page_table = page_table[:, :max_seqlen_k]
             indexer_seq_lens_cpu = torch.tensor(
                 lengths.seq_lens_cpu_extended,
@@ -1213,6 +1357,7 @@ class DeepseekSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
+            page_table_is_token_expanded = True
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -1371,6 +1516,7 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
+            page_table_is_token_expanded=page_table_is_token_expanded,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
@@ -1560,6 +1706,7 @@ class DeepseekSparseAttnBackend(
         indexer_seq_lens_cpu = None
         indexer_seq_lens = None
         token_to_batch_idx = None
+        page_table_is_token_expanded = False
 
         if forward_mode.is_decode_or_idle():
             # Normal Decode
@@ -1604,18 +1751,33 @@ class DeepseekSparseAttnBackend(
             verify_lens, verify_lens_cpu, total_verify_tokens = (
                 self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
             )
-            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
-                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
-            )
+            if self.supports_unified_dsa_target_verify_graph:
+                seq_lens = seq_lens[:bs]
+            else:
+                seq_lens, seq_lens_cpu = (
+                    self._sanitize_target_verify_seq_lens_for_graph(
+                        seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+                    )
+                )
             cache_seqlens_int32 = (seq_lens + verify_lens).to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-            max_seqlen_q = max(verify_lens_cpu) if verify_lens_cpu else 1
-            real_rows = bs
+            # Capture the full verify-window contract even when the dummy
+            # physical layout uses one-token rows. Replay may reuse this graph
+            # for any ragged layout whose per-request verify length is <= gamma.
+            max_seqlen_q = (
+                self.speculative_num_draft_tokens
+                if self.supports_unified_dsa_target_verify_graph
+                else (max(verify_lens_cpu) if verify_lens_cpu else 1)
+            )
+            page_table_is_token_expanded = (
+                self.supports_unified_dsa_target_verify_graph
+            )
+            real_rows = total_verify_tokens if page_table_is_token_expanded else bs
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
                 max_seqlen_k = self.req_to_token.shape[1]
             else:
-                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:real_rows, :]
                 max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = compute_cu_seqlens(verify_lens)
@@ -1629,14 +1791,15 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded, dsa_index_topk=self.dsa_index_topk
             )
             dsa_extend_seq_lens_list = verify_lens_cpu
-            (
-                indexer_k_start_end,
-                indexer_seq_lens_cpu,
-                indexer_seq_lens,
-                token_to_batch_idx,
-            ) = self._target_verify_indexer_metadata_for_graph(
-                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
-            )
+            if not page_table_is_token_expanded:
+                (
+                    indexer_k_start_end,
+                    indexer_seq_lens_cpu,
+                    indexer_seq_lens,
+                    token_to_batch_idx,
+                ) = self._target_verify_indexer_metadata_for_graph(
+                    seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+                )
 
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
@@ -1657,6 +1820,7 @@ class DeepseekSparseAttnBackend(
             )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
+            page_table_is_token_expanded = True
             real_rows = bs * self.speculative_num_draft_tokens
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
@@ -1757,13 +1921,15 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            page_table_is_token_expanded=page_table_is_token_expanded,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        self.decode_cuda_graph_metadata[metadata_key] = metadata
         self.forward_metadata = metadata
 
     def _apply_cuda_graph_metadata(
@@ -1783,7 +1949,8 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        if bs not in self.decode_cuda_graph_metadata:
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
+        if metadata_key not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
                 None,
@@ -1803,7 +1970,7 @@ class DeepseekSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
@@ -1854,39 +2021,45 @@ class DeepseekSparseAttnBackend(
             verify_lens, verify_lens_cpu, total_verify_tokens = (
                 self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
             )
-            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
-                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
-            )
+            if self.supports_unified_dsa_target_verify_graph:
+                seq_lens = seq_lens[:bs]
+            else:
+                seq_lens, seq_lens_cpu = (
+                    self._sanitize_target_verify_seq_lens_for_graph(
+                        seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+                    )
+                )
             metadata.dsa_extend_seq_lens_list[:] = verify_lens_cpu
             metadata.cu_seqlens_q.copy_(compute_cu_seqlens(verify_lens))
-            (
-                indexer_k_start_end,
-                indexer_seq_lens_cpu,
-                indexer_seq_lens,
-                token_to_batch_idx,
-            ) = self._target_verify_indexer_metadata_for_graph(
-                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
-            )
-            assert (
-                metadata.indexer_k_start_end is not None
-                and metadata.indexer_seq_lens_cpu is not None
-                and metadata.indexer_seq_lens is not None
-                and metadata.token_to_batch_idx is not None
-            )
-
-            def _copy_graph_prefix(dst: torch.Tensor, src: torch.Tensor):
-                assert src.numel() <= dst.numel(), (
-                    f"target-verify graph metadata overflow: "
-                    f"src={src.numel()} dst={dst.numel()}"
+            if not metadata.page_table_is_token_expanded:
+                (
+                    indexer_k_start_end,
+                    indexer_seq_lens_cpu,
+                    indexer_seq_lens,
+                    token_to_batch_idx,
+                ) = self._target_verify_indexer_metadata_for_graph(
+                    seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
                 )
-                dst.zero_()
-                dst[: src.numel()].copy_(src)
+                assert (
+                    metadata.indexer_k_start_end is not None
+                    and metadata.indexer_seq_lens_cpu is not None
+                    and metadata.indexer_seq_lens is not None
+                    and metadata.token_to_batch_idx is not None
+                )
 
-            _copy_graph_prefix(metadata.indexer_k_start_end[0], indexer_k_start_end[0])
-            _copy_graph_prefix(metadata.indexer_k_start_end[1], indexer_k_start_end[1])
-            _copy_graph_prefix(metadata.indexer_seq_lens_cpu, indexer_seq_lens_cpu)
-            _copy_graph_prefix(metadata.indexer_seq_lens, indexer_seq_lens)
-            _copy_graph_prefix(metadata.token_to_batch_idx, token_to_batch_idx)
+                def _copy_graph_prefix(dst: torch.Tensor, src: torch.Tensor):
+                    assert src.numel() <= dst.numel(), (
+                        f"target-verify graph metadata overflow: "
+                        f"src={src.numel()} dst={dst.numel()}"
+                    )
+                    dst.zero_()
+                    dst[: src.numel()].copy_(src)
+
+                _copy_graph_prefix(metadata.indexer_k_start_end[0], indexer_k_start_end[0])
+                _copy_graph_prefix(metadata.indexer_k_start_end[1], indexer_k_start_end[1])
+                _copy_graph_prefix(metadata.indexer_seq_lens_cpu, indexer_seq_lens_cpu)
+                _copy_graph_prefix(metadata.indexer_seq_lens, indexer_seq_lens)
+                _copy_graph_prefix(metadata.token_to_batch_idx, token_to_batch_idx)
 
             if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
@@ -1939,6 +2112,12 @@ class DeepseekSparseAttnBackend(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
                 page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                if metadata.page_table_is_token_expanded:
+                    page_indices = expand_target_verify_page_table(
+                        page_table=page_indices,
+                        verify_lens=verify_lens,
+                        output_num_tokens=total_verify_tokens,
+                    )
                 metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
                 seqlens_expanded = seqlens_expand_triton(
@@ -2126,7 +2305,8 @@ class DeepseekSparseAttnBackend(
         """
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, None)
+        metadata = self.decode_cuda_graph_metadata[metadata_key]
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -2400,10 +2580,8 @@ class DeepseekSparseAttnBackend(
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
                     output_num_tokens=q_nope.shape[0],
-                    # DRAFT_EXTEND_V2 expands page_table to one row per query token
-                    # above. TARGET_VERIFY intentionally keeps one row per request
-                    # and relies on extend_lens_cpu to map token rows to requests.
-                    page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
+                    # The explicit metadata contract records row ownership.
+                    page_table_is_expanded=metadata.page_table_is_token_expanded,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
@@ -3162,10 +3340,8 @@ class DeepseekSparseAttnBackend(
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
                 output_num_tokens=q.shape[0],
-                # DRAFT_EXTEND_V2 expands page_table to one row per query token
-                # above. TARGET_VERIFY intentionally keeps one row per request
-                # and relies on extend_lens_cpu to map token rows to requests.
-                page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
+                # The explicit metadata contract records row ownership.
+                page_table_is_expanded=metadata.page_table_is_token_expanded,
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
@@ -3436,9 +3612,18 @@ class DeepseekSparseAttnMultiStepBackend:
                     fused_metadata_copy_multi_cuda,
                 )
 
-                metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
-                metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
-                metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
+                metadata_key = self.attn_backends[0]._cuda_graph_metadata_key(
+                    bs, ForwardMode.DECODE, None
+                )
+                metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[
+                    metadata_key
+                ]
+                metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[
+                    metadata_key
+                ]
+                metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[
+                    metadata_key
+                ]
 
                 # Set dsa_prefill_impl for first 3 backends (required by the method)
                 for i in range(3):

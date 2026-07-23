@@ -50,6 +50,7 @@ def make_obs(
     num_verify_tokens=24,
     planned_num_verify_tokens=None,
     target_verify_cuda_graph=False,
+    target_forward_calls=1,
     target_verify_cuda_graph_reject_reason=None,
     target_verify_cuda_graph_reject_details=None,
     compact_verify=None,
@@ -78,6 +79,7 @@ def make_obs(
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
         target_verify_cuda_graph=target_verify_cuda_graph,
+        target_forward_calls=target_forward_calls,
         target_verify_cuda_graph_reject_reason=(target_verify_cuda_graph_reject_reason),
         target_verify_cuda_graph_reject_details=(
             target_verify_cuda_graph_reject_details
@@ -215,6 +217,7 @@ class TestCoreAndCpuTiming(unittest.TestCase):
         )
         record = dumper.dump()["records"][0]
         self.assertTrue(record["target_verify_cuda_graph"])
+        self.assertEqual(record["target_forward_calls"], 1)
         self.assertTrue(record["compact_verify"])
         self.assertTrue(record["proposal_folded"])
         self.assertTrue(record["fold_eligible"])
@@ -428,6 +431,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
         target_verify_cuda_graph=False,
+        target_forward_calls=1,
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=1.0,
@@ -512,6 +516,7 @@ class TestReqsAndGpuTiming(unittest.TestCase):
             verify_tokens_dp_synced=obs.verify_tokens_dp_synced,
             verify_tokens_graph_key=obs.verify_tokens_graph_key,
             target_verify_cuda_graph=obs.target_verify_cuda_graph,
+            target_forward_calls=obs.target_forward_calls,
             budget_dry_run=obs.budget_dry_run,
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,

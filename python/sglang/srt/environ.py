@@ -751,7 +751,6 @@ class Envs:
     # full block.
     SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS = EnvInt(0)
     SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS = EnvInt(1)
-    SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

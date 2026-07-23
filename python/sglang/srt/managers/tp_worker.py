@@ -521,6 +521,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                model_forward_calls=1,
             )
 
             if is_verify:
@@ -577,6 +578,7 @@ class TpModelWorker(BaseTpWorker):
                 cuda_graph_reject_reason=out.cuda_graph_reject_reason,
                 cuda_graph_reject_details=out.cuda_graph_reject_details,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                model_forward_calls=1,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):

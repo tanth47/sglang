@@ -731,6 +731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=dp_tier_num_tokens,
             target_verify_cuda_graph=can_run_cuda_graph,
+            target_forward_calls=target_verify.target_forward_calls,
             target_verify_cuda_graph_reject_reason=cuda_graph_reject_reason,
             target_verify_cuda_graph_reject_details=cuda_graph_reject_details,
             compact_verify=run_compact,

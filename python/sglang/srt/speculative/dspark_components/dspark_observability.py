@@ -115,6 +115,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
     target_verify_cuda_graph: Optional[bool] = None
+    target_forward_calls: Optional[int] = None
     target_verify_cuda_graph_reject_reason: Optional[str] = None
     target_verify_cuda_graph_reject_details: Optional[dict] = None
     compact_verify: Optional[bool] = None
@@ -148,6 +149,7 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    target_forward_calls: int
     budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
@@ -186,6 +188,7 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    target_forward_calls: int
     budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
@@ -308,6 +311,7 @@ class DsparkInfoDumper:
             verify_tokens_dp_synced=int(obs.verify_tokens_dp_synced),
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
             target_verify_cuda_graph=bool(obs.target_verify_cuda_graph),
+            target_forward_calls=int(obs.target_forward_calls),
             target_verify_cuda_graph_reject_reason=(
                 obs.target_verify_cuda_graph_reject_reason
             ),
@@ -427,6 +431,7 @@ class DsparkInfoDumper:
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.target_verify_cuda_graph = pending.target_verify_cuda_graph
+            record.target_forward_calls = pending.target_forward_calls
             record.target_verify_cuda_graph_reject_reason = (
                 pending.target_verify_cuda_graph_reject_reason
             )
@@ -936,6 +941,7 @@ class DsparkStepObservers:
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
         target_verify_cuda_graph: bool,
+        target_forward_calls: int,
         target_verify_cuda_graph_reject_reason: Optional[str],
         target_verify_cuda_graph_reject_details: Optional[dict],
         compact_verify: bool,
@@ -1034,6 +1040,7 @@ class DsparkStepObservers:
                     ),
                     verify_tokens_graph_key=num_verify_tokens,
                     target_verify_cuda_graph=target_verify_cuda_graph,
+                    target_forward_calls=target_forward_calls,
                     target_verify_cuda_graph_reject_reason=(
                         target_verify_cuda_graph_reject_reason
                     ),

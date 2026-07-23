@@ -5,6 +5,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
@@ -18,7 +21,9 @@ from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     classify_dsa_target_verify_graph_regime,
     classify_dsa_target_verify_graph_reject_reason,
+    expand_target_verify_page_table,
     is_static_full_verify_layout,
+    required_padded_verify_slots,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -53,6 +58,69 @@ class TestRaggedTargetVerifyGeometry(unittest.TestCase):
         self.assertEqual(geometry.cache_seqlens_int32.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_q.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_k.dtype, torch.int32)
+
+
+class TestTargetVerifyPageTableContract(unittest.TestCase):
+    def test_nonuniform_verify_lens_expand_request_rows_in_token_order(self):
+        page_table = torch.tensor(
+            [[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32
+        )
+        verify_lens = torch.tensor([3, 1, 2], dtype=torch.int32)
+
+        expanded = expand_target_verify_page_table(
+            page_table=page_table,
+            verify_lens=verify_lens,
+            output_num_tokens=6,
+        )
+
+        self.assertEqual(
+            expanded.tolist(),
+            [
+                [10, 11, 12],
+                [10, 11, 12],
+                [10, 11, 12],
+                [20, 21, 22],
+                [30, 31, 32],
+                [30, 31, 32],
+            ],
+        )
+
+    def test_different_layouts_keep_the_same_graph_tier_shape(self):
+        capture_lens = torch.ones((32,), dtype=torch.int32)
+        capture_rows = torch.arange(32, dtype=torch.int32).view(32, 1)
+        capture_page_table = expand_target_verify_page_table(
+            page_table=capture_rows,
+            verify_lens=capture_lens,
+            output_num_tokens=32,
+        )
+
+        replay = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 1, 3],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+            graph_num_tokens_floor=24,
+        ).padded_to_bucket(padded_bs=32)
+        replay_rows = torch.arange(32, dtype=torch.int32).view(32, 1)
+        replay_page_table = expand_target_verify_page_table(
+            page_table=replay_rows,
+            verify_lens=replay.verify_lens,
+            output_num_tokens=replay.graph_num_tokens,
+        )
+
+        self.assertEqual(capture_page_table.shape, replay_page_table.shape)
+        self.assertEqual(
+            replay_page_table[:12, 0].tolist(), [0] * 8 + [1] + [2] * 3
+        )
+        self.assertEqual(int(replay.verify_lens.sum()), 32)
+        self.assertLessEqual(int(replay.verify_lens.max()), 8)
+
+    def test_page_rows_must_match_verify_lens(self):
+        with self.assertRaisesRegex(ValueError, "page-table rows"):
+            expand_target_verify_page_table(
+                page_table=torch.zeros((2, 4), dtype=torch.int32),
+                verify_lens=torch.ones((3,), dtype=torch.int32),
+                output_num_tokens=3,
+            )
 
 
 class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
@@ -249,8 +317,74 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
 
 
+class TestDsaTargetVerifyGraphAdmission(unittest.TestCase):
+    def test_unified_shape_support_does_not_bypass_topk_regime_guard(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[4], device=_DEVICE, grid=[4]
+        )
+        cases = (
+            (2112, DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT),
+            (2046, DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT),
+        )
+
+        for seq_len, expected_reason in cases:
+            with self.subTest(seq_len=seq_len):
+                runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+                runner.ragged_verify_mode = True
+                runner.model_runner = SimpleNamespace(is_draft_worker=False)
+                runner.attn_backend = SimpleNamespace(
+                    use_dsa=True,
+                    dsa_index_topk=2048,
+                    supports_unified_dsa_target_verify_graph=True,
+                    supports_dsa_target_verify_post_topk_graph=False,
+                )
+                runner.num_tokens_per_req = 8
+                runner._logged_graph_reject_keys = set()
+                runner._dsa_target_verify_post_topk_graph_enabled_for_bs = mock.Mock(
+                    return_value=False
+                )
+                runner._can_run_ragged_verify_graph = mock.Mock(return_value=True)
+                forward_batch = SimpleNamespace(
+                    replace_embeds=None,
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    batch_size=1,
+                    seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+                    seq_lens_cpu=[seq_len],
+                    spec_info=SimpleNamespace(ragged_verify_layout=layout),
+                )
+
+                with mock.patch(
+                    "sglang.srt.model_executor.runner."
+                    "decode_cuda_graph_runner.is_hip",
+                    return_value=True,
+                ):
+                    self.assertFalse(runner.can_run_graph(forward_batch))
+
+                self.assertEqual(runner.last_graph_reject_reason, expected_reason)
+                runner._can_run_ragged_verify_graph.assert_not_called()
+
+    def test_idle_target_verify_capture_without_layout_falls_back_eager(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        runner.model_runner = SimpleNamespace(is_draft_worker=False)
+        runner.attn_backend = SimpleNamespace(use_dsa=True)
+        runner._log_graph_reject = mock.Mock()
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            forward_mode=ForwardMode.IDLE,
+            spec_info=None,
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        runner._log_graph_reject.assert_called_once_with(
+            forward_batch, "missing_ragged_layout"
+        )
+
+
+
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
-    def test_padded_layout_grows_bs_and_fills_bucket(self):
+    def test_required_slots_preserve_live_lens_and_bound_dummy_lens(self):
         raw = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[8, 1, 3],
             device=_DEVICE,
@@ -258,15 +392,12 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
             graph_num_tokens_floor=24,
         )
         self.assertEqual(raw.graph_num_tokens, 32)
-        padded = raw.padded_to_bucket(padded_bs=4)
-        self.assertEqual(padded.bs, 4)
-        self.assertEqual(padded.verify_lens.tolist(), [8, 1, 3, 20])
-        self.assertEqual(padded.qo_indptr_device.tolist(), [0, 8, 9, 12, 32])
-        seq_lens = torch.tensor([10, 20, 30, 1], dtype=torch.int32)
-        geometry = build_ragged_target_verify_geometry(seq_lens=seq_lens, layout=padded)
-        self.assertEqual(geometry.cu_seqlens_q.tolist(), [0, 8, 9, 12, 32])
-        self.assertEqual(geometry.cache_seqlens_int32.tolist(), [18, 21, 33, 21])
-        self.assertEqual(int(geometry.cu_seqlens_k[-1]), 18 + 21 + 33 + 21)
+        required_slots = required_padded_verify_slots(raw, num_tokens_per_req=8)
+        self.assertEqual(required_slots, 6)
+        padded = raw.padded_to_bucket(padded_bs=required_slots)
+        self.assertEqual(padded.verify_lens[:3].tolist(), [8, 1, 3])
+        self.assertLessEqual(max(padded.verify_lens.tolist()), 8)
+        self.assertEqual(int(padded.qo_indptr_device[-1]), 32)
 
     def test_padded_layout_decoupled_slots_spread_slack(self):
         raw = RaggedVerifyLayout.from_verify_lens(
@@ -399,6 +530,7 @@ class TestCompactTargetVerifyExecution(unittest.TestCase):
         target_worker.forward_batch_generation.return_value = SimpleNamespace(
             logits_output=logits_output,
             can_run_cuda_graph=False,
+            model_forward_calls=1,
             cuda_graph_reject_reason=reject_reason,
             cuda_graph_reject_details={"graph_regime": "batch_mixed_regions"},
         )
@@ -456,6 +588,7 @@ class TestCompactTargetVerifyExecution(unittest.TestCase):
             )
 
         self.assertFalse(result.can_run_cuda_graph)
+        self.assertEqual(result.target_forward_calls, 1)
         self.assertEqual(result.cuda_graph_reject_reason, reject_reason)
         graph_runner.can_run_graph.assert_called_once_with(full_forward_batch)
         graph_runner.load_batch.assert_not_called()

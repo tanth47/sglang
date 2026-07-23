@@ -629,7 +629,13 @@ def accept_greedy(
             correct_len=correct_len, verify_lens=cutoff_verify_lens
         )
         row_ids = torch.arange(bs, device=target_predict.device)
-        bonus = target_predict[row_ids, correct_len.to(torch.long)].to(torch.int64)
+        safe_correct_len = correct_len.clamp(
+            min=0, max=target_predict.shape[1] - 1
+        ).to(torch.long)
+        bonus = target_predict[row_ids, safe_correct_len]
+        bonus = torch.where(correct_len >= 0, bonus, torch.zeros_like(bonus)).to(
+            torch.int64
+        )
     return correct_len, bonus, cap_trim_lens
 
 
@@ -645,8 +651,10 @@ def _gather_row_bonus_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     idx = tl.load(idx_ptr + offs, mask=mask, other=0).to(tl.int64)
-    val = tl.load(table_ptr + offs * cols + idx, mask=mask, other=0)
-    tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
+    valid_idx = (idx >= 0) & (idx < cols)
+    safe_idx = tl.maximum(0, tl.minimum(idx, cols - 1))
+    val = tl.load(table_ptr + offs * cols + safe_idx, mask=mask, other=0)
+    tl.store(out_ptr + offs, tl.where(valid_idx, val, 0).to(tl.int64), mask=mask)
 
 
 def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:

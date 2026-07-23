@@ -66,6 +66,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    target_forward_calls: int
     cuda_graph_reject_reason: Optional[str] = None
     cuda_graph_reject_details: Optional[dict] = None
 
@@ -288,9 +289,16 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        target_forward_calls = int(target_out.model_forward_calls)
+        if target_forward_calls != 1:
+            raise RuntimeError(
+                "DSpark target verify must execute exactly one model forward; "
+                f"observed {target_forward_calls}"
+            )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            target_forward_calls=target_forward_calls,
             cuda_graph_reject_reason=getattr(
                 target_out, "cuda_graph_reject_reason", None
             ),

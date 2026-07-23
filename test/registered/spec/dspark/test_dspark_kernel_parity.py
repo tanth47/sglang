@@ -60,7 +60,10 @@ def _case_accept_greedy(tc):
     bs, t = 8, 6
     candidates = _ri(0, 200, (bs, t))
     target_logits = torch.randn(bs * t, 200, device=DEVICE)
-    for cutoff in (None, _ri(1, t + 1, (bs,), torch.int32)):
+    cutoff_with_dummy_rows = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 0], device=DEVICE, dtype=torch.int32
+    )
+    for cutoff in (None, cutoff_with_dummy_rows):
         tc._parity(
             dspark_accept.AcceptGreedy,
             candidates=candidates,
@@ -70,7 +73,10 @@ def _case_accept_greedy(tc):
         )
     # gather_row_bonus: bonus token at a per-row column index.
     table, idx = _ri(0, VOCAB, (64, t)), _ri(0, t, (64,), torch.int32)
-    ref = table[torch.arange(64, device=DEVICE), idx.long()]
+    idx[::7] = -1
+    safe_idx = idx.clamp(min=0, max=t - 1).long()
+    ref = table[torch.arange(64, device=DEVICE), safe_idx]
+    ref = torch.where(idx >= 0, ref, torch.zeros_like(ref))
     tc._eq(dspark_accept.gather_row_bonus_triton(table=table, idx=idx), ref)
 
 
