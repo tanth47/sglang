@@ -626,12 +626,8 @@ class DeepseekSparseAttnBackend(
                 gfx95_supported=_IS_GFX95,
             )
         )
-        self.supports_unified_dsa_target_verify_graph = (
-            regime_neutral_graph_supported
-        )
-        self.supports_dsa_target_verify_post_topk_graph = (
-            regime_neutral_graph_supported
-        )
+        self.supports_unified_dsa_target_verify_graph = regime_neutral_graph_supported
+        self.supports_dsa_target_verify_post_topk_graph = regime_neutral_graph_supported
         if self.supports_dsa_target_verify_post_topk_graph:
             logger.warning(
                 "ROCm DSA target-verify graph replay is enabled across the "
@@ -941,8 +937,7 @@ class DeepseekSparseAttnBackend(
         else:
             verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
             if any(
-                verify_len < 0
-                or verify_len > self.speculative_num_draft_tokens
+                verify_len < 0 or verify_len > self.speculative_num_draft_tokens
                 for verify_len in verify_lens_cpu
             ):
                 raise RuntimeError(
@@ -1769,15 +1764,15 @@ class DeepseekSparseAttnBackend(
                 if self.supports_unified_dsa_target_verify_graph
                 else (max(verify_lens_cpu) if verify_lens_cpu else 1)
             )
-            page_table_is_token_expanded = (
-                self.supports_unified_dsa_target_verify_graph
-            )
+            page_table_is_token_expanded = self.supports_unified_dsa_target_verify_graph
             real_rows = total_verify_tokens if page_table_is_token_expanded else bs
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
                 max_seqlen_k = self.req_to_token.shape[1]
             else:
-                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:real_rows, :]
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+                    :real_rows, :
+                ]
                 max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = compute_cu_seqlens(verify_lens)
@@ -2055,8 +2050,12 @@ class DeepseekSparseAttnBackend(
                     dst.zero_()
                     dst[: src.numel()].copy_(src)
 
-                _copy_graph_prefix(metadata.indexer_k_start_end[0], indexer_k_start_end[0])
-                _copy_graph_prefix(metadata.indexer_k_start_end[1], indexer_k_start_end[1])
+                _copy_graph_prefix(
+                    metadata.indexer_k_start_end[0], indexer_k_start_end[0]
+                )
+                _copy_graph_prefix(
+                    metadata.indexer_k_start_end[1], indexer_k_start_end[1]
+                )
                 _copy_graph_prefix(metadata.indexer_seq_lens_cpu, indexer_seq_lens_cpu)
                 _copy_graph_prefix(metadata.indexer_seq_lens, indexer_seq_lens)
                 _copy_graph_prefix(metadata.token_to_batch_idx, token_to_batch_idx)

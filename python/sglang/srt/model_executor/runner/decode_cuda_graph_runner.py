@@ -745,7 +745,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self.capture_forward_mode.is_target_verify()
             and is_hip()
             and getattr(self.attn_backend, "use_dsa", False)
-            and not getattr(self.attn_backend, "supports_unified_dsa_target_verify_graph", False)
+            and not getattr(
+                self.attn_backend, "supports_unified_dsa_target_verify_graph", False
+            )
             and getattr(self.attn_backend, "dsa_index_topk", None) is not None
         ):
             return [None]
@@ -793,7 +795,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.model_runner.is_draft_worker
             and is_hip()
             and getattr(self.attn_backend, "use_dsa", False)
-            and not getattr(self.attn_backend, "supports_unified_dsa_target_verify_graph", False)
+            and not getattr(
+                self.attn_backend, "supports_unified_dsa_target_verify_graph", False
+            )
         ):
             return None
         dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
@@ -869,15 +873,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             device=self.device,
             grid=self.capture_num_tokens,
         )
-        if (
-            not getattr(
-                self.attn_backend,
-                "supports_unified_dsa_target_verify_graph",
-                False,
-            )
-            and is_static_full_verify_layout(
-                layout, num_tokens_per_req=self.num_tokens_per_req
-            )
+        if not getattr(
+            self.attn_backend,
+            "supports_unified_dsa_target_verify_graph",
+            False,
+        ) and is_static_full_verify_layout(
+            layout, num_tokens_per_req=self.num_tokens_per_req
         ):
             return None
         return layout

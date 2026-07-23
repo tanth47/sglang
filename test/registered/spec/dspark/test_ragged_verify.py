@@ -108,9 +108,7 @@ class TestTargetVerifyPageTableContract(unittest.TestCase):
         )
 
         self.assertEqual(capture_page_table.shape, replay_page_table.shape)
-        self.assertEqual(
-            replay_page_table[:12, 0].tolist(), [0] * 8 + [1] + [2] * 3
-        )
+        self.assertEqual(replay_page_table[:12, 0].tolist(), [0] * 8 + [1] + [2] * 3)
         self.assertEqual(int(replay.verify_lens.sum()), 32)
         self.assertLessEqual(int(replay.verify_lens.max()), 8)
 
@@ -380,7 +378,6 @@ class TestDsaTargetVerifyGraphAdmission(unittest.TestCase):
         runner._log_graph_reject.assert_called_once_with(
             forward_batch, "missing_ragged_layout"
         )
-
 
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):

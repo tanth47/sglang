@@ -629,9 +629,9 @@ def accept_greedy(
             correct_len=correct_len, verify_lens=cutoff_verify_lens
         )
         row_ids = torch.arange(bs, device=target_predict.device)
-        safe_correct_len = correct_len.clamp(
-            min=0, max=target_predict.shape[1] - 1
-        ).to(torch.long)
+        safe_correct_len = correct_len.clamp(min=0, max=target_predict.shape[1] - 1).to(
+            torch.long
+        )
         bonus = target_predict[row_ids, safe_correct_len]
         bonus = torch.where(correct_len >= 0, bonus, torch.zeros_like(bonus)).to(
             torch.int64

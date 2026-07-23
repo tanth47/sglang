@@ -14,9 +14,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(
-    est_time=10, stage="stage-b", runner_config="1-gpu-small-amd"
-)
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class TestRaggedVerifyGraphCapability(CustomTestCase):
@@ -214,8 +212,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         spec_info = SimpleNamespace(ragged_verify_layout=layout)
 
         with mock.patch(
-            "sglang.srt.layers.attention.dsa_backend."
-            "materialize_verify_lens_cpu",
+            "sglang.srt.layers.attention.dsa_backend." "materialize_verify_lens_cpu",
             side_effect=AssertionError("unexpected D2H verify-lens materialization"),
         ):
             verify_lens, physical_lens_cpu, total_tokens = (
@@ -236,8 +233,7 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
             graph_num_tokens=128,
         )
         with mock.patch(
-            "sglang.srt.layers.attention.dsa_backend."
-            "materialize_verify_lens_cpu",
+            "sglang.srt.layers.attention.dsa_backend." "materialize_verify_lens_cpu",
             side_effect=AssertionError("unexpected D2H verify-lens materialization"),
         ):
             large_lens, large_physical_cpu, large_total = (
@@ -276,16 +272,13 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
                     _precompute_target_verify_mode=target_helper,
                 )
 
-                actual = (
-                    DeepseekSparseAttnBackendMTPPrecomputeMixin
-                    ._precompute_replay_metadata(
-                        backend,
-                        bs=2,
-                        req_pool_indices=torch.tensor([0, 1]),
-                        seq_lens=torch.tensor([8, 9]),
-                        seq_lens_cpu=[8, 9],
-                        forward_mode=forward_mode,
-                    )
+                actual = DeepseekSparseAttnBackendMTPPrecomputeMixin._precompute_replay_metadata(
+                    backend,
+                    bs=2,
+                    req_pool_indices=torch.tensor([0, 1]),
+                    seq_lens=torch.tensor([8, 9]),
+                    seq_lens_cpu=[8, 9],
+                    forward_mode=forward_mode,
                 )
 
                 self.assertIs(actual, expected)
