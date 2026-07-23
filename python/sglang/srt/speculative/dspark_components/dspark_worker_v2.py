@@ -51,12 +51,49 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    verify_logits_adjustments_are_noop,
+    verify_logits_adjustments_noop_reject_reason,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+
+def _folded_accept_reject_reason(
+    *,
+    has_verify_epilogue: bool,
+    proposal_folded: bool,
+    logits_adjustments_reject_reason: Optional[str],
+    simulate_acc_len: float,
+    run_compact: bool,
+    target_verify_cuda_graph: bool,
+) -> Optional[str]:
+    if not has_verify_epilogue:
+        return "no_verify_epilogue"
+    if not proposal_folded:
+        return "proposal_not_folded"
+    if logits_adjustments_reject_reason is not None:
+        return f"logits_adjustments:{logits_adjustments_reject_reason}"
+    if simulate_acc_len > 0:
+        return "simulate_acc_len"
+    if not run_compact:
+        return "non_compact_verify"
+    if not target_verify_cuda_graph:
+        return "target_verify_no_cuda_graph"
+    return None
+
+
+def _folded_commit_reject_reason(
+    *,
+    folded_accept: bool,
+    folded_accept_reject_reason: Optional[str],
+    commit_fold_reject_reason: Optional[str],
+) -> Optional[str]:
+    if folded_accept and commit_fold_reject_reason is None:
+        return None
+    if not folded_accept:
+        return folded_accept_reject_reason or "folded_accept_rejected"
+    return commit_fold_reject_reason or "commit_inject_capability_unavailable"
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -192,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
-            and is_cuda()
+            and (is_cuda() or is_hip())
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
@@ -576,10 +613,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        logits_adjustments_reject_reason = verify_logits_adjustments_noop_reject_reason(
+            sampling_info
+        )
+        has_verify_epilogue = self._verify_executor.verify_epilogue is not None
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            has_verify_epilogue
             and proposal.folded
-            and verify_logits_adjustments_are_noop(sampling_info)
+            and logits_adjustments_reject_reason is None
             and self._simulate_acc_len <= 0
         )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
@@ -605,9 +646,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        cuda_graph_reject_reason = target_verify.cuda_graph_reject_reason
+        cuda_graph_reject_details = target_verify.cuda_graph_reject_details
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        folded_accept_reject_reason = None
+        if not folded_accept:
+            folded_accept_reject_reason = _folded_accept_reject_reason(
+                has_verify_epilogue=has_verify_epilogue,
+                proposal_folded=proposal.folded,
+                logits_adjustments_reject_reason=logits_adjustments_reject_reason,
+                simulate_acc_len=self._simulate_acc_len,
+                run_compact=run_compact,
+                target_verify_cuda_graph=can_run_cuda_graph,
+            )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
@@ -630,9 +683,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(accept.new_seq_lens)
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        commit_fold_reject_reason = (
+            "no_verify_epilogue"
+            if epilogue is None
+            else epilogue.commit_fold_reject_reason
+        )
+        folds_commit = commit_fold_reject_reason is None
+        folded_commit = folded_accept and folds_commit
+        folded_commit_reject_reason = _folded_commit_reject_reason(
+            folded_accept=folded_accept,
+            folded_accept_reject_reason=folded_accept_reject_reason,
+            commit_fold_reject_reason=commit_fold_reject_reason,
+        )
+        commit_inject_path = "folded_graph" if folded_commit else None
         if not folded_commit:
-            self._verify_executor.commit_hidden(
+            commit_inject_path = self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
@@ -666,6 +731,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=dp_tier_num_tokens,
             target_verify_cuda_graph=can_run_cuda_graph,
+            target_forward_calls=target_verify.target_forward_calls,
+            target_verify_cuda_graph_reject_reason=cuda_graph_reject_reason,
+            target_verify_cuda_graph_reject_details=cuda_graph_reject_details,
+            compact_verify=run_compact,
+            fold_eligible=fold_eligible,
+            folded_accept=folded_accept,
+            folded_commit=folded_commit,
+            folded_accept_reject_reason=folded_accept_reject_reason,
+            folded_commit_reject_reason=folded_commit_reject_reason,
+            commit_fold_capability_reject_reason=commit_fold_reject_reason,
+            commit_inject_path=commit_inject_path,
         )
 
         next_draft_input = make_next_draft_input(
@@ -681,6 +757,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 layout.verify_lens.to(torch.int32) if layout is not None else None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
+            cuda_graph_reject_reason=cuda_graph_reject_reason,
+            cuda_graph_reject_details=cuda_graph_reject_details,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,

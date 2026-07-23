@@ -691,6 +691,7 @@ class Envs:
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH = EnvBool(False)
     SGLANG_DSA_DEBUG_RAGGED_VERIFY_GRAPH = EnvBool(False)
+    SGLANG_DSA_TARGET_VERIFY_GRAPH_TOPK_TRANSITION_MAX_SAFE_BS = EnvInt(0)
     SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION = EnvBool(False)
 
     # sgl-kernel
@@ -750,7 +751,6 @@ class Envs:
     # full block.
     SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS = EnvInt(0)
     SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS = EnvInt(1)
-    SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

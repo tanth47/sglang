@@ -16,7 +16,6 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -28,6 +27,18 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 logger = logging.getLogger(__name__)
 
 _NULL_SEGMENT = nullcontext()
+
+
+def _compute_correct_drafts_and_bonus(
+    *, candidates: torch.Tensor, target_predict: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    bonus = target_predict[
+        torch.arange(candidates.shape[0], device=candidates.device), correct_len
+    ]
+    return correct_len, bonus.to(torch.int64)
+
 
 ALL_COMPONENTS_TOKEN = "all"
 
@@ -104,6 +115,18 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
     target_verify_cuda_graph: Optional[bool] = None
+    target_forward_calls: Optional[int] = None
+    target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
+    commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
     budget_dry_run: bool = False
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
@@ -126,6 +149,7 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    target_forward_calls: int
     budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
@@ -139,6 +163,17 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
+    commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
+    target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -153,6 +188,7 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
     target_verify_cuda_graph: bool
+    target_forward_calls: int
     budget_dry_run: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
@@ -160,6 +196,17 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    compact_verify: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    fold_eligible: Optional[bool] = None
+    folded_accept: Optional[bool] = None
+    folded_commit: Optional[bool] = None
+    folded_accept_reject_reason: Optional[str] = None
+    folded_commit_reject_reason: Optional[str] = None
+    commit_fold_capability_reject_reason: Optional[str] = None
+    commit_inject_path: Optional[str] = None
+    target_verify_cuda_graph_reject_reason: Optional[str] = None
+    target_verify_cuda_graph_reject_details: Optional[dict] = None
 
 
 class DsparkInfoDumper:
@@ -264,11 +311,29 @@ class DsparkInfoDumper:
             verify_tokens_dp_synced=int(obs.verify_tokens_dp_synced),
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
             target_verify_cuda_graph=bool(obs.target_verify_cuda_graph),
+            target_forward_calls=int(obs.target_forward_calls),
+            target_verify_cuda_graph_reject_reason=(
+                obs.target_verify_cuda_graph_reject_reason
+            ),
+            target_verify_cuda_graph_reject_details=(
+                obs.target_verify_cuda_graph_reject_details
+            ),
             budget_dry_run=bool(obs.budget_dry_run),
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
+            compact_verify=obs.compact_verify,
+            proposal_folded=obs.proposal_folded,
+            fold_eligible=obs.fold_eligible,
+            folded_accept=obs.folded_accept,
+            folded_commit=obs.folded_commit,
+            folded_accept_reject_reason=obs.folded_accept_reject_reason,
+            folded_commit_reject_reason=obs.folded_commit_reject_reason,
+            commit_fold_capability_reject_reason=(
+                obs.commit_fold_capability_reject_reason
+            ),
+            commit_inject_path=obs.commit_inject_path,
             future=future,
             segment_events=self._current_segments,
         )
@@ -366,6 +431,24 @@ class DsparkInfoDumper:
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.target_verify_cuda_graph = pending.target_verify_cuda_graph
+            record.target_forward_calls = pending.target_forward_calls
+            record.target_verify_cuda_graph_reject_reason = (
+                pending.target_verify_cuda_graph_reject_reason
+            )
+            record.target_verify_cuda_graph_reject_details = (
+                pending.target_verify_cuda_graph_reject_details
+            )
+            record.compact_verify = pending.compact_verify
+            record.proposal_folded = pending.proposal_folded
+            record.fold_eligible = pending.fold_eligible
+            record.folded_accept = pending.folded_accept
+            record.folded_commit = pending.folded_commit
+            record.folded_accept_reject_reason = pending.folded_accept_reject_reason
+            record.folded_commit_reject_reason = pending.folded_commit_reject_reason
+            record.commit_fold_capability_reject_reason = (
+                pending.commit_fold_capability_reject_reason
+            )
+            record.commit_inject_path = pending.commit_inject_path
             record.budget_dry_run = pending.budget_dry_run
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
@@ -722,7 +805,7 @@ class ConfidenceMetricsProbe:
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self.verify_num_draft_tokens
         )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, _ = _compute_correct_drafts_and_bonus(
             candidates=verify_ids_2d,
             target_predict=target_predict,
         )
@@ -858,6 +941,17 @@ class DsparkStepObservers:
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
         target_verify_cuda_graph: bool,
+        target_forward_calls: int,
+        target_verify_cuda_graph_reject_reason: Optional[str],
+        target_verify_cuda_graph_reject_details: Optional[dict],
+        compact_verify: bool,
+        fold_eligible: bool,
+        folded_accept: bool,
+        folded_commit: bool,
+        folded_accept_reject_reason: Optional[str],
+        folded_commit_reject_reason: Optional[str],
+        commit_fold_capability_reject_reason: Optional[str],
+        commit_inject_path: Optional[str],
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -946,6 +1040,24 @@ class DsparkStepObservers:
                     ),
                     verify_tokens_graph_key=num_verify_tokens,
                     target_verify_cuda_graph=target_verify_cuda_graph,
+                    target_forward_calls=target_forward_calls,
+                    target_verify_cuda_graph_reject_reason=(
+                        target_verify_cuda_graph_reject_reason
+                    ),
+                    target_verify_cuda_graph_reject_details=(
+                        target_verify_cuda_graph_reject_details
+                    ),
+                    compact_verify=compact_verify,
+                    proposal_folded=proposal_folded,
+                    fold_eligible=fold_eligible,
+                    folded_accept=folded_accept,
+                    folded_commit=folded_commit,
+                    folded_accept_reject_reason=folded_accept_reject_reason,
+                    folded_commit_reject_reason=folded_commit_reject_reason,
+                    commit_fold_capability_reject_reason=(
+                        commit_fold_capability_reject_reason
+                    ),
+                    commit_inject_path=commit_inject_path,
                     budget_dry_run=budget_dry_run,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
@@ -985,7 +1097,7 @@ class DsparkStepObservers:
         target_predict = torch.argmax(target_logits, dim=-1).view(
             bs, self._verify_num_draft_tokens
         )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+        num_correct_drafts, _ = _compute_correct_drafts_and_bonus(
             candidates=verify_ids_2d,
             target_predict=target_predict,
         )

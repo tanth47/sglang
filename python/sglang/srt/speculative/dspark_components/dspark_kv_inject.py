@@ -1,13 +1,17 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class TargetHiddenKvInjector:
@@ -36,9 +40,9 @@ class TargetHiddenKvInjector:
         positions: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> str:
         if target_hidden is None or target_hidden.numel() == 0:
-            return
+            return "empty"
         device = self.model_runner.device
         cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
@@ -65,7 +69,9 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
             )
-            return
+            if commit_lens is not None and cache_loc_2d is not None:
+                return "swa_fused_masked"
+            return "swa_fused_full"
 
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
@@ -76,6 +82,9 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
             )
+        if cache_loc_2d is not None and commit_lens is not None:
+            return "generic_prefix_valid"
+        return "generic_full"
 
     def _inject_mla(
         self,
@@ -110,7 +119,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
-    ) -> None:
+    ) -> str:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
         hidden = hidden_strided.view(bs, stride, -1)
@@ -118,7 +127,7 @@ class TargetHiddenKvInjector:
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
-                return
+                return "empty"
             inject_layout = BuildCommitInjectLayout.execute(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
@@ -135,7 +144,7 @@ class TargetHiddenKvInjector:
                     positions=inject_layout.positions,
                     pool=pool,
                 )
-            return
+            return "ragged_swa_fused_layout"
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
         verify_cache_loc = assign_extend_cache_locs_func(
@@ -148,7 +157,7 @@ class TargetHiddenKvInjector:
             device=self.device,
         )
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
-        self.inject_target_hidden(
+        return self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_cache_loc,
             cache_loc_2d=verify_cache_loc_2d,

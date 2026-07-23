@@ -2009,7 +2009,11 @@ class Indexer(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                if _is_hip and forward_batch.forward_mode.is_target_verify():
+                if (
+                    _is_hip
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not metadata.attn_metadata.page_table_is_token_expanded
+                ):
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
                         forward_batch,

@@ -516,9 +516,12 @@ class TpModelWorker(BaseTpWorker):
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
+                cuda_graph_reject_reason=out.cuda_graph_reject_reason,
+                cuda_graph_reject_details=out.cuda_graph_reject_details,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                model_forward_calls=1,
             )
 
             if is_verify:
@@ -572,7 +575,10 @@ class TpModelWorker(BaseTpWorker):
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
+                cuda_graph_reject_reason=out.cuda_graph_reject_reason,
+                cuda_graph_reject_details=out.cuda_graph_reject_details,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                model_forward_calls=1,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
@@ -593,6 +599,8 @@ class TpModelWorker(BaseTpWorker):
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
+            cuda_graph_reject_reason=out.cuda_graph_reject_reason,
+            cuda_graph_reject_details=out.cuda_graph_reject_details,
             expert_distribution_metrics=out.expert_distribution_metrics,
         )
         batch_result.next_token_ids = next_token_ids

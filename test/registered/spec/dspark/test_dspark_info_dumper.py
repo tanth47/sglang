@@ -13,7 +13,6 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     resolve_enabled_components,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -50,6 +49,19 @@ def make_obs(
     bs=4,
     num_verify_tokens=24,
     planned_num_verify_tokens=None,
+    target_verify_cuda_graph=False,
+    target_forward_calls=1,
+    target_verify_cuda_graph_reject_reason=None,
+    target_verify_cuda_graph_reject_details=None,
+    compact_verify=None,
+    proposal_folded=None,
+    fold_eligible=None,
+    folded_accept=None,
+    folded_commit=None,
+    folded_accept_reject_reason=None,
+    folded_commit_reject_reason=None,
+    commit_fold_capability_reject_reason=None,
+    commit_inject_path=None,
     predicted_step_ms=None,
     predicted_theta=None,
 ):
@@ -66,7 +78,12 @@ def make_obs(
         verify_tokens_local=num_verify_tokens,
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
-        target_verify_cuda_graph=False,
+        target_verify_cuda_graph=target_verify_cuda_graph,
+        target_forward_calls=target_forward_calls,
+        target_verify_cuda_graph_reject_reason=(target_verify_cuda_graph_reject_reason),
+        target_verify_cuda_graph_reject_details=(
+            target_verify_cuda_graph_reject_details
+        ),
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
@@ -80,10 +97,19 @@ def make_obs(
         cap_trim_lens=torch.zeros((bs,), dtype=torch.int32),
         commit_lens=torch.full((bs,), 4, dtype=torch.int32),
         rids=[f"r{i}" for i in range(bs)],
+        compact_verify=compact_verify,
+        proposal_folded=proposal_folded,
+        fold_eligible=fold_eligible,
+        folded_accept=folded_accept,
+        folded_commit=folded_commit,
+        folded_accept_reject_reason=folded_accept_reject_reason,
+        folded_commit_reject_reason=folded_commit_reject_reason,
+        commit_fold_capability_reject_reason=(commit_fold_capability_reject_reason),
+        commit_inject_path=commit_inject_path,
     )
 
 
-class TestResolveComponents(CustomTestCase):
+class TestResolveComponents(unittest.TestCase):
     def test_empty_disables(self):
         self.assertEqual(resolve_components(()), set())
 
@@ -122,7 +148,7 @@ class TestResolveComponents(CustomTestCase):
                 )
 
 
-class TestCoreAndCpuTiming(CustomTestCase):
+class TestCoreAndCpuTiming(unittest.TestCase):
     def test_disabled_dumper_records_nothing(self):
         dumper, clock = make_dumper(set())
         dumper.begin_step()
@@ -172,6 +198,131 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["num_verify_tokens"], 18)
         self.assertEqual(record["planned_num_verify_tokens"], 18)
         self.assertEqual(record["mode"], "static")
+
+    def test_core_records_folded_path_diagnostics(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=True,
+                compact_verify=True,
+                proposal_folded=True,
+                fold_eligible=True,
+                folded_accept=True,
+                folded_commit=False,
+                folded_commit_reject_reason="pool_missing_fused_swa_commit",
+                commit_fold_capability_reject_reason=("pool_missing_fused_swa_commit"),
+                commit_inject_path="generic_prefix_valid",
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertTrue(record["target_verify_cuda_graph"])
+        self.assertEqual(record["target_forward_calls"], 1)
+        self.assertTrue(record["compact_verify"])
+        self.assertTrue(record["proposal_folded"])
+        self.assertTrue(record["fold_eligible"])
+        self.assertTrue(record["folded_accept"])
+        self.assertFalse(record["folded_commit"])
+        self.assertNotIn("folded_accept_reject_reason", record)
+        self.assertEqual(
+            record["folded_commit_reject_reason"],
+            "pool_missing_fused_swa_commit",
+        )
+        self.assertEqual(
+            record["commit_fold_capability_reject_reason"],
+            "pool_missing_fused_swa_commit",
+        )
+        self.assertEqual(record["commit_inject_path"], "generic_prefix_valid")
+
+    def test_core_separates_commit_step_reject_from_capability_reject(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=False,
+                compact_verify=True,
+                proposal_folded=True,
+                fold_eligible=True,
+                folded_accept=True,
+                folded_commit=False,
+                folded_commit_reject_reason="target_verify_not_full_graph",
+                commit_fold_capability_reject_reason=("pool_missing_fused_swa_commit"),
+                commit_inject_path="generic_prefix_valid",
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(
+            record["folded_commit_reject_reason"], "target_verify_not_full_graph"
+        )
+        self.assertEqual(
+            record["commit_fold_capability_reject_reason"],
+            "pool_missing_fused_swa_commit",
+        )
+        self.assertEqual(record["commit_inject_path"], "generic_prefix_valid")
+
+    def test_core_records_folded_commit_inject_path(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=True,
+                compact_verify=True,
+                proposal_folded=True,
+                fold_eligible=True,
+                folded_accept=True,
+                folded_commit=True,
+                commit_inject_path="folded_graph",
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertTrue(record["folded_commit"])
+        self.assertEqual(record["commit_inject_path"], "folded_graph")
+
+    def test_core_records_target_verify_graph_reject_reason(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=False,
+                target_verify_cuda_graph_reject_reason=(
+                    "rocm_dsa_target_verify_index_topk_mixed_transition"
+                ),
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertFalse(record["target_verify_cuda_graph"])
+        self.assertEqual(
+            record["target_verify_cuda_graph_reject_reason"],
+            "rocm_dsa_target_verify_index_topk_mixed_transition",
+        )
+
+    def test_core_records_target_verify_graph_reject_details(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(
+                forward_ct=7,
+                target_verify_cuda_graph=False,
+                target_verify_cuda_graph_reject_reason=(
+                    "rocm_dsa_target_verify_index_topk_window_transition"
+                ),
+                target_verify_cuda_graph_reject_details={
+                    "dsa_index_topk": 2048,
+                    "graph_regime": "window_transition",
+                    "verify_lens": [8, 8, 8],
+                    "verify_len_total": 24,
+                },
+            )
+        )
+        record = dumper.dump()["records"][0]
+        self.assertEqual(
+            record["target_verify_cuda_graph_reject_details"],
+            {
+                "dsa_index_topk": 2048,
+                "graph_regime": "window_transition",
+                "verify_lens": [8, 8, 8],
+                "verify_len_total": 24,
+            },
+        )
 
     def test_core_fields_report_dry_run_planned_verify_tokens(self):
         dumper, _ = make_dumper({"core"})
@@ -245,7 +396,7 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual([r["forward_ct"] for r in dumper.dump()["records"]], [9, 10])
 
 
-class TestPredictedStepFields(CustomTestCase):
+class TestPredictedStepFields(unittest.TestCase):
     def test_predicted_fields_recorded_under_core(self):
         dumper, clock = make_dumper({"core"})
         dumper.observe_decode_step(
@@ -280,6 +431,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
         target_verify_cuda_graph=False,
+        target_forward_calls=1,
         budget_dry_run=False,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=1.0,
@@ -290,7 +442,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
     )
 
 
-class TestOnlineSpsReporter(CustomTestCase):
+class TestOnlineSpsReporter(unittest.TestCase):
     def test_report_interval_enables_dumper_and_gpu_timing(self):
         dumper, _ = make_dumper(set(), sps_report_interval=2)
         self.assertTrue(dumper.enabled)
@@ -349,7 +501,7 @@ class TestOnlineSpsReporter(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA for d2h staging")
-class TestReqsAndGpuTiming(CustomTestCase):
+class TestReqsAndGpuTiming(unittest.TestCase):
     def _cuda_obs(self, *, forward_ct, bs=4):
         obs = make_obs(forward_ct=forward_ct, bs=bs)
         return DecodeStepObservation(
@@ -364,6 +516,7 @@ class TestReqsAndGpuTiming(CustomTestCase):
             verify_tokens_dp_synced=obs.verify_tokens_dp_synced,
             verify_tokens_graph_key=obs.verify_tokens_graph_key,
             target_verify_cuda_graph=obs.target_verify_cuda_graph,
+            target_forward_calls=obs.target_forward_calls,
             budget_dry_run=obs.budget_dry_run,
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,

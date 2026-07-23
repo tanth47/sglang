@@ -1,13 +1,14 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
+from __future__ import annotations
+
 import contextlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -17,6 +18,9 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils.common import is_pin_memory_available
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -107,7 +111,7 @@ class DFlashDraftInputV2(SpecInput):
             )
 
     @classmethod
-    def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
+    def create_idle_input(cls, device: torch.device) -> DFlashDraftInputV2:
         return cls(
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
@@ -265,7 +269,7 @@ class DFlashDraftInputV2(SpecInput):
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
 
-    def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+    def merge_batch(self, spec_info: DFlashDraftInputV2):
         if self.reserved_seq_lens_cpu is not None:
             assert spec_info.reserved_seq_lens_cpu is not None
             self.reserved_seq_lens_cpu = torch.cat(

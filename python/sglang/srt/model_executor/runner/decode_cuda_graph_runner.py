@@ -94,13 +94,21 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
+    DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
+    DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
     build_ragged_verify_token_buckets,
     classify_dsa_target_verify_graph_regime,
+    classify_dsa_target_verify_graph_reject_reason,
     is_static_full_verify_layout,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
+    required_padded_verify_slots,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import (
@@ -144,6 +152,7 @@ def build_replay_fb_view(
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
+    preserve_static_full_verify_layout: bool = False,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 
@@ -166,10 +175,14 @@ def build_replay_fb_view(
     extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
     extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
     graph_spec_info = resolve_graph_spec_info(
-        forward_batch, num_tokens_per_req=num_tokens_per_req
+        forward_batch,
+        num_tokens_per_req=num_tokens_per_req,
+        preserve_static_full_layout=preserve_static_full_verify_layout,
     )
     ragged_layout = resolve_graph_ragged_verify_layout(
-        forward_batch, num_tokens_per_req=num_tokens_per_req
+        forward_batch,
+        num_tokens_per_req=num_tokens_per_req,
+        preserve_static_full_layout=preserve_static_full_verify_layout,
     )
     if capture_forward_mode.is_target_verify() and ragged_layout is not None:
         extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
@@ -236,22 +249,34 @@ def build_replay_fb_view(
 
 
 def resolve_graph_ragged_verify_layout(
-    forward_batch: ForwardBatch, *, num_tokens_per_req: int
+    forward_batch: ForwardBatch,
+    *,
+    num_tokens_per_req: int,
+    preserve_static_full_layout: bool = False,
 ):
     layout = resolve_ragged_verify_layout(forward_batch)
     if layout is None:
         return None
-    if is_static_full_verify_layout(layout, num_tokens_per_req=num_tokens_per_req):
+    if not preserve_static_full_layout and is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
         return None
     return layout
 
 
-def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: int):
+def resolve_graph_spec_info(
+    forward_batch: ForwardBatch,
+    *,
+    num_tokens_per_req: int,
+    preserve_static_full_layout: bool = False,
+):
     spec_info = getattr(forward_batch, "spec_info", None)
     layout = getattr(spec_info, "ragged_verify_layout", None)
     if layout is None:
         return spec_info
-    if not is_static_full_verify_layout(layout, num_tokens_per_req=num_tokens_per_req):
+    if preserve_static_full_layout or not is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
         return spec_info
     spec_info = copy.copy(spec_info)
     spec_info.ragged_verify_layout = None
@@ -379,9 +404,31 @@ def dsa_target_verify_graph_debug_info(
         post_topk_guard_tokens=post_topk_guard_tokens,
         post_topk_capture_seq_len=post_topk_capture_seq_len,
     )
+    graph_reject_reason = classify_dsa_target_verify_graph_reject_reason(
+        seq_lens_cpu=seq_lens_cpu_list,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
+    )
+    graph_regime_label = graph_regime
+    if graph_regime_label is None:
+        if graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT:
+            graph_regime_label = "post_topk_no_capture_contract"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT:
+            graph_regime_label = "post_topk_above_capture_contract"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT:
+            graph_regime_label = "post_topk_capture_seq_len_mismatch"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT:
+            graph_regime_label = "window_transition"
+        elif graph_reject_reason == DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT:
+            graph_regime_label = "batch_mixed_regions"
+        else:
+            graph_regime_label = "mixed_or_transition"
     details = {
         "dsa_index_topk": int(dsa_index_topk),
-        "graph_regime": graph_regime or "mixed_or_transition",
+        "graph_regime": graph_regime_label,
+        "graph_reject_reason": graph_reject_reason,
         "num_tokens_per_req": int(num_tokens_per_req),
         "post_topk_capture_seq_len": post_topk_capture_seq_len,
         "post_topk_guard_tokens": int(post_topk_guard_tokens),
@@ -514,6 +561,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._ragged_graph_size = 0
         self._logged_graph_reject_keys = set()
+        self.last_graph_reject_reason: Optional[str] = None
+        self.last_graph_reject_details: Optional[dict] = None
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -682,19 +731,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
-    def _dsa_target_verify_graph_extra_labels(self) -> list[Optional[str]]:
+    def _dsa_target_verify_post_topk_graph_enabled_for_bs(self, bs: int) -> bool:
+        if not envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get():
+            return False
+        max_safe_bs = (
+            envs.SGLANG_DSA_TARGET_VERIFY_GRAPH_TOPK_TRANSITION_MAX_SAFE_BS.get()
+        )
+        return max_safe_bs > 0 and int(bs) <= int(max_safe_bs)
+
+    def _dsa_target_verify_graph_extra_labels(self, bs: int) -> list[Optional[str]]:
         if not (
             self.ragged_verify_mode
             and self.capture_forward_mode.is_target_verify()
             and is_hip()
             and getattr(self.attn_backend, "use_dsa", False)
+            and not getattr(
+                self.attn_backend, "supports_unified_dsa_target_verify_graph", False
+            )
             and getattr(self.attn_backend, "dsa_index_topk", None) is not None
         ):
             return [None]
         # TODO(GLM/ROCm DSA): this is an experimental, test-only contract for
         # validating post-topk target-verify graph replay on MI350. Keep it
         # opt-in until long-context post-topk replay is proven stable.
-        if not envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get():
+        if not self._dsa_target_verify_post_topk_graph_enabled_for_bs(bs):
             return [None]
         if self._dsa_target_verify_post_topk_capture_seq_len() is None:
             return [None]
@@ -735,6 +795,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.model_runner.is_draft_worker
             and is_hip()
             and getattr(self.attn_backend, "use_dsa", False)
+            and not getattr(
+                self.attn_backend, "supports_unified_dsa_target_verify_graph", False
+            )
         ):
             return None
         dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
@@ -750,7 +813,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_topk_capture_seq_len=(
                 self._dsa_target_verify_post_topk_capture_seq_len()
-                if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                if self._dsa_target_verify_post_topk_graph_enabled_for_bs(
+                    forward_batch.batch_size
+                )
                 else None
             ),
         )
@@ -784,8 +849,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4(server_args=model_runner.server_args)
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.num_tokens_per_req
         return self.attn_backend.ragged_verify_capture_slots(
             num_tokens=num_tokens,
             max_bs=self.max_bs,
@@ -794,8 +857,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
-            return None
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
@@ -812,13 +873,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             device=self.device,
             grid=self.capture_num_tokens,
         )
-        if is_static_full_verify_layout(
+        if not getattr(
+            self.attn_backend,
+            "supports_unified_dsa_target_verify_graph",
+            False,
+        ) and is_static_full_verify_layout(
             layout, num_tokens_per_req=self.num_tokens_per_req
         ):
             return None
         return layout
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        self.last_graph_reject_reason = None
+        self.last_graph_reject_details = None
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             self._log_graph_reject(forward_batch, "replace_embeds")
@@ -829,19 +897,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.ragged_verify_mode
             else None
         )
-        ragged_layout = (
-            resolve_graph_ragged_verify_layout(
-                forward_batch, num_tokens_per_req=self.num_tokens_per_req
-            )
-            if raw_ragged_layout is not None
-            else None
-        )
 
         if (
             forward_batch.forward_mode.is_target_verify()
             and not self.model_runner.is_draft_worker
             and is_hip()
             and getattr(self.attn_backend, "use_dsa", False)
+            and not getattr(
+                self.attn_backend,
+                "supports_dsa_target_verify_post_topk_graph",
+                False,
+            )
         ):
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
@@ -852,7 +918,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 post_topk_capture_seq_len = (
                     self._dsa_target_verify_post_topk_capture_seq_len()
-                    if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                    if self._dsa_target_verify_post_topk_graph_enabled_for_bs(
+                        forward_batch.batch_size
+                    )
                     else None
                 )
                 if raw_ragged_layout is not None:
@@ -867,17 +935,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else:
                     graph_regime = None
                 if raw_ragged_layout is not None and graph_regime is None:
+                    debug_info = dsa_target_verify_graph_debug_info(
+                        forward_batch,
+                        raw_ragged_layout,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                        post_topk_guard_tokens=post_topk_guard_tokens,
+                        post_topk_capture_seq_len=post_topk_capture_seq_len,
+                    )
+                    reject_reason = (
+                        debug_info.pop("graph_reject_reason", None)
+                        or DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
+                    )
                     self._log_graph_reject(
                         forward_batch,
-                        "rocm_dsa_target_verify_index_topk_mixed_transition",
-                        **dsa_target_verify_graph_debug_info(
-                            forward_batch,
-                            raw_ragged_layout,
-                            num_tokens_per_req=self.num_tokens_per_req,
-                            dsa_index_topk=int(dsa_index_topk),
-                            post_topk_guard_tokens=post_topk_guard_tokens,
-                            post_topk_capture_seq_len=post_topk_capture_seq_len,
-                        ),
+                        reject_reason,
+                        **debug_info,
                     )
                     return False
                 if raw_ragged_layout is None:
@@ -903,11 +976,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         )
                         return False
 
+        ragged_layout = (
+            resolve_graph_ragged_verify_layout(
+                forward_batch,
+                num_tokens_per_req=self.num_tokens_per_req,
+                preserve_static_full_layout=getattr(
+                    self.attn_backend,
+                    "supports_unified_dsa_target_verify_graph",
+                    False,
+                ),
+            )
+            if raw_ragged_layout is not None
+            else None
+        )
+
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if (
             self.ragged_verify_mode
-            and forward_batch.forward_mode.is_target_verify()
+            and self.capture_forward_mode.is_target_verify()
             and raw_ragged_layout is None
         ):
             self._log_graph_reject(forward_batch, "missing_ragged_layout")
@@ -1010,9 +1097,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return False
 
         admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        capture_slots = self._ragged_capture_slots(admission_tokens)
+        required_slots = required_padded_verify_slots(
+            ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+        )
+        is_tokens_supported = admission_tokens <= self.capture_num_tokens[-1]
+        is_slots_supported = required_slots <= capture_slots
 
         is_dp_supported = (
             forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
@@ -1041,6 +1131,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ok = (
             is_tokens_supported
             and is_dp_supported
+            and is_slots_supported
             and is_encoder_lens_supported
             and capture_hidden_mode_matches
         )
@@ -1051,8 +1142,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 admission_tokens=int(admission_tokens),
                 max_capture_tokens=int(self.capture_num_tokens[-1]),
                 batch_size=int(forward_batch.batch_size),
-                capture_slots=int(self._ragged_capture_slots(admission_tokens)),
+                capture_slots=int(capture_slots),
+                required_slots=int(required_slots),
                 tokens_supported=is_tokens_supported,
+                slots_supported=is_slots_supported,
                 dp_supported=is_dp_supported,
                 encoder_lens_supported=is_encoder_lens_supported,
                 capture_hidden_mode_matches=capture_hidden_mode_matches,
@@ -1062,6 +1155,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return ok
 
     def _log_graph_reject(self, forward_batch: ForwardBatch, reason: str, **kwargs):
+        self.last_graph_reject_reason = reason
+        self.last_graph_reject_details = dict(kwargs) if kwargs else None
         if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
             return
         details = tuple(sorted(kwargs.items()))
@@ -1217,8 +1312,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         extend_seq_lens_cpu = None
         extend_start_loc = None
         ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
-        if ragged_layout is not None and is_static_full_verify_layout(
-            ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+        if (
+            ragged_layout is not None
+            and not getattr(
+                self.attn_backend,
+                "supports_unified_dsa_target_verify_graph",
+                False,
+            )
+            and is_static_full_verify_layout(
+                ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+            )
         ):
             ragged_layout = None
         if self.capture_forward_mode.is_target_verify() and ragged_layout is not None:
@@ -1401,7 +1504,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{avail_mem=:.2f} GB)"
                 )
 
-            for extra_label in self._dsa_target_verify_graph_extra_labels():
+            for extra_label in self._dsa_target_verify_graph_extra_labels(bs):
                 for variant_label, _variant_has_lora in lora_variants:
                     _set_capture_lora_variant(variant_label)
                     with torch_compile_decoration.patch_model(
@@ -1583,7 +1686,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         ragged_layout = (
             resolve_graph_ragged_verify_layout(
-                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+                forward_batch,
+                num_tokens_per_req=self.num_tokens_per_req,
+                preserve_static_full_layout=getattr(
+                    self.attn_backend,
+                    "supports_unified_dsa_target_verify_graph",
+                    False,
+                ),
             )
             if raw_ragged_layout is not None
             else None
@@ -1715,6 +1824,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
+            preserve_static_full_verify_layout=getattr(
+                attn_backend, "supports_unified_dsa_target_verify_graph", False
+            ),
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
 

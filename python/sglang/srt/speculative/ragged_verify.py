@@ -18,6 +18,24 @@ class RaggedVerifyMode(str, Enum):
 
 DSA_TARGET_VERIFY_PRE_TOPK_GRAPH = "dsa_pre_topk"
 DSA_TARGET_VERIFY_POST_TOPK_GRAPH = "dsa_post_topk"
+DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT = (
+    "rocm_dsa_target_verify_index_topk_mixed_transition"
+)
+DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT = (
+    "rocm_dsa_target_verify_index_topk_batch_mixed_regions"
+)
+DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT = (
+    "rocm_dsa_target_verify_index_topk_window_transition"
+)
+DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT = (
+    "rocm_dsa_target_verify_post_topk_no_capture_contract"
+)
+DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
+    "rocm_dsa_target_verify_post_topk_above_capture_contract"
+)
+DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
+    "rocm_dsa_target_verify_post_topk_capture_seq_len_mismatch"
+)
 
 
 def read_ragged_verify_mode() -> RaggedVerifyMode:
@@ -120,11 +138,72 @@ def classify_dsa_target_verify_graph_regime(
     post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
     if all(
         seq_len + 1 >= post_topk_graph_threshold
-        and seq_len <= post_topk_capture_seq_len
+        and seq_len == post_topk_capture_seq_len
         for seq_len, _ in windows
     ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
+
+
+def classify_dsa_target_verify_graph_reject_reason(
+    *,
+    seq_lens_cpu: Sequence[int],
+    verify_lens_cpu: Sequence[int],
+    dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
+) -> Optional[str]:
+    """Return a precise ROCm DSA target-verify graph reject reason.
+
+    ``classify_dsa_target_verify_graph_regime`` intentionally keeps the public
+    admission result compact: either a safe graph label or ``None``. For
+    observability and graph-admission fast-fail paths, split the ``None`` case
+    into mixed/transition windows versus fully post-topk windows that simply do
+    not have a validated capture contract yet.
+    """
+    regime = classify_dsa_target_verify_graph_regime(
+        seq_lens_cpu=seq_lens_cpu,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
+    )
+    if regime is not None or dsa_index_topk <= 0:
+        return None
+
+    windows = [
+        (int(seq_len), int(verify_len))
+        for seq_len, verify_len in zip(seq_lens_cpu, verify_lens_cpu, strict=True)
+        if int(verify_len) > 0
+    ]
+    if not windows:
+        return None
+
+    post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
+    fully_post_topk = all(
+        seq_len + 1 >= post_topk_graph_threshold for seq_len, _ in windows
+    )
+    if fully_post_topk:
+        if post_topk_capture_seq_len is None:
+            return DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
+        if any(seq_len > post_topk_capture_seq_len for seq_len, _ in windows):
+            return DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT
+        return DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
+
+    any_pre_topk = False
+    any_post_topk = False
+    for seq_len, verify_len in windows:
+        if seq_len + verify_len < dsa_index_topk:
+            any_pre_topk = True
+            continue
+        if seq_len + 1 >= post_topk_graph_threshold:
+            any_post_topk = True
+            continue
+        return DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT
+
+    if any_pre_topk and any_post_topk:
+        return DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
+    return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
 
 
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
@@ -271,6 +350,19 @@ def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     return sum(materialize_verify_lens_cpu(layout))
 
 
+def required_padded_verify_slots(
+    layout: RaggedVerifyLayout, *, num_tokens_per_req: int
+) -> int:
+    """Slots needed to pad a graph tier without enlarging a live request."""
+    if num_tokens_per_req < 1:
+        raise ValueError("num_tokens_per_req must be positive")
+    slack_tokens = layout.graph_num_tokens - materialize_total_verify_tokens(layout)
+    if slack_tokens <= 0:
+        return layout.bs
+    padding_slots = (slack_tokens + num_tokens_per_req - 1) // num_tokens_per_req
+    return layout.bs + padding_slots
+
+
 def is_static_full_verify_layout(
     layout: RaggedVerifyLayout, *, num_tokens_per_req: int
 ) -> bool:
@@ -348,6 +440,27 @@ def build_ragged_target_verify_geometry(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
+    )
+
+
+def expand_target_verify_page_table(
+    *,
+    page_table: torch.Tensor,
+    verify_lens: torch.Tensor,
+    output_num_tokens: int,
+) -> torch.Tensor:
+    """Expand request-keyed page rows into query-token order.
+
+    ``output_num_tokens`` is an explicit graph-tier size, so repeat_interleave
+    does not need to read the device-side sum of ``verify_lens`` on the host.
+    """
+    if page_table.shape[0] != verify_lens.shape[0]:
+        raise ValueError(
+            f"page-table rows ({page_table.shape[0]}) must match verify_lens "
+            f"({verify_lens.shape[0]})"
+        )
+    return torch.repeat_interleave(
+        page_table, repeats=verify_lens, dim=0, output_size=output_num_tokens
     )
 
 

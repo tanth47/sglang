@@ -99,14 +99,17 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, None)
+        graph_metadata = self.decode_cuda_graph_metadata[metadata_key]
+
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
             return self._precompute_decode_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
+                bs, req_pool_indices, seq_lens, seq_lens_cpu, graph_metadata
             )
         elif forward_mode.is_target_verify():
             return self._precompute_target_verify_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
+                bs, req_pool_indices, seq_lens, seq_lens_cpu, graph_metadata
             )
         else:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
@@ -117,9 +120,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        graph_metadata,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
-        max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        max_len = graph_metadata.page_table_1.shape[1]
 
         if _is_cuda and not _is_hip:
             from sglang.kernels.ops.attention.dsa_metadata import (
@@ -235,9 +239,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        graph_metadata,
     ) -> PrecomputedMetadata:
         """Precompute metadata for target verify mode."""
-        max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        max_seqlen_k = graph_metadata.page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
         if _is_cuda and not _is_hip:

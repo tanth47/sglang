@@ -1,6 +1,7 @@
 import functools
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -22,7 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -531,6 +532,17 @@ class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
             )
         )
 
+    def test_mixed_transition_exact_compact_layout_is_not_graph_safe(self):
+        self.assertFalse(
+            rocm_dsa_target_verify_layout_graph_safe(
+                seq_lens_cpu=[2044],
+                verify_lens_cpu=[4],
+                verify_num_draft_tokens=8,
+                graph_num_tokens=4,
+                dsa_index_topk=2048,
+            )
+        )
+
     def test_graph_safe_sps_caps_single_request_before_topk(self):
         self.assertEqual(
             rocm_dsa_graph_safe_sps_verify_len_caps(
@@ -550,6 +562,27 @@ class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
             )
         )
 
+    def test_graph_safe_sps_caps_require_exact_capture_tier(self):
+        self.assertIsNone(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[2044],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+                capture_num_tokens=[8, 16],
+            )
+        )
+        self.assertEqual(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[2044],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+                capture_num_tokens=[1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            [3],
+        )
+
     def test_graph_safe_sps_does_not_schedule_multi_request_dsa(self):
         self.assertIsNone(
             rocm_dsa_graph_safe_sps_verify_len_caps(
@@ -565,6 +598,17 @@ class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
                 tier_num_reqs=2,
                 verify_num_draft_tokens=8,
                 dsa_index_topk=2048,
+            )
+        )
+
+    def test_graph_safe_sps_does_not_cap_boundary_anchor(self):
+        self.assertIsNone(
+            rocm_dsa_graph_safe_sps_verify_len_caps(
+                seq_lens_cpu=[2047],
+                tier_num_reqs=1,
+                verify_num_draft_tokens=8,
+                dsa_index_topk=2048,
+                capture_num_tokens=[1, 2, 3, 4, 5, 6, 7, 8],
             )
         )
 
@@ -591,18 +635,80 @@ class TestRocmDsaTargetVerifyGraphSafety(CustomTestCase):
             )
         )
 
+    def test_uniform_layout_caps_single_request_when_graph_alignment_is_enabled(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = True
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7)
+        planner.verify_num_draft_tokens = 8
+        planner.model_runner = _fake_model_runner(
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            max_bs=8,
+            use_dsa=True,
+            dsa_index_topk=2048,
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_planner.is_hip",
+            return_value=True,
+        ):
+            layout = planner._rocm_dsa_graph_safe_uniform_layout(
+                prefix_lens=torch.tensor([2044], dtype=torch.int64),
+                device=torch.device("cpu"),
+                global_num_reqs=None,
+                dp_tier_num_tokens=None,
+            )
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.verify_lens_cpu, [3])
+        self.assertEqual(layout.graph_num_tokens, 3)
+
+    def test_uniform_layout_stays_full_when_capture_would_pad_cap(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = True
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7)
+        planner.verify_num_draft_tokens = 8
+        planner.model_runner = _fake_model_runner(
+            [8, 16],
+            max_bs=8,
+            use_dsa=True,
+            dsa_index_topk=2048,
+        )
+
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_planner.is_hip",
+            return_value=True,
+        ):
+            layout = planner._rocm_dsa_graph_safe_uniform_layout(
+                prefix_lens=torch.tensor([2044], dtype=torch.int64),
+                device=torch.device("cpu"),
+                global_num_reqs=None,
+                dp_tier_num_tokens=None,
+            )
+
+        self.assertIsNone(layout)
+
 
 class _FakeRaggedRunner(types.SimpleNamespace):
     pass
 
 
-def _fake_model_runner(capture_num_tokens, max_bs):
+def _fake_model_runner(
+    capture_num_tokens, max_bs, *, use_dsa=False, dsa_index_topk=None
+):
     runner = _FakeRaggedRunner(
         ragged_verify_mode=True,
         capture_num_tokens=capture_num_tokens,
         max_bs=max_bs,
     )
-    return types.SimpleNamespace(decode_cuda_graph_runner=runner)
+    return types.SimpleNamespace(
+        decode_cuda_graph_runner=runner,
+        attn_backend=types.SimpleNamespace(
+            use_dsa=use_dsa,
+            dsa_index_topk=dsa_index_topk,
+        ),
+    )
 
 
 class TestBudgetTierSelection(CustomTestCase):

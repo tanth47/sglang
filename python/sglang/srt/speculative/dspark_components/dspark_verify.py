@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional
+import inspect
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -38,20 +34,31 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+    from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 
-def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+
+def verify_logits_adjustments_noop_reject_reason(sampling_info) -> Optional[str]:
     if sampling_info is None:
-        return True
+        return None
     if sampling_info.has_custom_logit_processor:
-        return False
+        return "custom_logit_processor"
     if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
+        return "acc_linear_penalties"
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
-        return False
+        return "penalizer_required"
     if getattr(sampling_info, "vocab_mask", None) is not None:
-        return False
+        return "vocab_mask"
     if getattr(sampling_info, "logit_bias", None) is not None:
+        return "logit_bias"
+    return None
+
+
+def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+    if verify_logits_adjustments_noop_reject_reason(sampling_info) is not None:
         return False
     return True
 
@@ -59,6 +66,9 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    target_forward_calls: int
+    cuda_graph_reject_reason: Optional[str] = None
+    cuda_graph_reject_details: Optional[dict] = None
 
 
 class TargetVerifyExecutor:
@@ -247,6 +257,10 @@ class TargetVerifyExecutor:
         )
 
         if sampling_info is not None:
+            from sglang.srt.speculative.dflash_utils import (
+                apply_dflash_verify_logits_adjustments,
+            )
+
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -275,9 +289,22 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        target_forward_calls = int(target_out.model_forward_calls)
+        if target_forward_calls != 1:
+            raise RuntimeError(
+                "DSpark target verify must execute exactly one model forward; "
+                f"observed {target_forward_calls}"
+            )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            target_forward_calls=target_forward_calls,
+            cuda_graph_reject_reason=getattr(
+                target_out, "cuda_graph_reject_reason", None
+            ),
+            cuda_graph_reject_details=getattr(
+                target_out, "cuda_graph_reject_details", None
+            ),
         )
 
     def commit_hidden(
@@ -291,21 +318,20 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
-    ) -> None:
+    ) -> str:
         if run_compact:
-            self.kv_injector.inject_ragged(
+            return self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
             )
-            return
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
-        self.kv_injector.inject_target_hidden(
+        return self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_window.verify_cache_loc,
             cache_loc_2d=verify_window.verify_cache_loc_2d,
@@ -348,6 +374,42 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
+    def _compact_outputs_to_strided(
+        self,
+        *,
+        target_verify: TargetVerifyResult,
+        layout: RaggedVerifyLayout,
+        bs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        stride = self.verify_num_draft_tokens
+        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
+            strided_logits = self.verify_epilogue.strided_logits
+            hidden_strided = self.verify_epilogue.strided_hidden
+            assert strided_logits is not None and hidden_strided is not None, (
+                "verify epilogue buffers unwritten after a graph replay -- the "
+                "replayed graph was captured without the epilogue"
+            )
+            return strided_logits[: bs * stride], hidden_strided[: bs * stride]
+
+        logits_output = target_verify.logits_output
+        compact_logits = logits_output.next_token_logits
+        strided_logits = ScatterCompactToStrided.execute(
+            compact=compact_logits,
+            layout=layout,
+            fill_value=0.0,
+            verify_num_draft_tokens=stride,
+        )
+        compact_hidden = logits_output.hidden_states
+        if compact_hidden is None:
+            raise RuntimeError("DSpark verify requires target hidden states, got None.")
+        hidden_strided = ScatterCompactToStrided.execute(
+            compact=compact_hidden,
+            layout=layout,
+            fill_value=0.0,
+            verify_num_draft_tokens=stride,
+        )
+        return strided_logits, hidden_strided
+
     def run_compact(
         self,
         *,
@@ -381,34 +443,11 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
-        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
-            strided_logits = self.verify_epilogue.strided_logits
-            hidden_strided = self.verify_epilogue.strided_hidden
-            assert strided_logits is not None and hidden_strided is not None, (
-                "verify epilogue buffers unwritten after a graph replay -- the "
-                "replayed graph was captured without the epilogue"
-            )
-            strided_logits = strided_logits[: bs * stride]
-            hidden_strided = hidden_strided[: bs * stride]
-        else:
-            compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
-            compact_hidden = logits_output.hidden_states
-            if compact_hidden is None:
-                raise RuntimeError(
-                    "DSpark verify requires target hidden states, got None."
-                )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+        strided_logits, hidden_strided = self._compact_outputs_to_strided(
+            target_verify=target_verify,
+            layout=layout,
+            bs=bs,
+        )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
@@ -433,6 +472,16 @@ class CommitInjectCtx(msgspec.Struct):
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+
+
+def _callable_accepts_keyword(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
 
 
 class AcceptOuts(msgspec.Struct):
@@ -487,6 +536,8 @@ class DsparkVerifyEpilogue:
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
             return
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
@@ -523,11 +574,49 @@ class DsparkVerifyEpilogue:
         )
 
     @property
-    def folds_commit(self) -> bool:
+    def commit_fold_reject_reason(self) -> Optional[str]:
+        _kind, reason = self._commit_fold_kind_and_reject_reason()
+        return reason
+
+    def _commit_fold_kind_and_reject_reason(
+        self,
+    ) -> tuple[Optional[str], Optional[str]]:
         if self.commit_ctx is None:
-            return False
+            return None, "no_commit_context"
+        writer = getattr(self.commit_ctx.draft_model, "write_target_hidden_kv", None)
+        if writer is None:
+            return None, "missing_draft_commit_writer"
         pool = self.commit_ctx.resolve_pool()
-        return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            if getattr(pool, "full_to_swa_index_mapping", None) is None:
+                return None, "missing_full_to_swa_index_mapping"
+            if not all(
+                _callable_accepts_keyword(writer, name)
+                for name in ("main_hidden", "swa_loc", "positions", "pool")
+            ):
+                return None, "draft_writer_missing_swa_commit_signature"
+            return "swa_fused", None
+
+        if hasattr(pool, "set_kv_buffer_prefix_valid"):
+            if not all(
+                _callable_accepts_keyword(writer, name)
+                for name in (
+                    "target_hidden",
+                    "cache_loc",
+                    "cache_loc_2d",
+                    "positions",
+                    "commit_lens",
+                    "pool",
+                )
+            ):
+                return None, "draft_writer_missing_prefix_valid_commit_signature"
+            return "generic_prefix_valid", None
+
+        return None, "pool_missing_fused_swa_commit"
+
+    @property
+    def folds_commit(self) -> bool:
+        return self.commit_fold_reject_reason is None
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor
@@ -627,24 +716,49 @@ class DsparkVerifyEpilogue:
     ) -> None:
         ctx = self.commit_ctx
         pool = ctx.resolve_pool()
+        commit_kind, reject_reason = self._commit_fold_kind_and_reject_reason()
+        if reject_reason is not None:
+            return
         gated_commit_lens = (
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
+        if commit_kind == "swa_fused":
+            inject_layout = BuildCommitInjectLayout.execute(
+                req_pool_indices=req_pool_indices,
+                req_to_token=ctx.resolve_req_to_token(),
+                prefix_lens=seq_lens[:bs],
+                block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                commit_lens=gated_commit_lens,
+                stride=self.stride,
+            )
+            with torch.inference_mode():
+                ctx.draft_model.write_target_hidden_kv(
+                    main_hidden=self.strided_hidden[: bs * self.stride],
+                    swa_loc=inject_layout.swa_loc,
+                    positions=inject_layout.positions,
+                    pool=pool,
+                )
+            return
+
         inject_layout = BuildCommitInjectLayout.execute(
             req_pool_indices=req_pool_indices,
             req_to_token=ctx.resolve_req_to_token(),
             prefix_lens=seq_lens[:bs],
             block_pos_offsets=ctx.block_pos_offsets[: self.stride],
-            full_to_swa_mapping=pool.full_to_swa_index_mapping,
+            full_to_swa_mapping=None,
             commit_lens=gated_commit_lens,
             stride=self.stride,
         )
+        cache_loc_2d = inject_layout.cache_loc_2d
         with torch.inference_mode():
             ctx.draft_model.write_target_hidden_kv(
-                main_hidden=self.strided_hidden[: bs * self.stride],
-                swa_loc=inject_layout.swa_loc,
+                target_hidden=self.strided_hidden[: bs * self.stride],
+                cache_loc=cache_loc_2d.reshape(-1),
+                cache_loc_2d=cache_loc_2d,
                 positions=inject_layout.positions,
+                commit_lens=gated_commit_lens,
                 pool=pool,
             )
 
