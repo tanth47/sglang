@@ -1,20 +1,26 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    _get_or_create_chain_verify_buffers,
-    build_dflash_verify_target_probs,
-    compute_dflash_correct_drafts_and_bonus,
-)
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+
+def _compute_correct_drafts_and_bonus(
+    *, candidates: torch.Tensor, target_predict: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    bonus = target_predict[torch.arange(candidates.shape[0], device=candidates.device), correct_len]
+    return correct_len, bonus.to(torch.int64)
 
 
 class AcceptSampling:
@@ -86,6 +92,11 @@ def _accept_sampling_core(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.srt.speculative.dflash_utils import (
+        _get_or_create_chain_verify_buffers,
+        build_dflash_verify_target_probs,
+    )
+
     bs = candidates.shape[0]
     device = candidates.device
     if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
@@ -606,7 +617,7 @@ def accept_greedy(
     target_predict = torch.argmax(target_logits, dim=-1).view(
         bs, verify_num_draft_tokens
     )
-    correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
+    correct_len, bonus = _compute_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
     )
@@ -658,7 +669,7 @@ def accept_greedy_triton(
     target_predict = torch.argmax(target_logits, dim=-1).view(
         bs, verify_num_draft_tokens
     )
-    correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
+    correct_len, bonus = _compute_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
     )

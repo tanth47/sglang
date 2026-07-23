@@ -8,7 +8,6 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -45,7 +44,7 @@ def make_injector(*, draft_model, pool, req_to_token=None, stride=3):
     )
 
 
-class TestTargetHiddenKvInjector(CustomTestCase):
+class TestTargetHiddenKvInjector(unittest.TestCase):
     def test_generic_target_hidden_path_forwards_commit_lens(self):
         draft_model = FakeDraftModel()
         pool = object()

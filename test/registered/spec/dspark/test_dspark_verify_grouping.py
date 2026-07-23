@@ -4,7 +4,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     _encoder_lens_has_payload,
@@ -19,6 +18,10 @@ from sglang.srt.speculative.ragged_verify import (
     DsaTargetVerifyGraphGroup,
     RaggedVerifyLayout,
 )
+
+
+def _logits_output(**kwargs):
+    return SimpleNamespace(**kwargs)
 
 
 class TestGroupedTargetVerifyPayloadGuards(unittest.TestCase):
@@ -180,7 +183,7 @@ class TestGroupedTargetVerifyAdmission(unittest.TestCase):
         def run_ragged(*, batch, **_kwargs):
             return SimpleNamespace(
                 group_indices=batch.group_indices,
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                logits_output=_logits_output(next_token_logits=None),
                 can_run_cuda_graph=len(batch.group_indices) > 1,
             )
 
@@ -291,7 +294,7 @@ class TestGroupedTargetVerifyAdmission(unittest.TestCase):
         def run_ragged(*, batch, **_kwargs):
             return SimpleNamespace(
                 group_indices=batch.group_indices,
-                logits_output=LogitsProcessorOutput(next_token_logits=None),
+                logits_output=_logits_output(next_token_logits=None),
                 can_run_cuda_graph=False,
             )
 

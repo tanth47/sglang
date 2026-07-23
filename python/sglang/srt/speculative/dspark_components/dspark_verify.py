@@ -1,19 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -50,6 +45,11 @@ from sglang.srt.speculative.ragged_verify import (
     scatter_grouped_strided_rows,
 )
 from sglang.srt.utils import is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+    from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 
 
 def _rocm_dsa_target_verify_post_topk_graph_guard_tokens(
@@ -347,6 +347,10 @@ class TargetVerifyExecutor:
         )
 
         if sampling_info is not None:
+            from sglang.srt.speculative.dflash_utils import (
+                apply_dflash_verify_logits_adjustments,
+            )
+
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -949,6 +953,8 @@ class DsparkVerifyEpilogue:
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
             return
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
