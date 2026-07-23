@@ -4,10 +4,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_verify import (
-    TargetVerifyExecutor,
-    TargetVerifyResult,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
@@ -368,41 +366,87 @@ class TestCaptureVerifyLens(unittest.TestCase):
 
 
 class TestCompactTargetVerifyExecution(unittest.TestCase):
-    def test_compact_verify_invokes_target_path_once(self):
+    def test_mixed_region_graph_reject_runs_one_full_batch_target_forward(self):
+        reject_reason = classify_dsa_target_verify_graph_reject_reason(
+            seq_lens_cpu=[1000, 3000],
+            verify_lens_cpu=[8, 8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(reject_reason, DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT)
+
+        graph_runner = mock.Mock()
+        graph_runner.can_run_graph.return_value = False
+        attn_backend = mock.Mock()
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                decode_cuda_graph_runner=graph_runner,
+                attn_backend=attn_backend,
+            ),
+            forward_batch_generation=mock.Mock(),
+        )
         executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
         executor.verify_num_draft_tokens = 8
         executor.model_runner = object()
+        executor.target_worker = target_worker
         executor.verify_epilogue = None
+        executor._verify_backend_self_adds_seq_lens_cache = True
 
         logits_output = SimpleNamespace(
             next_token_logits=torch.empty((16, 4)),
             hidden_states=torch.empty((16, 4)),
         )
-        target_result = TargetVerifyResult(
-            logits_output=logits_output, can_run_cuda_graph=False
+        target_worker.forward_batch_generation.return_value = SimpleNamespace(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
+            cuda_graph_reject_reason=reject_reason,
+            cuda_graph_reject_details={"graph_regime": "batch_mixed_regions"},
         )
-        executor._run_ragged = mock.Mock(return_value=target_result)
         executor._compact_outputs_to_strided = mock.Mock(
             return_value=(
                 torch.empty((16, 4)),
                 torch.empty((16, 4)),
             )
         )
-        layout = SimpleNamespace(verify_lens=torch.tensor([8, 8]))
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 8], device=_DEVICE, grid=_GRID
+        )
+        ragged_window = SimpleNamespace(
+            verify_ids=torch.zeros((16,), dtype=torch.int64),
+            positions=torch.arange(16, dtype=torch.int64),
+            verify_cache_loc=torch.arange(16, dtype=torch.int64),
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([1000, 3000], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([1000, 3000], dtype=torch.int64),
+            seq_lens_sum=4000,
+            forward_mode=ForwardMode.DECODE,
+        )
+        full_forward_batch = SimpleNamespace(batch_size=2)
+
+        def init_full_forward_batch(prepared_batch, _model_runner):
+            self.assertIs(prepared_batch, batch)
+            self.assertEqual(prepared_batch.input_ids.numel(), 16)
+            self.assertIs(prepared_batch.spec_info.ragged_verify_layout, layout)
+            return full_forward_batch
 
         with (
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_verify."
                 "BuildRaggedVerifyWindow.execute",
-                return_value=object(),
+                return_value=ragged_window,
             ),
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_verify."
                 "apply_logits_adjustments_strided"
             ),
+            mock.patch(
+                "sglang.srt.speculative.dflash_info.ForwardBatch.init_new",
+                side_effect=init_full_forward_batch,
+            ),
         ):
             result, _ = executor.run_compact(
-                batch=object(),
+                batch=batch,
                 layout=layout,
                 draft_block_ids=torch.zeros((2, 1), dtype=torch.int64),
                 draft_tokens=torch.zeros((2, 7), dtype=torch.int64),
@@ -411,8 +455,17 @@ class TestCompactTargetVerifyExecution(unittest.TestCase):
                 sampling_info=None,
             )
 
-        self.assertIs(result, target_result)
-        executor._run_ragged.assert_called_once()
+        self.assertFalse(result.can_run_cuda_graph)
+        self.assertEqual(result.cuda_graph_reject_reason, reject_reason)
+        graph_runner.can_run_graph.assert_called_once_with(full_forward_batch)
+        graph_runner.load_batch.assert_not_called()
+        attn_backend.init_forward_metadata.assert_called_once_with(full_forward_batch)
+        target_worker.forward_batch_generation.assert_called_once_with(
+            batch=None,
+            forward_batch=full_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
 
 
 if __name__ == "__main__":
