@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.environ import envs
 
-
 class RaggedVerifyMode(str, Enum):
     STATIC = "static"
     CAP_ACCEPT = "cap-accept"
@@ -36,27 +35,6 @@ DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
 DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
     "rocm_dsa_target_verify_post_topk_capture_seq_len_mismatch"
 )
-DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT = (
-    "rocm_dsa_target_verify_grouped_partial"
-)
-DSA_TARGET_VERIFY_GROUPED_PARTIAL_SOURCE_REJECTS = frozenset(
-    (
-        DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
-        DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
-    )
-)
-
-
-class DsaTargetVerifyGraphGroup(msgspec.Struct, frozen=True):
-    indices: Tuple[int, ...]
-    graph_regime: Optional[str] = None
-    reject_reason: Optional[str] = None
-
-
-def can_group_dsa_target_verify_reject(reason: Optional[str]) -> bool:
-    return reason in DSA_TARGET_VERIFY_GROUPED_PARTIAL_SOURCE_REJECTS
-
-
 def read_ragged_verify_mode() -> RaggedVerifyMode:
     value = envs.SGLANG_RAGGED_VERIFY_MODE.get()
     for mode in RaggedVerifyMode:
@@ -67,10 +45,8 @@ def read_ragged_verify_mode() -> RaggedVerifyMode:
         f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}"
     )
 
-
 def ragged_verify_compact_enabled() -> bool:
     return read_ragged_verify_mode() == RaggedVerifyMode.COMPACT
-
 
 def build_ragged_verify_token_buckets(
     *,
@@ -102,7 +78,6 @@ def build_ragged_verify_token_buckets(
     assert buckets and buckets[0] > 0, f"{buckets=}"
     return buckets
 
-
 def round_up_grid(total: int, grid: Sequence[int]) -> int:
     if not grid:
         raise ValueError("round_up_grid requires a non-empty grid")
@@ -113,7 +88,6 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
         )
     index = bisect.bisect_left(grid, total)
     return grid[index]
-
 
 def classify_dsa_target_verify_graph_regime(
     *,
@@ -162,7 +136,6 @@ def classify_dsa_target_verify_graph_regime(
     ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
-
 
 def classify_dsa_target_verify_graph_reject_reason(
     *,
@@ -223,63 +196,6 @@ def classify_dsa_target_verify_graph_reject_reason(
     if any_pre_topk and any_post_topk:
         return DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
     return DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
-
-
-def group_dsa_target_verify_graph_regions(
-    *,
-    seq_lens_cpu: Sequence[int],
-    verify_lens_cpu: Sequence[int],
-    dsa_index_topk: int,
-    post_topk_guard_tokens: int = 0,
-    post_topk_capture_seq_len: Optional[int] = None,
-) -> list[DsaTargetVerifyGraphGroup]:
-    """Group request indices by DSA target-verify graph compatibility.
-
-    This is the scheduler/executor-side primitive for the next GLM/ROCm DSA
-    coverage step: graph-compatible requests can be replayed together, while
-    unsupported transition/post-topk requests stay on eager fallback and get
-    scattered back to the original request order by the caller.
-    """
-    graph_groups: dict[str, list[int]] = {}
-    eager_groups: dict[str, list[int]] = {}
-
-    for idx, (seq_len, verify_len) in enumerate(
-        zip(seq_lens_cpu, verify_lens_cpu, strict=True)
-    ):
-        seq_len = int(seq_len)
-        verify_len = int(verify_len)
-        if verify_len <= 0:
-            continue
-        regime = classify_dsa_target_verify_graph_regime(
-            seq_lens_cpu=[seq_len],
-            verify_lens_cpu=[verify_len],
-            dsa_index_topk=dsa_index_topk,
-            post_topk_guard_tokens=post_topk_guard_tokens,
-            post_topk_capture_seq_len=post_topk_capture_seq_len,
-        )
-        if regime is not None:
-            graph_groups.setdefault(regime, []).append(idx)
-            continue
-
-        reject_reason = (
-            classify_dsa_target_verify_graph_reject_reason(
-                seq_lens_cpu=[seq_len],
-                verify_lens_cpu=[verify_len],
-                dsa_index_topk=dsa_index_topk,
-                post_topk_guard_tokens=post_topk_guard_tokens,
-                post_topk_capture_seq_len=post_topk_capture_seq_len,
-            )
-            or DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT
-        )
-        eager_groups.setdefault(reject_reason, []).append(idx)
-
-    return [
-        DsaTargetVerifyGraphGroup(indices=tuple(indices), graph_regime=regime)
-        for regime, indices in graph_groups.items()
-    ] + [
-        DsaTargetVerifyGraphGroup(indices=tuple(indices), reject_reason=reason)
-        for reason, indices in eager_groups.items()
-    ]
 
 
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
@@ -411,7 +327,6 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             total_verify_tokens=self.graph_num_tokens,
         )
 
-
 def materialize_verify_lens_cpu(layout: RaggedVerifyLayout) -> list[int]:
     """Return host verify lengths, syncing from device only for layouts that were
     intentionally built without a host mirror."""
@@ -419,38 +334,10 @@ def materialize_verify_lens_cpu(layout: RaggedVerifyLayout) -> list[int]:
         return [int(x) for x in layout.verify_lens_cpu]
     return [int(x) for x in layout.verify_lens.detach().cpu().tolist()]
 
-
 def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     if layout.total_verify_tokens is not None:
         return int(layout.total_verify_tokens)
     return sum(materialize_verify_lens_cpu(layout))
-
-
-def scatter_grouped_strided_rows(
-    *,
-    full: torch.Tensor,
-    group: torch.Tensor,
-    row_indices: torch.Tensor,
-    bs: int,
-    stride: int,
-) -> None:
-    """Scatter group-local strided rows back to full request order."""
-    if row_indices.numel() == 0:
-        return
-    group_bs = int(row_indices.numel())
-    expected_rows = group_bs * int(stride)
-    if group.shape[0] != expected_rows:
-        raise ValueError(
-            f"group first dimension {group.shape[0]} != "
-            f"group_bs({group_bs}) * stride({stride})"
-        )
-    if full.shape[0] != int(bs) * int(stride):
-        raise ValueError(
-            f"full first dimension {full.shape[0]} != bs({bs}) * stride({stride})"
-        )
-    full_view = full.view(int(bs), int(stride), *full.shape[1:])
-    group_view = group.view(group_bs, int(stride), *group.shape[1:])
-    full_view.index_copy_(0, row_indices.to(full.device, dtype=torch.long), group_view)
 
 
 def is_static_full_verify_layout(
@@ -476,7 +363,6 @@ def is_static_full_verify_layout(
         and layout.graph_num_tokens % num_tokens_per_req == 0
     )
 
-
 def build_capture_verify_lens(
     *,
     num_tokens: int,
@@ -497,7 +383,6 @@ def build_capture_verify_lens(
     rem = num_tokens - base * num_slots
     return [base + 1] * rem + [base] * (num_slots - rem)
 
-
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""
@@ -506,13 +391,11 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
         return None
     return spec_info.ragged_verify_layout
 
-
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     max_seq_len_q: Optional[int]
-
 
 def build_ragged_target_verify_geometry(
     *,
@@ -531,7 +414,6 @@ def build_ragged_target_verify_geometry(
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
     )
-
 
 def compute_target_verify_graph_key(
     *,
@@ -555,14 +437,12 @@ def compute_target_verify_graph_key(
         )
     return graph_num_tokens, graph_num_tokens
 
-
 class VerifyExtendLengths(msgspec.Struct, frozen=True):
     seq_lens_extended: torch.Tensor
     seq_lens_cpu_extended: List[int]
     extend_seq_lens_cpu: List[int]
     num_tokens: int
     extend_start_loc: Optional[torch.Tensor]
-
 
 def compute_uniform_extend_lengths(
     *,
@@ -582,7 +462,6 @@ def compute_uniform_extend_lengths(
         num_tokens=num_tokens,
         extend_start_loc=None,
     )
-
 
 def compute_ragged_extend_lengths(
     *,

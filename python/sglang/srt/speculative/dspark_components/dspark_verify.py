@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import replace
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -34,73 +32,12 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
     ScatterCompactToStrided,
     scatter_compact_to_strided_into,
 )
-from sglang.srt.speculative.ragged_verify import (
-    DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT,
-    DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
-    DsaTargetVerifyGraphGroup,
-    RaggedVerifyLayout,
-    can_group_dsa_target_verify_reject,
-    classify_dsa_target_verify_graph_reject_reason,
-    group_dsa_target_verify_graph_regions,
-    materialize_verify_lens_cpu,
-    scatter_grouped_strided_rows,
-)
-from sglang.srt.utils import is_hip
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
     from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
-
-
-def _rocm_dsa_target_verify_post_topk_graph_guard_tokens(
-    *, num_tokens_per_req: int
-) -> int:
-    return max(64, int(num_tokens_per_req) * 8)
-
-
-def _slice_tensor_first_dim(
-    tensor: Optional[torch.Tensor],
-    indices_cpu: Sequence[int],
-    indices_device: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    if tensor is None:
-        return None
-    if tensor.device.type == "cpu":
-        return tensor[torch.tensor(indices_cpu, dtype=torch.long)]
-    return tensor.index_select(0, indices_device)
-
-
-def _slice_optional_list(values, indices_cpu: Sequence[int]):
-    if values is None:
-        return None
-    return [values[i] for i in indices_cpu]
-
-
-def _tensor_has_payload(value) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, torch.Tensor):
-        return int(value.numel()) > 0
-    return True
-
-
-def _encoder_lens_has_payload(
-    encoder_lens: Optional[torch.Tensor], encoder_lens_cpu
-) -> bool:
-    if encoder_lens_cpu is not None:
-        return any(int(x) > 0 for x in encoder_lens_cpu)
-    if encoder_lens is None or int(encoder_lens.numel()) == 0:
-        return False
-    return bool(torch.any(encoder_lens > 0).item())
-
-
-def _multimodal_inputs_have_payload(multimodal_inputs) -> bool:
-    if multimodal_inputs is None:
-        return False
-    if isinstance(multimodal_inputs, (list, tuple)):
-        return any(item is not None for item in multimodal_inputs)
-    return True
 
 
 def verify_logits_adjustments_noop_reject_reason(sampling_info) -> Optional[str]:
@@ -119,19 +56,16 @@ def verify_logits_adjustments_noop_reject_reason(sampling_info) -> Optional[str]
         return "logit_bias"
     return None
 
-
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if verify_logits_adjustments_noop_reject_reason(sampling_info) is not None:
         return False
     return True
-
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
     cuda_graph_reject_reason: Optional[str] = None
     cuda_graph_reject_details: Optional[dict] = None
-
 
 class TargetVerifyExecutor:
     def __init__(
@@ -465,301 +399,6 @@ class TargetVerifyExecutor:
         )
         return strided_logits, hidden_strided
 
-    def _target_verify_capture_grid(self) -> Optional[list[int]]:
-        graph_runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
-        grid = getattr(graph_runner, "capture_num_tokens", None)
-        if grid:
-            return [int(x) for x in grid]
-        return None
-
-    def _grouped_dsa_target_verify_groups(
-        self,
-        *,
-        batch: ScheduleBatch,
-        layout: RaggedVerifyLayout,
-        bs: int,
-    ) -> Optional[list[DsaTargetVerifyGraphGroup]]:
-        if not is_hip():
-            return None
-        backend = self.target_worker.model_runner.attn_backend
-        if not getattr(backend, "use_dsa", False):
-            return None
-        dsa_index_topk = getattr(backend, "dsa_index_topk", None)
-        if dsa_index_topk is None:
-            return None
-        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-            return None
-        server_args = getattr(self.model_runner, "server_args", None)
-        dp_size = int(getattr(server_args, "dp_size", 1) or 1)
-        if (
-            dp_size > 1
-            or getattr(server_args, "enable_dp_attention", False)
-            or getattr(batch, "inner_idle_batch", None) is not None
-        ):
-            return None
-        for field in (
-            "input_embeds",
-            "replace_embeds",
-            "replace_positions",
-            "out_cache_loc_dsv4",
-            "mamba_track_indices",
-            "mamba_track_mask",
-            "mamba_track_seqlens",
-        ):
-            if _tensor_has_payload(getattr(batch, field, None)):
-                return None
-        if _encoder_lens_has_payload(batch.encoder_lens, batch.encoder_lens_cpu):
-            return None
-        if _tensor_has_payload(batch.encoder_out_cache_loc):
-            return None
-        if _multimodal_inputs_have_payload(getattr(batch, "multimodal_inputs", None)):
-            return None
-
-        seq_lens_cpu_raw = (
-            batch.seq_lens_cpu if batch.seq_lens_cpu is not None else batch.seq_lens
-        )
-        if isinstance(seq_lens_cpu_raw, torch.Tensor):
-            seq_lens_cpu = [
-                int(x) for x in seq_lens_cpu_raw[:bs].detach().cpu().tolist()
-            ]
-        else:
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu_raw[:bs]]
-        verify_lens_cpu = materialize_verify_lens_cpu(layout)[:bs]
-        if len(seq_lens_cpu) != bs or len(verify_lens_cpu) != bs:
-            return None
-
-        post_topk_guard_tokens = _rocm_dsa_target_verify_post_topk_graph_guard_tokens(
-            num_tokens_per_req=self.verify_num_draft_tokens
-        )
-        # Do not opt into post-topk replay from grouped GLM/ROCm DSA verify yet.
-        # The lower-level classifier supports an explicit capture seq-len
-        # contract, but the executor only validates pre-topk graph replay plus
-        # eager fallback groups until the DSA verify metadata contract is proven.
-        post_topk_capture_seq_len = None
-        reject_reason = classify_dsa_target_verify_graph_reject_reason(
-            seq_lens_cpu=seq_lens_cpu,
-            verify_lens_cpu=verify_lens_cpu,
-            dsa_index_topk=int(dsa_index_topk),
-            post_topk_guard_tokens=post_topk_guard_tokens,
-            post_topk_capture_seq_len=post_topk_capture_seq_len,
-        )
-        if not can_group_dsa_target_verify_reject(reject_reason):
-            return None
-
-        groups = group_dsa_target_verify_graph_regions(
-            seq_lens_cpu=seq_lens_cpu,
-            verify_lens_cpu=verify_lens_cpu,
-            dsa_index_topk=int(dsa_index_topk),
-            post_topk_guard_tokens=post_topk_guard_tokens,
-            post_topk_capture_seq_len=post_topk_capture_seq_len,
-        )
-        if len(groups) <= 1:
-            return None
-        if not any(
-            group.graph_regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-            for group in groups
-        ):
-            return None
-        # The first grouped execution contract only validates pre-topk graph
-        # replay plus eager fallback for the rest. This also covers DSA guard/
-        # transition requests that would otherwise poison the whole batch. A
-        # dedicated transition/post-topk graph contract remains future work.
-        if any(
-            group.graph_regime not in (None, DSA_TARGET_VERIFY_PRE_TOPK_GRAPH)
-            for group in groups
-        ):
-            return None
-        return groups
-
-    def _make_group_batch(
-        self,
-        *,
-        batch: ScheduleBatch,
-        indices_cpu: Sequence[int],
-        indices_device: torch.Tensor,
-    ) -> ScheduleBatch:
-        seq_lens_cpu = _slice_tensor_first_dim(
-            batch.seq_lens_cpu, indices_cpu, indices_device
-        )
-        seq_lens_sum = (
-            int(seq_lens_cpu.sum().item())
-            if seq_lens_cpu is not None
-            else int(batch.seq_lens.index_select(0, indices_device).sum().item())
-        )
-        return replace(
-            batch,
-            reqs=[batch.reqs[i] for i in indices_cpu],
-            req_pool_indices=batch.req_pool_indices.index_select(0, indices_device),
-            req_pool_indices_cpu=_slice_tensor_first_dim(
-                batch.req_pool_indices_cpu, indices_cpu, indices_device
-            ),
-            seq_lens=batch.seq_lens.index_select(0, indices_device),
-            orig_seq_lens=_slice_tensor_first_dim(
-                batch.orig_seq_lens, indices_cpu, indices_device
-            ),
-            out_cache_loc=None,
-            input_ids=None,
-            spec_info=None,
-            sampling_info=None,
-            seq_lens_cpu=seq_lens_cpu,
-            seq_lens_sum=seq_lens_sum,
-            capture_hidden_mode=None,
-            seq_lens_cpu_cache=None,
-            return_hidden_states_before_norm=False,
-            top_logprobs_nums=_slice_optional_list(
-                batch.top_logprobs_nums, indices_cpu
-            ),
-            token_ids_logprobs=_slice_optional_list(
-                batch.token_ids_logprobs, indices_cpu
-            ),
-            encoder_cached=_slice_optional_list(batch.encoder_cached, indices_cpu),
-            multimodal_inputs=_slice_optional_list(
-                batch.multimodal_inputs, indices_cpu
-            ),
-            encoder_lens=_slice_tensor_first_dim(
-                batch.encoder_lens, indices_cpu, indices_device
-            ),
-            encoder_lens_cpu=_slice_optional_list(batch.encoder_lens_cpu, indices_cpu),
-            encoder_out_cache_loc=batch.encoder_out_cache_loc,
-        )
-
-    def _run_grouped_compact_if_supported(
-        self,
-        *,
-        batch: ScheduleBatch,
-        layout: RaggedVerifyLayout,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        bs: int,
-        device: str,
-        sampling_info,
-    ) -> Optional[tuple[TargetVerifyResult, torch.Tensor]]:
-        groups = self._grouped_dsa_target_verify_groups(
-            batch=batch, layout=layout, bs=bs
-        )
-        if groups is None:
-            return None
-
-        stride = self.verify_num_draft_tokens
-        verify_lens_cpu = materialize_verify_lens_cpu(layout)[:bs]
-        capture_grid = self._target_verify_capture_grid()
-        if capture_grid is None:
-            return None
-        full_logits = None
-        full_hidden = None
-        merged_logits_output = None
-
-        for group in groups:
-            indices_cpu = list(group.indices)
-            indices_device = torch.tensor(
-                indices_cpu, dtype=torch.long, device=draft_tokens.device
-            )
-            group_batch = self._make_group_batch(
-                batch=batch,
-                indices_cpu=indices_cpu,
-                indices_device=indices_device,
-            )
-            group_verify_lens_cpu = [verify_lens_cpu[i] for i in indices_cpu]
-            group_layout = RaggedVerifyLayout.from_verify_lens(
-                verify_lens_cpu=group_verify_lens_cpu,
-                device=torch.device(device),
-                grid=capture_grid,
-            )
-            if group.graph_regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH:
-                total_verify_tokens = sum(group_verify_lens_cpu)
-                exact_graph_tier = group_layout.graph_num_tokens == total_verify_tokens
-                multi_req_full_width = len(indices_cpu) > 1 and all(
-                    verify_len == stride for verify_len in group_verify_lens_cpu
-                )
-                single_req = len(indices_cpu) == 1
-                if not exact_graph_tier or not (multi_req_full_width or single_req):
-                    return None
-            ragged_window = BuildRaggedVerifyWindow.execute(
-                batch=group_batch,
-                layout=group_layout,
-                draft_block_ids=draft_block_ids.index_select(0, indices_device),
-                draft_tokens=draft_tokens.index_select(0, indices_device),
-                bs=len(indices_cpu),
-                device=device,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                model_runner=self.model_runner,
-            )
-            if self.verify_epilogue is not None:
-                self.verify_epilogue.begin_step(group_layout.verify_lens, armed=False)
-            target_verify = self._run_ragged(
-                batch=group_batch,
-                layout=group_layout,
-                ragged_window=ragged_window,
-                sampling_info=None,
-            )
-            strided_logits, hidden_strided = self._compact_outputs_to_strided(
-                target_verify=target_verify,
-                layout=group_layout,
-                bs=len(indices_cpu),
-            )
-            if full_logits is None:
-                full_logits = torch.empty(
-                    (bs * stride, *strided_logits.shape[1:]),
-                    dtype=strided_logits.dtype,
-                    device=strided_logits.device,
-                )
-                full_hidden = torch.empty(
-                    (bs * stride, *hidden_strided.shape[1:]),
-                    dtype=hidden_strided.dtype,
-                    device=hidden_strided.device,
-                )
-                merged_logits_output = target_verify.logits_output
-            scatter_grouped_strided_rows(
-                full=full_logits,
-                group=strided_logits,
-                row_indices=indices_device,
-                bs=bs,
-                stride=stride,
-            )
-            scatter_grouped_strided_rows(
-                full=full_hidden,
-                group=hidden_strided,
-                row_indices=indices_device,
-                bs=bs,
-                stride=stride,
-            )
-
-        if merged_logits_output is None or full_logits is None or full_hidden is None:
-            return None
-
-        apply_logits_adjustments_strided(
-            next_token_logits=full_logits,
-            sampling_info=sampling_info,
-            verify_num_draft_tokens=stride,
-        )
-        merged_logits_output.next_token_logits = full_logits
-        merged_logits_output.hidden_states = full_hidden
-        return (
-            TargetVerifyResult(
-                logits_output=merged_logits_output,
-                can_run_cuda_graph=False,
-                cuda_graph_reject_reason=DSA_TARGET_VERIFY_GROUPED_PARTIAL_REJECT,
-                cuda_graph_reject_details={
-                    "group_count": len(groups),
-                    "graph_group_count": sum(
-                        1 for group in groups if group.graph_regime is not None
-                    ),
-                    "eager_group_count": sum(
-                        1 for group in groups if group.graph_regime is None
-                    ),
-                    "groups": [
-                        {
-                            "indices": list(group.indices),
-                            "graph_regime": group.graph_regime,
-                            "reject_reason": group.reject_reason,
-                        }
-                        for group in groups
-                    ],
-                },
-            ),
-            full_hidden,
-        )
-
     def run_compact(
         self,
         *,
@@ -772,18 +411,6 @@ class TargetVerifyExecutor:
         sampling_info,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        grouped = self._run_grouped_compact_if_supported(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            sampling_info=sampling_info,
-        )
-        if grouped is not None:
-            return grouped
-
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
             layout=layout,
@@ -827,14 +454,12 @@ class TargetVerifyExecutor:
             )
         return self._verify_backend_self_adds_seq_lens_cache
 
-
 class CommitInjectCtx(msgspec.Struct):
 
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
-
 
 def _callable_accepts_keyword(fn, name: str) -> bool:
     try:
@@ -845,7 +470,6 @@ def _callable_accepts_keyword(fn, name: str) -> bool:
         param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
     )
 
-
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -853,7 +477,6 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
-
 
 class DsparkVerifyEpilogue:
 
@@ -1121,7 +744,6 @@ class DsparkVerifyEpilogue:
                 commit_lens=gated_commit_lens,
                 pool=pool,
             )
-
 
 def accept_draft_tokens(
     *,

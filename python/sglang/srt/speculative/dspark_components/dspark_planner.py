@@ -602,9 +602,9 @@ class DSparkVerifyPlanner:
             else int(global_num_reqs)
         )
         if tier_num_reqs != 1:
-            # TODO(GLM/ROCm DSA): Handle mixed pre/post-topk request batches with a
-            # DeepSeek-style grouped target-verify replay path instead of forcing a
-            # single graph contract across incompatible attention regions.
+            # Keep one target forward per verify step: mixed-region batches use the
+            # whole-batch eager fallback until a single-forward graph contract exists.
+            # TODO(GLM/ROCm DSA): add that contract or scheduler-side bucketing.
             return None
         seq_lens_cpu = [int(x) for x in prefix_lens.detach().cpu().tolist()]
         attn_backend = getattr(self.model_runner, "attn_backend", None)

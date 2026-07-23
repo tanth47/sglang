@@ -1,7 +1,14 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
+
 
 import torch
 
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    TargetVerifyExecutor,
+    TargetVerifyResult,
+)
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
     DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
@@ -11,15 +18,11 @@ from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
-    DsaTargetVerifyGraphGroup,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
-    can_group_dsa_target_verify_reject,
     classify_dsa_target_verify_graph_regime,
     classify_dsa_target_verify_graph_reject_reason,
-    group_dsa_target_verify_graph_regions,
     is_static_full_verify_layout,
-    scatter_grouped_strided_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -54,42 +57,6 @@ class TestRaggedTargetVerifyGeometry(unittest.TestCase):
         self.assertEqual(geometry.cache_seqlens_int32.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_q.dtype, torch.int32)
         self.assertEqual(geometry.cu_seqlens_k.dtype, torch.int32)
-
-
-class TestGroupedStridedScatter(unittest.TestCase):
-    def test_grouped_logits_return_to_original_order(self):
-        stride = 3
-        full = torch.empty((4 * stride, 2), dtype=torch.int64)
-        group = torch.tensor(
-            [
-                [20, 200],
-                [21, 201],
-                [22, 202],
-                [10, 100],
-                [11, 101],
-                [12, 102],
-            ],
-            dtype=torch.int64,
-        )
-        scatter_grouped_strided_rows(
-            full=full,
-            group=group,
-            row_indices=torch.tensor([2, 1], dtype=torch.long),
-            bs=4,
-            stride=stride,
-        )
-        self.assertEqual(full.view(4, stride, 2)[2].tolist(), group[:3].tolist())
-        self.assertEqual(full.view(4, stride, 2)[1].tolist(), group[3:].tolist())
-
-    def test_grouped_scatter_rejects_shape_mismatch(self):
-        with self.assertRaisesRegex(ValueError, "group first dimension"):
-            scatter_grouped_strided_rows(
-                full=torch.empty((6, 2)),
-                group=torch.empty((4, 2)),
-                row_indices=torch.tensor([0], dtype=torch.long),
-                bs=2,
-                stride=3,
-            )
 
 
 class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
@@ -261,85 +228,6 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertEqual(reason, DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT)
 
-    def test_graph_region_grouping_splits_mixed_batch(self):
-        groups = group_dsa_target_verify_graph_regions(
-            seq_lens_cpu=[1000, 3000],
-            verify_lens_cpu=[8, 8],
-            dsa_index_topk=2048,
-            post_topk_guard_tokens=64,
-        )
-        self.assertEqual(
-            groups,
-            [
-                DsaTargetVerifyGraphGroup(
-                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-                ),
-                DsaTargetVerifyGraphGroup(
-                    indices=(1,),
-                    reject_reason=DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
-                ),
-            ],
-        )
-
-    def test_graph_region_grouping_keeps_original_indices(self):
-        groups = group_dsa_target_verify_graph_regions(
-            seq_lens_cpu=[3000, 1000, 2044, 1200],
-            verify_lens_cpu=[8, 8, 8, 1],
-            dsa_index_topk=2048,
-            post_topk_guard_tokens=64,
-        )
-        self.assertEqual(
-            groups,
-            [
-                DsaTargetVerifyGraphGroup(
-                    indices=(1, 3), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-                ),
-                DsaTargetVerifyGraphGroup(
-                    indices=(0,),
-                    reject_reason=DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT,
-                ),
-                DsaTargetVerifyGraphGroup(
-                    indices=(2,),
-                    reject_reason=DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
-                ),
-            ],
-        )
-
-    def test_graph_region_grouping_allows_post_topk_capture_contract(self):
-        groups = group_dsa_target_verify_graph_regions(
-            seq_lens_cpu=[4096, 1000],
-            verify_lens_cpu=[8, 8],
-            dsa_index_topk=2048,
-            post_topk_guard_tokens=64,
-            post_topk_capture_seq_len=4096,
-        )
-        self.assertEqual(
-            groups,
-            [
-                DsaTargetVerifyGraphGroup(
-                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_POST_TOPK_GRAPH
-                ),
-                DsaTargetVerifyGraphGroup(
-                    indices=(1,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-                ),
-            ],
-        )
-
-    def test_graph_region_grouping_ignores_zero_verify_padding(self):
-        groups = group_dsa_target_verify_graph_regions(
-            seq_lens_cpu=[1000, 1],
-            verify_lens_cpu=[8, 0],
-            dsa_index_topk=2048,
-        )
-        self.assertEqual(
-            groups,
-            [
-                DsaTargetVerifyGraphGroup(
-                    indices=(0,), graph_regime=DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-                )
-            ],
-        )
-
     def test_reject_reason_is_none_for_graphable_post_topk(self):
         reason = classify_dsa_target_verify_graph_reject_reason(
             seq_lens_cpu=[4096],
@@ -362,24 +250,6 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         self.assertEqual(
             classify_dsa_target_verify_graph_reject_reason(**kwargs),
             DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT,
-        )
-
-    def test_grouped_partial_source_rejects_include_window_transition(self):
-        self.assertTrue(
-            can_group_dsa_target_verify_reject(
-                DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT
-            )
-        )
-        self.assertTrue(
-            can_group_dsa_target_verify_reject(
-                DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT
-            )
-        )
-        self.assertFalse(can_group_dsa_target_verify_reject(None))
-        self.assertFalse(
-            can_group_dsa_target_verify_reject(
-                DSA_TARGET_VERIFY_POST_TOPK_NO_CAPTURE_REJECT
-            )
         )
 
 
@@ -497,6 +367,55 @@ class TestCaptureVerifyLens(unittest.TestCase):
             build_capture_verify_lens(num_tokens=64, num_slots=4, num_draft_tokens=8)
         with self.assertRaises(ValueError):
             build_capture_verify_lens(num_tokens=4, num_slots=8, num_draft_tokens=8)
+
+
+
+class TestCompactTargetVerifyExecution(unittest.TestCase):
+    def test_compact_verify_invokes_target_path_once(self):
+        executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
+        executor.verify_num_draft_tokens = 8
+        executor.model_runner = object()
+        executor.verify_epilogue = None
+
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.empty((16, 4)),
+            hidden_states=torch.empty((16, 4)),
+        )
+        target_result = TargetVerifyResult(
+            logits_output=logits_output, can_run_cuda_graph=False
+        )
+        executor._run_ragged = mock.Mock(return_value=target_result)
+        executor._compact_outputs_to_strided = mock.Mock(
+            return_value=(
+                torch.empty((16, 4)),
+                torch.empty((16, 4)),
+            )
+        )
+        layout = SimpleNamespace(verify_lens=torch.tensor([8, 8]))
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_verify."
+                "BuildRaggedVerifyWindow.execute",
+                return_value=object(),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_verify."
+                "apply_logits_adjustments_strided"
+            ),
+        ):
+            result, _ = executor.run_compact(
+                batch=object(),
+                layout=layout,
+                draft_block_ids=torch.zeros((2, 1), dtype=torch.int64),
+                draft_tokens=torch.zeros((2, 7), dtype=torch.int64),
+                bs=2,
+                device="cpu",
+                sampling_info=None,
+            )
+
+        self.assertIs(result, target_result)
+        executor._run_ragged.assert_called_once()
 
 
 if __name__ == "__main__":
