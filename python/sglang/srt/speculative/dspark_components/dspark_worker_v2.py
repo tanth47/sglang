@@ -613,8 +613,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
-        logits_adjustments_reject_reason = (
-            verify_logits_adjustments_noop_reject_reason(sampling_info)
+        logits_adjustments_reject_reason = verify_logits_adjustments_noop_reject_reason(
+            sampling_info
         )
         has_verify_epilogue = self._verify_executor.verify_epilogue is not None
         fold_eligible = (

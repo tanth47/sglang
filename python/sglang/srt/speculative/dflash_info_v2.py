@@ -111,7 +111,7 @@ class DFlashDraftInputV2(SpecInput):
             )
 
     @classmethod
-    def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
+    def create_idle_input(cls, device: torch.device) -> DFlashDraftInputV2:
         return cls(
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
@@ -269,7 +269,7 @@ class DFlashDraftInputV2(SpecInput):
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
 
-    def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+    def merge_batch(self, spec_info: DFlashDraftInputV2):
         if self.reserved_seq_lens_cpu is not None:
             assert spec_info.reserved_seq_lens_cpu is not None
             self.reserved_seq_lens_cpu = torch.cat(

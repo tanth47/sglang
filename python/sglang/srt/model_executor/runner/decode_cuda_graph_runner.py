@@ -399,10 +399,7 @@ def dsa_target_verify_graph_debug_info(
             graph_regime_label = "post_topk_no_capture_contract"
         elif graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT:
             graph_regime_label = "post_topk_above_capture_contract"
-        elif (
-            graph_reject_reason
-            == DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT
-        ):
+        elif graph_reject_reason == DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT:
             graph_regime_label = "post_topk_capture_seq_len_mismatch"
         elif graph_reject_reason == DSA_TARGET_VERIFY_WINDOW_TRANSITION_REJECT:
             graph_regime_label = "window_transition"

@@ -78,9 +78,7 @@ def make_obs(
         verify_tokens_dp_synced=num_verify_tokens,
         verify_tokens_graph_key=num_verify_tokens,
         target_verify_cuda_graph=target_verify_cuda_graph,
-        target_verify_cuda_graph_reject_reason=(
-            target_verify_cuda_graph_reject_reason
-        ),
+        target_verify_cuda_graph_reject_reason=(target_verify_cuda_graph_reject_reason),
         target_verify_cuda_graph_reject_details=(
             target_verify_cuda_graph_reject_details
         ),
@@ -104,9 +102,7 @@ def make_obs(
         folded_commit=folded_commit,
         folded_accept_reject_reason=folded_accept_reject_reason,
         folded_commit_reject_reason=folded_commit_reject_reason,
-        commit_fold_capability_reject_reason=(
-            commit_fold_capability_reject_reason
-        ),
+        commit_fold_capability_reject_reason=(commit_fold_capability_reject_reason),
         commit_inject_path=commit_inject_path,
     )
 
@@ -213,9 +209,7 @@ class TestCoreAndCpuTiming(unittest.TestCase):
                 folded_accept=True,
                 folded_commit=False,
                 folded_commit_reject_reason="pool_missing_fused_swa_commit",
-                commit_fold_capability_reject_reason=(
-                    "pool_missing_fused_swa_commit"
-                ),
+                commit_fold_capability_reject_reason=("pool_missing_fused_swa_commit"),
                 commit_inject_path="generic_prefix_valid",
             )
         )
@@ -249,9 +243,7 @@ class TestCoreAndCpuTiming(unittest.TestCase):
                 folded_accept=True,
                 folded_commit=False,
                 folded_commit_reject_reason="target_verify_not_full_graph",
-                commit_fold_capability_reject_reason=(
-                    "pool_missing_fused_swa_commit"
-                ),
+                commit_fold_capability_reject_reason=("pool_missing_fused_swa_commit"),
                 commit_inject_path="generic_prefix_valid",
             )
         )

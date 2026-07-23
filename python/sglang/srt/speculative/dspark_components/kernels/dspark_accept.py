@@ -19,7 +19,9 @@ def _compute_correct_drafts_and_bonus(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     matches = candidates[:, 1:] == target_predict[:, :-1]
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    bonus = target_predict[torch.arange(candidates.shape[0], device=candidates.device), correct_len]
+    bonus = target_predict[
+        torch.arange(candidates.shape[0], device=candidates.device), correct_len
+    ]
     return correct_len, bonus.to(torch.int64)
 
 

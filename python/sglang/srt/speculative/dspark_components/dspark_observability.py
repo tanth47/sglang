@@ -39,6 +39,7 @@ def _compute_correct_drafts_and_bonus(
     ]
     return correct_len, bonus.to(torch.int64)
 
+
 ALL_COMPONENTS_TOKEN = "all"
 
 
@@ -437,12 +438,8 @@ class DsparkInfoDumper:
             record.fold_eligible = pending.fold_eligible
             record.folded_accept = pending.folded_accept
             record.folded_commit = pending.folded_commit
-            record.folded_accept_reject_reason = (
-                pending.folded_accept_reject_reason
-            )
-            record.folded_commit_reject_reason = (
-                pending.folded_commit_reject_reason
-            )
+            record.folded_accept_reject_reason = pending.folded_accept_reject_reason
+            record.folded_commit_reject_reason = pending.folded_commit_reject_reason
             record.commit_fold_capability_reject_reason = (
                 pending.commit_fold_capability_reject_reason
             )

@@ -133,9 +133,7 @@ class TestTargetHiddenKvInjector(unittest.TestCase):
         commit_lens = torch.tensor([2, 0], dtype=torch.int32)
 
         expected_positions = torch.tensor([2, 3, 4, 4, 5, 6], dtype=torch.int64)
-        expected_swa_loc = torch.tensor(
-            [112, 113, -1, -1, -1, -1], dtype=torch.int32
-        )
+        expected_swa_loc = torch.tensor([112, 113, -1, -1, -1, -1], dtype=torch.int32)
         with mock.patch(
             "sglang.srt.speculative.dspark_components.dspark_kv_inject."
             "BuildCommitInjectLayout.execute",

@@ -56,16 +56,19 @@ def verify_logits_adjustments_noop_reject_reason(sampling_info) -> Optional[str]
         return "logit_bias"
     return None
 
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if verify_logits_adjustments_noop_reject_reason(sampling_info) is not None:
         return False
     return True
+
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
     cuda_graph_reject_reason: Optional[str] = None
     cuda_graph_reject_details: Optional[dict] = None
+
 
 class TargetVerifyExecutor:
     def __init__(
@@ -454,12 +457,14 @@ class TargetVerifyExecutor:
             )
         return self._verify_backend_self_adds_seq_lens_cache
 
+
 class CommitInjectCtx(msgspec.Struct):
 
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+
 
 def _callable_accepts_keyword(fn, name: str) -> bool:
     try:
@@ -470,6 +475,7 @@ def _callable_accepts_keyword(fn, name: str) -> bool:
         param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
     )
 
+
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -477,6 +483,7 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
+
 
 class DsparkVerifyEpilogue:
 
@@ -563,7 +570,9 @@ class DsparkVerifyEpilogue:
         _kind, reason = self._commit_fold_kind_and_reject_reason()
         return reason
 
-    def _commit_fold_kind_and_reject_reason(self) -> tuple[Optional[str], Optional[str]]:
+    def _commit_fold_kind_and_reject_reason(
+        self,
+    ) -> tuple[Optional[str], Optional[str]]:
         if self.commit_ctx is None:
             return None, "no_commit_context"
         writer = getattr(self.commit_ctx.draft_model, "write_target_hidden_kv", None)
@@ -744,6 +753,7 @@ class DsparkVerifyEpilogue:
                 commit_lens=gated_commit_lens,
                 pool=pool,
             )
+
 
 def accept_draft_tokens(
     *,

@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 
+
 class RaggedVerifyMode(str, Enum):
     STATIC = "static"
     CAP_ACCEPT = "cap-accept"
@@ -35,6 +36,8 @@ DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT = (
 DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT = (
     "rocm_dsa_target_verify_post_topk_capture_seq_len_mismatch"
 )
+
+
 def read_ragged_verify_mode() -> RaggedVerifyMode:
     value = envs.SGLANG_RAGGED_VERIFY_MODE.get()
     for mode in RaggedVerifyMode:
@@ -45,8 +48,10 @@ def read_ragged_verify_mode() -> RaggedVerifyMode:
         f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}"
     )
 
+
 def ragged_verify_compact_enabled() -> bool:
     return read_ragged_verify_mode() == RaggedVerifyMode.COMPACT
+
 
 def build_ragged_verify_token_buckets(
     *,
@@ -78,6 +83,7 @@ def build_ragged_verify_token_buckets(
     assert buckets and buckets[0] > 0, f"{buckets=}"
     return buckets
 
+
 def round_up_grid(total: int, grid: Sequence[int]) -> int:
     if not grid:
         raise ValueError("round_up_grid requires a non-empty grid")
@@ -88,6 +94,7 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
         )
     index = bisect.bisect_left(grid, total)
     return grid[index]
+
 
 def classify_dsa_target_verify_graph_regime(
     *,
@@ -136,6 +143,7 @@ def classify_dsa_target_verify_graph_regime(
     ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
+
 
 def classify_dsa_target_verify_graph_reject_reason(
     *,
@@ -327,12 +335,14 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             total_verify_tokens=self.graph_num_tokens,
         )
 
+
 def materialize_verify_lens_cpu(layout: RaggedVerifyLayout) -> list[int]:
     """Return host verify lengths, syncing from device only for layouts that were
     intentionally built without a host mirror."""
     if layout.verify_lens_cpu is not None:
         return [int(x) for x in layout.verify_lens_cpu]
     return [int(x) for x in layout.verify_lens.detach().cpu().tolist()]
+
 
 def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     if layout.total_verify_tokens is not None:
@@ -363,6 +373,7 @@ def is_static_full_verify_layout(
         and layout.graph_num_tokens % num_tokens_per_req == 0
     )
 
+
 def build_capture_verify_lens(
     *,
     num_tokens: int,
@@ -383,6 +394,7 @@ def build_capture_verify_lens(
     rem = num_tokens - base * num_slots
     return [base + 1] * rem + [base] * (num_slots - rem)
 
+
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""
@@ -391,11 +403,13 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
         return None
     return spec_info.ragged_verify_layout
 
+
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     max_seq_len_q: Optional[int]
+
 
 def build_ragged_target_verify_geometry(
     *,
@@ -414,6 +428,7 @@ def build_ragged_target_verify_geometry(
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
     )
+
 
 def compute_target_verify_graph_key(
     *,
@@ -437,12 +452,14 @@ def compute_target_verify_graph_key(
         )
     return graph_num_tokens, graph_num_tokens
 
+
 class VerifyExtendLengths(msgspec.Struct, frozen=True):
     seq_lens_extended: torch.Tensor
     seq_lens_cpu_extended: List[int]
     extend_seq_lens_cpu: List[int]
     num_tokens: int
     extend_start_loc: Optional[torch.Tensor]
+
 
 def compute_uniform_extend_lengths(
     *,
@@ -462,6 +479,7 @@ def compute_uniform_extend_lengths(
         num_tokens=num_tokens,
         extend_start_loc=None,
     )
+
 
 def compute_ragged_extend_lengths(
     *,

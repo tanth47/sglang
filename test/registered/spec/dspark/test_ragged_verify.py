@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -11,7 +10,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.srt.speculative.ragged_verify import (
     DSA_TARGET_VERIFY_BATCH_MIXED_REGIONS_REJECT,
-    DSA_TARGET_VERIFY_MIXED_TRANSITION_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_ABOVE_CAPTURE_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_CAPTURE_MISMATCH_REJECT,
     DSA_TARGET_VERIFY_POST_TOPK_GRAPH,

@@ -620,9 +620,7 @@ class DSparkVerifyPlanner:
             dsa_index_topk=dsa_index_topk,
             capture_num_tokens=capture_num_tokens,
         )
-        if verify_lens_cpu is None or verify_lens_cpu == [
-            self.verify_num_draft_tokens
-        ]:
+        if verify_lens_cpu is None or verify_lens_cpu == [self.verify_num_draft_tokens]:
             return None
         return RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
