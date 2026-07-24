@@ -7,14 +7,22 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DsparkStepObservers,
+    InfoComponent,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     DSparkVerifyPlanner,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
+)
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -322,6 +330,77 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             [call.kwargs["tier_num_tokens"] for call in build_layout.call_args_list],
             [8, 16],
         )
+
+    def test_verify_all_skips_confidence_until_policy_needs_it(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = SimpleNamespace(forced_budget_frac=None)
+        planner._is_verify_all = True
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3)
+        self.assertFalse(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(
+            gamma=3, sps_target_accept_length=2.0
+        )
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3, sps_dry_run=True)
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3)
+        planner._budget_planner.forced_budget_frac = 0.5
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._budget_planner.forced_budget_frac = None
+        planner._is_verify_all = False
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._budget_planner = None
+        self.assertFalse(planner.needs_confidence_publication)
+
+    def test_observability_modes_preserve_confidence_publication(self):
+        observers = object.__new__(DsparkStepObservers)
+        observers._info_components = set()
+        with (
+            mock.patch.object(
+                envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL, "get", return_value=0
+            ),
+            mock.patch.object(
+                envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(observers.needs_budget_telemetry)
+            observers._info_components = {InfoComponent.REQS}
+            self.assertTrue(observers.needs_budget_telemetry)
+            observers._info_components = set()
+
+        with mock.patch.object(
+            envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL, "get", return_value=8
+        ):
+            self.assertTrue(observers.needs_budget_telemetry)
+
+        with mock.patch.object(
+            envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER,
+            "get",
+            return_value=True,
+        ):
+            self.assertTrue(observers.needs_budget_telemetry)
+
+    def test_worker_confidence_publication_gate(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._verify_planner = SimpleNamespace(
+            needs_confidence_publication=False
+        )
+        worker._observers = SimpleNamespace(needs_budget_telemetry=False)
+        self.assertFalse(worker._should_publish_confidence(None))
+        self.assertFalse(worker._should_publish_confidence(torch.ones(1)))
+
+        worker._verify_planner.needs_confidence_publication = True
+        self.assertTrue(worker._should_publish_confidence(torch.ones(1)))
+        worker._verify_planner.needs_confidence_publication = False
+        worker._observers.needs_budget_telemetry = True
+        self.assertTrue(worker._should_publish_confidence(torch.ones(1)))
 
 
 class _FakeTargetWorker:

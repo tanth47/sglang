@@ -474,6 +474,18 @@ class DSparkVerifyPlanner:
             return None
         return self.prepare_verify_budget
 
+    @property
+    def needs_confidence_publication(self) -> bool:
+        """Whether overlap scheduling can consume a relayed confidence block."""
+        if not self.schedules_verify_budget:
+            return False
+        return not (
+            getattr(self, "_is_verify_all", False)
+            and self._schedule_cfg.sps_target_accept_length <= 0
+            and not self._schedule_cfg.sps_dry_run
+            and getattr(self._budget_planner, "forced_budget_frac", None) is None
+        )
+
     def _budget_from_resolved(
         self,
         *,

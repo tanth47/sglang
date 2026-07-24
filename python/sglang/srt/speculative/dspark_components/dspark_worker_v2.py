@@ -632,7 +632,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if on_publish is not None:
-            if confidence is not None:
+            if self._should_publish_confidence(confidence):
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
@@ -695,6 +695,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_planner.needs_accept_feedback
                 else None
             ),
+        )
+
+    def _should_publish_confidence(
+        self, confidence: Optional[torch.Tensor]
+    ) -> bool:
+        return confidence is not None and (
+            self._verify_planner.needs_confidence_publication
+            or self._observers.needs_budget_telemetry
         )
 
     def get_confidence_budget_prepare(self):

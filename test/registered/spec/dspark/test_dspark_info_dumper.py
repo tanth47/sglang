@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -131,6 +132,48 @@ class TestResolveComponents(CustomTestCase):
                         InfoComponent.REQS,
                     },
                 )
+
+    def test_step_observers_reuse_resolved_components_for_relay_policy(self):
+        components = {InfoComponent.REQS}
+        dumper = mock.Mock()
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_observability."
+                "resolve_enabled_components",
+                return_value=components,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_observability."
+                "ConfidenceMetricsProbe"
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_observability."
+                "DsparkInfoDumper",
+                return_value=dumper,
+            ) as dumper_cls,
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_observability."
+                "create_block_accept_estimate_recorder",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_observability."
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_rank=0),
+            ),
+        ):
+            observers = DsparkStepObservers(
+                planner=SimpleNamespace(mode_value="compact"),
+                gamma=7,
+                verify_num_draft_tokens=8,
+                tp_rank=0,
+                device=torch.device("cpu"),
+                simulate_acc_len=0.0,
+            )
+
+        self.assertIs(observers._info_components, components)
+        self.assertIs(dumper_cls.call_args.kwargs["components"], components)
+        self.assertTrue(observers.needs_budget_telemetry)
 
 
 class TestCoreAndCpuTiming(CustomTestCase):
