@@ -295,8 +295,124 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         self.assertEqual(total_extra, 3)
 
 
-class TestVerifyLenAnchorContract(CustomTestCase):
+class TestScheduleVerifyLensTopkExactBudget(CustomTestCase):
+    def test_all_zero_confidence_consumes_exact_budget_deterministically(self):
+        survival = torch.zeros(3, 4, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=4, survival_eps=1e-6)
 
+        first = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+        second = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        expected = torch.tensor([3, 3, 2], dtype=torch.int32)
+        self.assertTrue(torch.equal(first, expected))
+        self.assertTrue(torch.equal(second, expected))
+        extras = first.to(torch.int64) - 1
+        self.assertEqual(int(extras.sum().item()), 5)
+        self.assertLessEqual(int(extras.max().item() - extras.min().item()), 1)
+
+    def test_partial_valid_candidates_backfill_filtered_prefixes(self):
+        survival = torch.tensor(
+            [[0.90, 0.80, 0.0, 0.0], [0.95, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(gamma=4, survival_eps=0.5)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(legacy, torch.tensor([3, 2], dtype=torch.int32)))
+        self.assertTrue(torch.equal(exact, torch.tensor([4, 3], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 + 5)
+
+    def test_non_default_min_max_define_exact_capacity(self):
+        survival = torch.tensor(
+            [[0.99, 0.01, 0.01, 0.01, 0.01, 0.01], [0.50] * 6],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(
+            gamma=6, min_verify_len=2, max_verify_len=5, survival_eps=0.1
+        )
+
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+        capped = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=100, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(exact, torch.tensor([4, 5], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 * 2 + 5)
+        self.assertGreaterEqual(int(exact.min().item()), cfg.min_verify_len)
+        self.assertLessEqual(int(exact.max().item()), cfg.max_verify_len)
+        self.assertTrue(torch.equal(capped, torch.tensor([5, 5], dtype=torch.int32)))
+
+    def test_zero_min_uses_anchor_floor_without_losing_budget(self):
+        survival = torch.zeros(2, 3, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(
+            gamma=3, min_verify_len=0, max_verify_len=3, survival_eps=1e-6
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=3, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(exact, torch.tensor([3, 2], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 + 3)
+
+    def test_flag_off_matches_legacy_oracle_byte_for_byte(self):
+        survival = torch.tensor(
+            [[0.90, 0.40, 0.30, 0.20], [0.80, 0.70, 0.10, 0.0]],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(
+            gamma=4, min_verify_len=2, max_verify_len=4, survival_eps=0.5
+        )
+        expected = schedule_verify_lens_topk_vanilla(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        implicit_off = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        explicit_off = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=False
+        )
+
+        self.assertEqual(implicit_off.numpy().tobytes(), expected.numpy().tobytes())
+        self.assertEqual(explicit_off.numpy().tobytes(), expected.numpy().tobytes())
+
+    def test_nan_is_filtered_in_legacy_and_selectable_last_in_exact_mode(self):
+        nan = float("nan")
+        survival = torch.tensor(
+            [[0.90, nan, nan], [0.80, 0.70, 0.60]], dtype=torch.float32
+        )
+        cfg = DSparkScheduleConfig(gamma=3, survival_eps=1e-6)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=6, cfg=cfg
+        )
+        exact_finite_only = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=4, cfg=cfg, exact_budget=True
+        )
+        exact_with_nan = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        finite_only = torch.tensor([2, 4], dtype=torch.int32)
+        self.assertTrue(torch.equal(legacy, finite_only))
+        self.assertTrue(torch.equal(exact_finite_only, finite_only))
+        self.assertTrue(
+            torch.equal(exact_with_nan, torch.tensor([3, 4], dtype=torch.int32))
+        )
+
+
+class TestVerifyLenAnchorContract(CustomTestCase):
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):
         survival = _survival_from_confidence(
@@ -709,6 +825,124 @@ def _fake_model_runner(
             dsa_index_topk=dsa_index_topk,
         ),
     )
+
+
+class TestScheduleLayoutGraphTierAlignment(CustomTestCase):
+    @staticmethod
+    def _planner(*, align, mode, capture_num_tokens):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = align
+        planner._ragged_verify_mode = mode
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7)
+        planner._budget_planner = object()
+        planner._dynamic_graph_tier = True
+        planner.verify_num_draft_tokens = 8
+        planner.model_runner = _fake_model_runner(capture_num_tokens, max_bs=8)
+        planner.server_args = types.SimpleNamespace(tp_size=1)
+        return planner
+
+    def test_exact_activation_requires_resolved_compact_capture_tier(self):
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+
+        active = self._planner(
+            align=True,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+        budget, exact_budget = active._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=7,
+            global_num_reqs=None,
+            dp_tier_num_tokens=None,
+        )
+        self.assertEqual(budget, 14)
+        self.assertTrue(exact_budget)
+
+        for mode, capture_num_tokens in (
+            (RaggedVerifyMode.CAP_ACCEPT, [8, 16]),
+            (RaggedVerifyMode.COMPACT, None),
+        ):
+            with self.subTest(mode=mode, capture_num_tokens=capture_num_tokens):
+                inactive = self._planner(
+                    align=True,
+                    mode=mode,
+                    capture_num_tokens=capture_num_tokens,
+                )
+                budget, exact_budget = inactive._budget_aligned_to_graph_tier(
+                    req_pool_indices=req_pool_indices,
+                    budget=7,
+                    global_num_reqs=None,
+                    dp_tier_num_tokens=None,
+                )
+                self.assertEqual(budget, 7)
+                self.assertFalse(exact_budget)
+
+    def test_schedule_layout_fills_resolved_graph_tier_with_low_confidence(self):
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        prefix_lens = torch.tensor([100, 200], dtype=torch.int64)
+        confidence = torch.tensor(
+            [
+                [0.90, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.80, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        aligned = self._planner(
+            align=True,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+        inactive = self._planner(
+            align=False,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(None, 1),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner.is_hip",
+                return_value=False,
+            ),
+        ):
+            aligned_layout = aligned.schedule_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=torch.device("cpu"),
+                confidence=confidence,
+                budget=7,
+            )
+            inactive_layout = inactive.schedule_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=torch.device("cpu"),
+                confidence=confidence,
+                budget=7,
+            )
+
+        self.assertIsNotNone(aligned_layout)
+        self.assertEqual(int(aligned_layout.verify_lens.sum().item()), 16)
+        self.assertEqual(aligned_layout.graph_num_tokens, 16)
+        self.assertTrue(
+            torch.equal(
+                aligned_layout.verify_lens,
+                torch.tensor([8, 8], dtype=torch.int32),
+            )
+        )
+
+        self.assertIsNotNone(inactive_layout)
+        self.assertEqual(int(inactive_layout.verify_lens.sum().item()), 4)
+        self.assertEqual(inactive_layout.graph_num_tokens, 16)
+        self.assertTrue(
+            torch.equal(
+                inactive_layout.verify_lens,
+                torch.tensor([2, 2], dtype=torch.int32),
+            )
+        )
 
 
 class TestBudgetTierSelection(CustomTestCase):

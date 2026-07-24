@@ -490,10 +490,33 @@ def _case_schedule_verify_lens_topk(tc):
         torch.full((bs, gamma), 0.5, device=DEVICE),  # all-ties
         (base * 4).floor() / 4,  # coarse quantization
         torch.where(base < 0.3, torch.zeros_like(base), base),  # invalid zeros
+        torch.zeros(bs, gamma, device=DEVICE),  # all filtered
+        torch.where(
+            base < 0.3, torch.full_like(base, float("nan")), base
+        ),  # NaN propagation
     )
     for confidence in confidences:
         for budget in (0, 1, 3, 7, 1000):
-            tc._parity(cls, confidence=confidence, budget=budget, cfg=cfg)
+            for exact_budget in (False, True):
+                tc._parity(
+                    cls,
+                    confidence=confidence,
+                    budget=budget,
+                    cfg=cfg,
+                    exact_budget=exact_budget,
+                )
+
+    bounded_cfg = DSparkScheduleConfig(
+        gamma=gamma, min_verify_len=2, max_verify_len=4, survival_eps=0.5
+    )
+    for budget in (0, 1, 5, 1000):
+        tc._parity(
+            cls,
+            confidence=confidences[2],
+            budget=budget,
+            cfg=bounded_cfg,
+            exact_budget=True,
+        )
 
 
 def _case_softmax_temp(tc):

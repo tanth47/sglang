@@ -30,8 +30,14 @@ class ScheduleVerifyLensTopk:
         confidence: torch.Tensor,
         budget: int,
         cfg: DSparkScheduleConfig,
+        exact_budget: bool = False,
     ) -> torch.Tensor:
-        return schedule_verify_lens_topk(confidence=confidence, budget=budget, cfg=cfg)
+        return schedule_verify_lens_topk(
+            confidence=confidence,
+            budget=budget,
+            cfg=cfg,
+            exact_budget=exact_budget,
+        )
 
     @classmethod
     def triton(
@@ -40,9 +46,13 @@ class ScheduleVerifyLensTopk:
         confidence: torch.Tensor,
         budget: int,
         cfg: DSparkScheduleConfig,
+        exact_budget: bool = False,
     ) -> torch.Tensor:
         return schedule_verify_lens_topk_triton(
-            confidence=confidence, budget=budget, cfg=cfg
+            confidence=confidence,
+            budget=budget,
+            cfg=cfg,
+            exact_budget=exact_budget,
         )
 
 
@@ -55,9 +65,13 @@ def schedule_verify_lens_topk(
     confidence: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    exact_budget: bool = False,
 ) -> torch.Tensor:
     return schedule_verify_lens_topk_from_survival(
-        survival_probs=compute_sort_survival(confidence), budget=budget, cfg=cfg
+        survival_probs=compute_sort_survival(confidence),
+        budget=budget,
+        cfg=cfg,
+        exact_budget=exact_budget,
     )
 
 
@@ -66,14 +80,18 @@ def schedule_verify_lens_topk_from_survival(
     survival_probs: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    exact_budget: bool = False,
 ) -> torch.Tensor:
-    num_requests, _gamma = survival_probs.shape
+    num_requests, gamma = survival_probs.shape
     max_len = cfg.resolved_max_verify_len()
     device = survival_probs.device
+    candidate_start, candidate_stop, base_verify_len = _schedule_candidate_bounds(
+        gamma=gamma, cfg=cfg, exact_budget=exact_budget
+    )
 
     selected_extra = torch.zeros(num_requests, dtype=torch.int64, device=device)
     if budget > 0:
-        candidate_window = survival_probs[:, :max_len]
+        candidate_window = survival_probs[:, candidate_start:candidate_stop]
         num_candidates = candidate_window.numel()
         if num_candidates > 0:
             request_index = (
@@ -86,7 +104,11 @@ def schedule_verify_lens_topk_from_survival(
                 .view(1, candidate_window.shape[1])
                 .expand_as(candidate_window)
             )
-            valid = candidate_window >= cfg.survival_eps
+            valid = (
+                torch.ones_like(candidate_window, dtype=torch.bool)
+                if exact_budget
+                else candidate_window >= cfg.survival_eps
+            )
 
             flat_prob = candidate_window.reshape(-1).to(torch.float64)
             flat_request = request_index.reshape(-1)
@@ -107,12 +129,26 @@ def schedule_verify_lens_topk_from_survival(
             selected_extra.scatter_add_(0, chosen_requests, chosen_valid)
 
     min_len = torch.full(
-        (num_requests,), cfg.min_verify_len, dtype=torch.int64, device=device
+        (num_requests,), base_verify_len, dtype=torch.int64, device=device
     )
     verify_lens = min_len + selected_extra
     lower_bound = max(cfg.min_verify_len, 1)
     verify_lens = torch.clamp(verify_lens, min=lower_bound, max=max_len)
     return verify_lens.to(torch.int32)
+
+
+def _schedule_candidate_bounds(
+    *, gamma: int, cfg: DSparkScheduleConfig, exact_budget: bool
+) -> tuple[int, int, int]:
+    max_len = cfg.resolved_max_verify_len()
+    if not exact_budget:
+        return 0, min(max_len, gamma), cfg.min_verify_len
+
+    # survival[p] scores the prefix extension from p + 1 to p + 2 tokens.
+    floor = max(cfg.min_verify_len, 1)
+    candidate_start = floor - 1
+    candidate_stop = min(max_len - 1, gamma)
+    return candidate_start, max(candidate_start, candidate_stop), floor
 
 
 def _value_independent_descending_order(
@@ -122,7 +158,9 @@ def _value_independent_descending_order(
     requests: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
-    masked_prob = torch.where(valid, probs, torch.full_like(probs, float("-inf")))
+    lowest_prob = torch.full_like(probs, float("-inf"))
+    canonical_prob = torch.where(torch.isnan(probs), lowest_prob, probs)
+    masked_prob = torch.where(valid, canonical_prob, lowest_prob)
     num_candidates = masked_prob.numel()
     order = torch.arange(num_candidates, device=probs.device)
     order = order[torch.argsort(requests[order], stable=True)]
@@ -138,6 +176,7 @@ def _schedule_topk_prep_kernel(
     selected_extra_ptr,
     gamma,
     cols,
+    candidate_start,
     G_P2: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -146,7 +185,13 @@ def _schedule_topk_prep_kernel(
         confidence_ptr + row.to(tl.int64) * gamma + g, mask=g < gamma, other=1.0
     ).to(tl.float32)
     surv = tl.cumprod(conf, axis=0)
-    tl.store(survival_ptr + row.to(tl.int64) * cols + g, surv, mask=g < cols)
+    candidate_col = g - candidate_start
+    candidate_mask = (candidate_col >= 0) & (candidate_col < cols)
+    tl.store(
+        survival_ptr + row.to(tl.int64) * cols + candidate_col,
+        surv,
+        mask=candidate_mask,
+    )
     tl.store(selected_extra_ptr + row, 0)
 
 
@@ -186,6 +231,7 @@ def _schedule_topk_selected_extra_kernel(
     r = c // cols
     p = c % cols
     sp = tl.load(survival_ptr + c, mask=cmask, other=0.0)
+    sp = tl.where(sp == sp, sp, float("-inf"))
     valid_c = sp >= survival_eps
     mp = tl.where(valid_c, sp, float("-inf"))
     rank = tl.zeros([BLOCK_C], dtype=tl.int32)
@@ -195,6 +241,7 @@ def _schedule_topk_selected_extra_kernel(
         rp = cp // cols
         pp = cp % cols
         spp = tl.load(survival_ptr + cp, mask=cpmask, other=0.0)
+        spp = tl.where(spp == spp, spp, float("-inf"))
         validp = spp >= survival_eps
         mpp = tl.where(validp, spp, float("-inf"))
         gt = mpp[None, :] > mp[:, None]
@@ -214,11 +261,15 @@ def schedule_verify_lens_topk_triton(
     confidence: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    exact_budget: bool = False,
 ) -> torch.Tensor:
     num_requests, gamma = confidence.shape
     max_len = cfg.resolved_max_verify_len()
     device = confidence.device
-    cols = min(max_len, gamma)
+    candidate_start, candidate_stop, base_verify_len = _schedule_candidate_bounds(
+        gamma=gamma, cfg=cfg, exact_budget=exact_budget
+    )
+    cols = candidate_stop - candidate_start
     n = num_requests * cols
 
     selected_extra = torch.empty(num_requests, dtype=torch.int32, device=device)
@@ -229,6 +280,7 @@ def schedule_verify_lens_topk_triton(
         selected_extra,
         gamma,
         cols,
+        candidate_start,
         G_P2=triton.next_power_of_2(max(gamma, 1)),
     )
     if budget > 0 and n > 0:
@@ -241,7 +293,7 @@ def schedule_verify_lens_topk_triton(
             int(budget),
             cols,
             n,
-            float(cfg.survival_eps),
+            float("-inf") if exact_budget else float(cfg.survival_eps),
             BLOCK_C=BLOCK_C,
             BLOCK_CP=BLOCK_CP,
         )
@@ -251,7 +303,7 @@ def schedule_verify_lens_topk_triton(
     _schedule_topk_finalize_kernel[(triton.cdiv(num_requests, BLOCK),)](
         selected_extra,
         verify_lens,
-        int(cfg.min_verify_len),
+        int(base_verify_len),
         max(cfg.min_verify_len, 1),
         int(max_len),
         num_requests,
