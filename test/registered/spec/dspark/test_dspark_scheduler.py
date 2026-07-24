@@ -455,9 +455,7 @@ class TestScheduleVerifyLensTopkExactBudget(CustomTestCase):
 
     def test_prefix_preservation_scope_excludes_non_default_min(self):
         """With min > 1, legacy and exact mode score different position windows."""
-        survival = torch.tensor(
-            [[0.99, 0.01], [0.50, 0.49]], dtype=torch.float32
-        )
+        survival = torch.tensor([[0.99, 0.01], [0.50, 0.49]], dtype=torch.float32)
         cfg = DSparkScheduleConfig(
             gamma=2, min_verify_len=2, max_verify_len=3, survival_eps=1e-6
         )
