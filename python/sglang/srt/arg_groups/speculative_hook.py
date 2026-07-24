@@ -428,6 +428,34 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
         )
+    if server_args.speculative_dspark_sps_target_accept_length < 0:
+        raise ValueError(
+            "--speculative-dspark-sps-target-accept-length must be >= 0, "
+            f"got {server_args.speculative_dspark_sps_target_accept_length}."
+        )
+    if server_args.speculative_dspark_sps_min_schedule_batch_size < 1:
+        raise ValueError(
+            "--speculative-dspark-sps-min-schedule-batch-size must be >= 1, "
+            f"got {server_args.speculative_dspark_sps_min_schedule_batch_size}."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length feeds the ragged-verify "
+            "budget scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; "
+            "it will be a no-op."
+        )
+    if (
+        server_args.speculative_dspark_sps_target_accept_length > 0
+        and not server_args.speculative_dspark_sps_dry_run
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-target-accept-length is experimental in "
+            "active scheduling mode. Validate accept length with "
+            "--speculative-dspark-sps-dry-run before serving."
+        )
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:

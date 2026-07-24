@@ -2027,6 +2027,26 @@ class ServerArgs:
         "gain by itself).",
         NS("spec"),
     ] = None
+    speculative_dspark_sps_target_accept_length: A[
+        float,
+        "DSPARK ragged-verify only. Optional SPS budget cap: when positive, "
+        "choose no more than the smallest verify-token budget whose confidence "
+        "estimate reaches this per-request expected accept length. Use "
+        "--speculative-dspark-sps-dry-run first to validate accept length.",
+        NS("spec"),
+    ] = 0.0
+    speculative_dspark_sps_min_schedule_batch_size: A[
+        int,
+        "DSPARK ragged-verify only. Minimum live batch size at which the "
+        "SPS/confidence scheduler may trim verify tokens.",
+        NS("spec"),
+    ] = 1
+    speculative_dspark_sps_dry_run: A[
+        bool,
+        "DSPARK ragged-verify only. Record SPS/confidence budget decisions while "
+        "executing the full verify width.",
+        NS("spec"),
+    ] = False
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
         "DSPARK only. Optional path to a per-position STS (sequential temperature "

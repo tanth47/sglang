@@ -57,6 +57,12 @@ def _survival_from_confidence(confidence: torch.Tensor) -> torch.Tensor:
     return torch.cumprod(confidence, dim=1)
 
 
+def _target_survival() -> torch.Tensor:
+    return torch.tensor(
+        [[0.9, 0.8, 0.7], [0.9, 0.8, 0.7]], dtype=torch.float32
+    )
+
+
 def _bruteforce_budget(
     *,
     history_survival_probs: torch.Tensor,
@@ -199,12 +205,72 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
         )
         self.assertGreater(decision.predicted_theta, 0.0)
 
+    def test_target_accept_length_caps_sps_argmax(self):
+        default = compute_verify_token_budget(
+            history_survival_probs=_target_survival(),
+            sps_table=_flat_table(),
+            cfg=DSparkScheduleConfig(gamma=3),
+        )
+        targeted = compute_verify_token_budget(
+            history_survival_probs=_target_survival(),
+            sps_table=_flat_table(),
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+        )
+
+        self.assertEqual(default.budget, 6)
+        self.assertAlmostEqual(default.predicted_theta, 6.8)
+        self.assertEqual(targeted.budget, 3)
+        self.assertAlmostEqual(targeted.predicted_theta, 4.6)
+
+    def test_target_accept_length_updates_additive_prediction(self):
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.1,
+            bs_probes=[1, 2],
+            alpha_seconds=[0.01, 0.02],
+            m_probes=[1, 8],
+            theta_seconds=[0.001, 0.008],
+        )
+        decision = compute_verify_token_budget(
+            history_survival_probs=_target_survival(),
+            sps_table=table,
+            cfg=DSparkScheduleConfig(gamma=3, sps_target_accept_length=2.0),
+        )
+
+        self.assertEqual(decision.budget, 3)
+        self.assertAlmostEqual(
+            decision.predicted_step_seconds,
+            table.step_time(num_reqs=2, budget=3),
+            places=6,
+        )
+
 
 def _make_budget_planner() -> HostConfidenceBudgetPlanner:
     return HostConfidenceBudgetPlanner(
         sps_table=_flat_table(),
         cfg=DSparkScheduleConfig(gamma=4),
         model_runner=None,
+    )
+
+
+def _make_target_budget_planner(**cfg_kwargs) -> HostConfidenceBudgetPlanner:
+    return HostConfidenceBudgetPlanner(
+        sps_table=_flat_table(max_batch_tokens=64),
+        cfg=DSparkScheduleConfig(
+            gamma=3,
+            sps_target_accept_length=2.0,
+            **cfg_kwargs,
+        ),
+        model_runner=None,
+        relay_lag_steps=1024,
+    )
+
+
+def _compute_target_budget(planner: HostConfidenceBudgetPlanner) -> int:
+    return planner.compute_budget(
+        confidence=_target_survival(),
+        generation=torch.ones(2, dtype=torch.int64),
+        current_generation=torch.ones(2, dtype=torch.int64),
+        req_pool_indices_cpu=torch.arange(2, dtype=torch.int64),
     )
 
 
@@ -223,6 +289,91 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestTargetAcceptPolicy(CustomTestCase):
+    def test_min_batch_size_keeps_full_budget_below_floor(self):
+        planner = _make_target_budget_planner(sps_min_schedule_batch_size=3)
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([3, 3], dtype=torch.int32)
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 6)
+
+    def test_min_batch_size_allows_trim_at_floor(self):
+        planner = _make_target_budget_planner(sps_min_schedule_batch_size=2)
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([3, 3], dtype=torch.int32)
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 3)
+
+    def test_cold_start_keeps_full_budget(self):
+        self.assertEqual(_compute_target_budget(_make_target_budget_planner()), 6)
+
+    def test_healthy_acceptance_allows_trim(self):
+        planner = _make_target_budget_planner()
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([3, 3], dtype=torch.int32)
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 3)
+
+    def test_cap_trim_feedback_arms_full_budget_guard(self):
+        planner = _make_target_budget_planner()
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([3, 3], dtype=torch.int32),
+            cap_trim_lens_cpu=torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 6)
+
+    def test_low_observed_acceptance_keeps_full_budget(self):
+        planner = _make_target_budget_planner()
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([1, 1], dtype=torch.int32)
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 6)
+
+    def test_dry_run_records_trim_but_uses_full_budget(self):
+        planner = _make_target_budget_planner(sps_dry_run=True)
+        planner.observe_accept_lens_cpu(
+            accept_lens_cpu=torch.tensor([3, 3], dtype=torch.int32)
+        )
+
+        self.assertEqual(_compute_target_budget(planner), 6)
+        decision = planner.take_last_decision()
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.budget, 3)
+        self.assertTrue(decision.dry_run)
+
+    def test_runtime_reset_drops_generation_and_feedback_state(self):
+        planner = _make_target_budget_planner()
+        planner._carry_confidence = torch.ones((1, 2, 3))
+        planner._carry_generation = torch.ones((1, 2), dtype=torch.int64)
+        planner._carry_pos = 7
+        planner._accept_len_ewma = 2.5
+        planner._accept_guard_cooldown = 4
+        planner.last_decision = VerifyBudgetDecision(budget=3)
+
+        planner.reset_runtime_state()
+
+        self.assertIsNone(planner._carry_confidence)
+        self.assertIsNone(planner._carry_generation)
+        self.assertEqual(planner._carry_pos, 0)
+        self.assertIsNone(planner._accept_len_ewma)
+        self.assertEqual(planner._accept_guard_cooldown, 0)
+        self.assertIsNone(planner.last_decision)
+
+    def test_accept_feedback_rejects_device_tensor(self):
+        planner = _make_target_budget_planner()
+        fake_device_tensor = types.SimpleNamespace(
+            device=types.SimpleNamespace(type="cuda"), numel=lambda: 1
+        )
+
+        with self.assertRaisesRegex(ValueError, "CPU-resident"):
+            planner.observe_accept_lens_cpu(accept_lens_cpu=fake_device_tensor)
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):
@@ -439,6 +590,20 @@ class TestDSparkScheduleConfig(CustomTestCase):
     def test_zero_max_resolves_to_gamma_plus_one(self):
         cfg = DSparkScheduleConfig(gamma=7)
         self.assertEqual(cfg.resolved_max_verify_len(), 8)
+
+    def test_target_accept_length_rejects_invalid_values(self):
+        for value in (-1.0, 10.0):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "sps_target_accept_length"):
+                    DSparkScheduleConfig(
+                        gamma=3, sps_target_accept_length=value
+                    ).validate()
+
+    def test_min_schedule_batch_size_rejects_non_positive_value(self):
+        with self.assertRaisesRegex(ValueError, "sps_min_schedule_batch_size"):
+            DSparkScheduleConfig(
+                gamma=3, sps_min_schedule_batch_size=0
+            ).validate()
 
 
 class TestGraphTierFillBudget(CustomTestCase):

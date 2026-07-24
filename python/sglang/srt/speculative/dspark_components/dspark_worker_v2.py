@@ -336,11 +336,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._verify_planner.reset_runtime_state()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
+
+    def _post_copy_accept_feedback(self, result: GenerationBatchResult) -> None:
+        accept_lens_cpu = result.accept_lens
+        block_accept_lens_cpu = result.block_accept_lens
+        if accept_lens_cpu is None or block_accept_lens_cpu is None:
+            raise RuntimeError(
+                "DSpark target-accept feedback requires copied accept and block "
+                "accept lengths."
+            )
+        self._verify_planner.observe_accept_lens_cpu(
+            accept_lens_cpu=accept_lens_cpu,
+            cap_trim_lens_cpu=block_accept_lens_cpu - accept_lens_cpu,
+        )
 
     def dump_info_records(self) -> Optional[dict]:
         return self._observers.dump_info_records()
@@ -671,6 +684,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            post_copy_cpu_callback=(
+                self._post_copy_accept_feedback
+                if self._verify_planner.needs_accept_feedback
+                else None
+            ),
         )
 
     def get_confidence_budget_prepare(self):

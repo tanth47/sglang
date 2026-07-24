@@ -130,12 +130,23 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma,
+            sps_target_accept_length=(
+                server_args.speculative_dspark_sps_target_accept_length
+            ),
+            sps_min_schedule_batch_size=(
+                server_args.speculative_dspark_sps_min_schedule_batch_size
+            ),
+            sps_dry_run=server_args.speculative_dspark_sps_dry_run,
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
-        self._uniform_layout_cache: dict = {}
+        self._uniform_layout_cache: dict[
+            tuple[int, int, Optional[int]], Optional[RaggedVerifyLayout]
+        ] = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -155,6 +166,10 @@ class DSparkVerifyPlanner:
             self._is_verify_all = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
+                and (
+                    self._schedule_cfg.sps_target_accept_length <= 0
+                    or self._schedule_cfg.sps_dry_run
+                )
             )
             relay_lag_steps = (
                 0
@@ -203,10 +218,19 @@ class DSparkVerifyPlanner:
                 if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
                     sps_table
                 ):
+                    verify_budget_note = (
+                        "the verify budget degenerates to verify-all "
+                        "(zero scheduling gain)"
+                        if self._is_verify_all
+                        else (
+                            "the SPS cost objective is flat, but the target accept-"
+                            "length policy can still trim the verify budget"
+                        )
+                    )
                     logger.warning(
-                        "DSpark SPS table is uninitialized (flat): the verify "
-                        "budget degenerates to verify-all (zero scheduling gain). "
-                        "Pass a profiled --speculative-dspark-sps-table-path."
+                        "DSpark SPS table is uninitialized (flat): %s. Pass a "
+                        "profiled --speculative-dspark-sps-table-path.",
+                        verify_budget_note,
                     )
 
     def _require_prep_in_cuda_graph(self) -> None:
@@ -251,10 +275,30 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.lag_steps
 
+    @property
+    def needs_accept_feedback(self) -> bool:
+        return (
+            self._budget_planner is not None
+            and self._schedule_cfg.sps_target_accept_length > 0
+        )
+
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def observe_accept_lens_cpu(
+        self,
+        *,
+        accept_lens_cpu: torch.Tensor,
+        cap_trim_lens_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self._budget_planner is None:
+            return
+        self._budget_planner.observe_accept_lens_cpu(
+            accept_lens_cpu=accept_lens_cpu,
+            cap_trim_lens_cpu=cap_trim_lens_cpu,
+        )
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -348,6 +392,10 @@ class DSparkVerifyPlanner:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
 
+    def reset_runtime_state(self) -> None:
+        if self._budget_planner is not None:
+            self._budget_planner.reset_runtime_state()
+
     def compute_budget_sync(
         self,
         *,
@@ -416,6 +464,17 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _can_cache_uniform_layout(self) -> bool:
+        return (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and (
+                self._schedule_cfg.sps_target_accept_length <= 0
+                or self._schedule_cfg.sps_dry_run
+            )
+            and getattr(self._budget_planner, "forced_budget_frac", None) is None
+        )
+
     def schedule_layout(
         self,
         *,
@@ -429,21 +488,30 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+        if self._can_cache_uniform_layout():
+            bs = int(req_pool_indices.shape[0])
+            tier_num_reqs = bs if global_num_reqs is None else int(global_num_reqs)
+            if dp_tier_num_tokens is not None:
+                assert global_num_reqs is not None, (
+                    "dp tier agreement requires the dp-global request count; "
+                    "keying the tier off the local bs diverges across ranks"
+                )
+                dp_tier_num_tokens = int(dp_tier_num_tokens)
+            key = (bs, tier_num_reqs, dp_tier_num_tokens)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
-                    bs=key[0],
+                    bs=bs,
                     device=device,
                     verify_num_draft_tokens=self.verify_num_draft_tokens,
                     ragged_verify_mode=self._ragged_verify_mode,
                     model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
+                    tier_num_reqs=tier_num_reqs,
+                    tier_num_tokens=dp_tier_num_tokens,
                 )
             return self._uniform_layout_cache[key]
+        broadcast_group, broadcast_group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -455,6 +523,8 @@ class DSparkVerifyPlanner:
                 global_num_reqs=global_num_reqs,
                 dp_tier_num_tokens=dp_tier_num_tokens,
             ),
+            broadcast_group=broadcast_group,
+            broadcast_group_size=broadcast_group_size,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -479,6 +549,8 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
+        elif broadcast_group_size > 1:
+            tier_num_tokens = tier_num_reqs * self.verify_num_draft_tokens
         elif self._dynamic_graph_tier and budget is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
@@ -582,16 +654,35 @@ class DSparkVerifyPlanner:
         device: torch.device,
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
+        broadcast_group=None,
+        broadcast_group_size: int = 1,
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        ready = (
+            self._budget_planner is not None
+            and confidence is not None
+            and budget is not None
+        )
+        is_source = (
+            broadcast_group_size == 1 or broadcast_group.rank_in_group == 0
+        )
+        if broadcast_group_size == 1 and not ready:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=confidence,
-            budget=budget,
-            cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
 
-        if resolve_level() >= InvariantCheckLevel.WARN:
+        if is_source and ready:
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                confidence=confidence,
+                budget=budget,
+                cfg=self._schedule_cfg,
+            ).to(device=device, dtype=torch.int32)
+        else:
+            verify_lens = torch.full(
+                (int(req_pool_indices.shape[0]),),
+                self.verify_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        if is_source and ready and resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
             expect(
@@ -600,7 +691,11 @@ class DSparkVerifyPlanner:
                 msg=f"budget={budget}",
             )
 
-        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+        if (
+            is_source
+            and ready
+            and envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        ):
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=prefix_lens,
@@ -609,10 +704,7 @@ class DSparkVerifyPlanner:
                 verify_lens=verify_lens,
             )
 
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
+        if broadcast_group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
@@ -739,12 +831,14 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    tier_num_tokens: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
     if ragged_layout_exceeds_captured_grid(
         num_reqs=tier_num_reqs,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_tokens_hint=tier_num_tokens,
     ):
         return None
     verify_lens_cpu = [verify_num_draft_tokens] * bs
@@ -758,6 +852,7 @@ def uniform_ragged_layout(
         ragged_verify_mode=ragged_verify_mode,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_num_tokens=tier_num_tokens,
     )
     return RaggedVerifyLayout.from_verify_lens(
         verify_lens_cpu=verify_lens_cpu,
@@ -928,6 +1023,9 @@ class DSparkScheduleConfig(msgspec.Struct):
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    sps_target_accept_length: float = 0.0
+    sps_min_schedule_batch_size: int = 1
+    sps_dry_run: bool = False
 
     def resolved_max_verify_len(self) -> int:
         return self.max_verify_len or (self.gamma + 1)
@@ -943,12 +1041,23 @@ class DSparkScheduleConfig(msgspec.Struct):
             )
         if self.survival_eps < 0:
             raise ValueError(f"survival_eps must be >= 0, got {self.survival_eps}.")
+        if not (0 <= self.sps_target_accept_length <= max_len):
+            raise ValueError(
+                "sps_target_accept_length must be in [0, max_verify_len], "
+                f"got target={self.sps_target_accept_length}, max={max_len}."
+            )
+        if self.sps_min_schedule_batch_size < 1:
+            raise ValueError(
+                "sps_min_schedule_batch_size must be >= 1, "
+                f"got {self.sps_min_schedule_batch_size}."
+            )
 
 
 class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    dry_run: bool = False
 
 
 def compute_verify_token_budget(
@@ -984,6 +1093,16 @@ def compute_verify_token_budget(
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
+    if cfg.sps_target_accept_length > 0:
+        target_total = float(cfg.sps_target_accept_length) * float(num_requests)
+        target_matches = torch.nonzero(tau_star >= target_total, as_tuple=False)
+        if target_matches.numel() > 0:
+            idx = min(idx, int(target_matches[0].item()))
+            if isinstance(sps_table, SpsAdditiveCostTable):
+                predicted_step_seconds = float(step_time[idx])
+            else:
+                sps_at_idx = float(sps[idx])
+                predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
         budget=idx,
         predicted_step_seconds=predicted_step_seconds,
@@ -1043,6 +1162,18 @@ class HostConfidenceBudgetPlanner:
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
         self._carry_pos = 0
+        self._accept_len_ewma: Optional[float] = None
+        self._accept_guard_cooldown = 0
+
+    def reset_runtime_state(self) -> None:
+        # req_generation restarts after a pool flush. Drop all generation-keyed
+        # carry slots and observations before request slots can be reused.
+        self.last_decision = None
+        self._carry_confidence = None
+        self._carry_generation = None
+        self._carry_pos = 0
+        self._accept_len_ewma = None
+        self._accept_guard_cooldown = 0
 
     def compute_budget(
         self,
@@ -1062,17 +1193,34 @@ class HostConfidenceBudgetPlanner:
             lagged_generation=lagged_generation,
             current_generation=current_generation,
         )
+        num_requests = int(survival.shape[0])
+        full_budget = int(
+            survival[:, : self.cfg.resolved_max_verify_len()].numel()
+        )
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
-            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
+        if num_requests < self.cfg.sps_min_schedule_batch_size:
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
+        if self._should_protect_target_accept_length():
+            self.last_decision = VerifyBudgetDecision(budget=full_budget)
+            return full_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
         )
+        if self.cfg.sps_dry_run:
+            self.last_decision = VerifyBudgetDecision(
+                budget=decision.budget,
+                predicted_step_seconds=decision.predicted_step_seconds,
+                predicted_theta=decision.predicted_theta,
+                dry_run=True,
+            )
+            return full_budget
         self.last_decision = decision
         return decision.budget
 
@@ -1083,6 +1231,48 @@ class HostConfidenceBudgetPlanner:
 
     def note_non_decode_step(self) -> None:
         self.last_decision = None
+
+    def observe_accept_lens_cpu(
+        self,
+        *,
+        accept_lens_cpu: torch.Tensor,
+        cap_trim_lens_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.cfg.sps_target_accept_length <= 0 or accept_lens_cpu.numel() == 0:
+            return
+        if accept_lens_cpu.device.type != "cpu":
+            raise ValueError(
+                "DSpark accept feedback must be CPU-resident after result D2H."
+            )
+        if cap_trim_lens_cpu is not None:
+            if cap_trim_lens_cpu.device.type != "cpu":
+                raise ValueError(
+                    "DSpark cap-trim feedback must be CPU-resident after result D2H."
+                )
+            if any(int(value) > 0 for value in cap_trim_lens_cpu.tolist()):
+                # Overlap launches one subsequent batch before result D2H is
+                # processed, in addition to the confidence relay lag.
+                self._accept_guard_cooldown = max(
+                    self._accept_guard_cooldown,
+                    self.lag_steps + 2,
+                )
+        accept_values = [float(value) for value in accept_lens_cpu.tolist()]
+        observed = sum(accept_values) / len(accept_values)
+        if self._accept_len_ewma is None:
+            self._accept_len_ewma = observed
+        else:
+            self._accept_len_ewma = 0.9 * self._accept_len_ewma + 0.1 * observed
+
+    def _should_protect_target_accept_length(self) -> bool:
+        target = float(self.cfg.sps_target_accept_length)
+        if target <= 0:
+            return False
+        if self._accept_guard_cooldown > 0:
+            self._accept_guard_cooldown -= 1
+            return True
+        if self._accept_len_ewma is None:
+            return True
+        return self._accept_len_ewma < target
 
     def _shift_to_lag(
         self,

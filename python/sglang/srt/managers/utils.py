@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 import torch
 
@@ -64,6 +64,9 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
+    # Optional policy feedback that consumes tensors after the existing result
+    # D2H/copy_done boundary. It must never trigger another device read.
+    post_copy_cpu_callback: Optional[Callable[[GenerationBatchResult], None]] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
@@ -166,6 +169,13 @@ class GenerationBatchResult:
                 holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
+
+    def run_post_copy_cpu_callback(self) -> None:
+        callback = self.post_copy_cpu_callback
+        if callback is None:
+            return
+        self.post_copy_cpu_callback = None
+        callback(self)
 
     @classmethod
     def from_pp_proxy(
