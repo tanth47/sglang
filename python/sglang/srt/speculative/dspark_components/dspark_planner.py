@@ -389,25 +389,46 @@ class DSparkVerifyPlanner:
             or getattr(self._budget_planner, "forced_budget_frac", None) is not None
         )
         if broadcast_group_size > 1 and needs_tp_coordination:
-            tier_tensor = torch.tensor(
-                [
-                    int(local_tier_num_tokens)
-                    if broadcast_group.rank_in_group == 0
-                    else -1
-                ],
-                dtype=torch.int64,
-            )
-            torch.distributed.broadcast(
-                tier_tensor,
-                src=broadcast_group.ranks[0],
-                group=broadcast_group.cpu_group,
-            )
-            local_tier_num_tokens = int(tier_tensor[0])
+            if not is_dp_attention_enabled():
+                local_tier_num_tokens = self._conservative_tp_verify_tier(
+                    batch=batch,
+                    local_tier_num_tokens=local_tier_num_tokens,
+                )
+            else:
+                tier_tensor = torch.tensor(
+                    [
+                        int(local_tier_num_tokens)
+                        if broadcast_group.rank_in_group == 0
+                        else -1
+                    ],
+                    dtype=torch.int64,
+                )
+                torch.distributed.broadcast(
+                    tier_tensor,
+                    src=broadcast_group.ranks[0],
+                    group=broadcast_group.cpu_group,
+                )
+                local_tier_num_tokens = int(tier_tensor[0])
         batch.spec_verify_tier_num_tokens = int(local_tier_num_tokens)
         self._maybe_gather_dp_verify_tier(
             batch=batch,
             local_tier_num_tokens=batch.spec_verify_tier_num_tokens,
         )
+
+    def _conservative_tp_verify_tier(
+        self, *, batch: ScheduleBatch, local_tier_num_tokens: int
+    ) -> int:
+        """Choose a TP-consistent graph tier without a host collective.
+
+        The exact non-uniform verify lengths are still broadcast on the device
+        during target verify.  Graph selection is host-side, so pure TP uses the
+        deterministic full-width tier and accepts padding instead of rendezvousing
+        scheduler ranks through Gloo on every decode step.
+        """
+        batch_size = int(batch.batch_size())
+        if local_tier_num_tokens == 0 or batch_size == 0:
+            return 0
+        return batch_size * int(self.verify_num_draft_tokens)
 
     def _maybe_gather_dp_verify_tier(
         self, *, batch: ScheduleBatch, local_tier_num_tokens: int
