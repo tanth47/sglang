@@ -384,7 +384,11 @@ class DSparkVerifyPlanner:
         broadcast_group, broadcast_group_size = verify_lens_broadcast_group(
             tp_size=self.server_args.tp_size
         )
-        if broadcast_group_size > 1:
+        needs_tp_coordination = (
+            not getattr(self, "_is_verify_all", False)
+            or getattr(self._budget_planner, "forced_budget_frac", None) is not None
+        )
+        if broadcast_group_size > 1 and needs_tp_coordination:
             tier_tensor = torch.tensor(
                 [
                     int(local_tier_num_tokens)

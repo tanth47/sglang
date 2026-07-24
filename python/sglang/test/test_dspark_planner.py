@@ -84,6 +84,7 @@ class _FakeBroadcastGroup:
 class TestDSparkPlanner(unittest.TestCase):
     def test_tp_verify_tier_uses_source_cpu_control(self):
         planner = _uniform_cache_planner()
+        planner._is_verify_all = False
         planner.server_args.tp_size = 2
         group = _FakeBroadcastGroup(rank_in_group=1)
         batch = types.SimpleNamespace(spec_verify_tier_num_tokens=-1)
@@ -114,6 +115,32 @@ class TestDSparkPlanner(unittest.TestCase):
         self.assertEqual(batch.spec_verify_tier_num_tokens, 3)
         tier_broadcast.assert_called_once()
         gather.assert_called_once_with(batch=batch, local_tier_num_tokens=3)
+
+    def test_verify_all_skips_tp_tier_collective(self):
+        planner = _uniform_cache_planner()
+        planner.server_args.tp_size = 2
+        group = _FakeBroadcastGroup(rank_in_group=1)
+        batch = types.SimpleNamespace(spec_verify_tier_num_tokens=-1)
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "torch.distributed.broadcast",
+                side_effect=AssertionError("verify-all must not coordinate TP tier"),
+            ),
+            mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
+        ):
+            planner._coordinate_verify_tier(
+                batch=batch, local_tier_num_tokens=8
+            )
+
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
 
     def test_verify_all_uniform_layout_cache_reuses_layout_and_none(self):
         for cached_layout in (object(), None):
