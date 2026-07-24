@@ -884,7 +884,11 @@ class DsparkStepObservers:
 
     @property
     def needs_budget_telemetry(self) -> bool:
-        return InfoComponent.CORE in self._info_components
+        return (
+            bool(self._info_components)
+            or envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get() > 0
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        )
 
     # --- step lifecycle -------------------------------------------------
 

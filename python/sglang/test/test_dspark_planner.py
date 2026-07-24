@@ -5,6 +5,11 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DsparkStepObservers,
+    InfoComponent,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     DSparkVerifyPlanner,
@@ -17,6 +22,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
+)
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
 )
 from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
     ScheduleVerifyLensTopk,
@@ -317,6 +325,55 @@ class TestDSparkPlanner(unittest.TestCase):
         planner._budget_planner.forced_budget_frac = None
         planner._is_verify_all = False
         self.assertTrue(planner.needs_confidence_publication)
+
+    def test_observability_modes_preserve_confidence_publication(self):
+        observers = object.__new__(DsparkStepObservers)
+        observers._info_components = set()
+        with (
+            mock.patch.object(
+                envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL,
+                "get",
+                return_value=0,
+            ),
+            mock.patch.object(
+                envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(observers.needs_budget_telemetry)
+            observers._info_components = {InfoComponent.REQS}
+            self.assertTrue(observers.needs_budget_telemetry)
+            observers._info_components = set()
+
+        with mock.patch.object(
+            envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL,
+            "get",
+            return_value=8,
+        ):
+            self.assertTrue(observers.needs_budget_telemetry)
+
+        with mock.patch.object(
+            envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER,
+            "get",
+            return_value=True,
+        ):
+            self.assertTrue(observers.needs_budget_telemetry)
+
+    def test_worker_confidence_publication_gate(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._verify_planner = types.SimpleNamespace(
+            needs_confidence_publication=False
+        )
+        worker._observers = types.SimpleNamespace(needs_budget_telemetry=False)
+        self.assertFalse(worker._should_publish_confidence(None))
+        self.assertFalse(worker._should_publish_confidence(torch.ones(1)))
+
+        worker._verify_planner.needs_confidence_publication = True
+        self.assertTrue(worker._should_publish_confidence(torch.ones(1)))
+        worker._verify_planner.needs_confidence_publication = False
+        worker._observers.needs_budget_telemetry = True
+        self.assertTrue(worker._should_publish_confidence(torch.ones(1)))
 
     def test_host_upper_bound_avoids_prefix_device_read(self):
         device_prefix = types.SimpleNamespace(
