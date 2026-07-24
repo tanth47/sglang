@@ -381,6 +381,19 @@ class TestDsaTargetVerifyGraphAdmission(unittest.TestCase):
 
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
+    def test_device_layout_uses_conservative_slots_without_host_read(self):
+        raw = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=16,
+        )
+        with mock.patch(
+            "sglang.srt.speculative.ragged_verify." "materialize_total_verify_tokens",
+            side_effect=AssertionError("unexpected verify-lens D2H"),
+        ):
+            required_slots = required_padded_verify_slots(raw, num_tokens_per_req=8)
+
+        self.assertEqual(required_slots, 4)
+
     def test_required_slots_preserve_live_lens_and_bound_dummy_lens(self):
         raw = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[8, 1, 3],
@@ -395,6 +408,66 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
         self.assertEqual(padded.verify_lens[:3].tolist(), [8, 1, 3])
         self.assertLessEqual(max(padded.verify_lens.tolist()), 8)
         self.assertEqual(int(padded.qo_indptr_device[-1]), 32)
+
+    def test_unified_replay_view_keeps_dynamic_layout_device_only(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            build_replay_fb_view,
+        )
+
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=8,
+        )
+        forward_batch = SimpleNamespace(
+            extend_num_tokens=None,
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+            extend_start_loc=None,
+            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            out_cache_loc=None,
+            out_cache_loc_dsv4=None,
+        )
+        buffers = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64, device=_DEVICE),
+            positions=torch.zeros(8, dtype=torch.int64, device=_DEVICE),
+            req_pool_indices=torch.zeros(8, dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.ones(8, dtype=torch.int64, device=_DEVICE),
+            seq_lens_cpu=torch.ones(8, dtype=torch.int64),
+            encoder_lens=None,
+            mamba_track_indices=None,
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+                "materialize_total_verify_tokens",
+                side_effect=AssertionError("unexpected total-token D2H"),
+            ),
+            mock.patch(
+                "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+                "materialize_verify_lens_cpu",
+                side_effect=AssertionError("unexpected verify-lens D2H"),
+            ),
+        ):
+            replay_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=buffers,
+                bs=8,
+                raw_bs=2,
+                num_tokens=8,
+                num_tokens_per_req=8,
+                seq_len_fill_value=1,
+                capture_forward_mode=ForwardMode.TARGET_VERIFY,
+                is_encoder_decoder=False,
+                preserve_static_full_verify_layout=True,
+            )
+
+        self.assertEqual(replay_view.extend_num_tokens, 8)
+        self.assertIsNone(replay_view.extend_seq_lens_cpu)
+        self.assertIs(replay_view.extend_seq_lens, layout.verify_lens)
 
     def test_padded_layout_decoupled_slots_spread_slack(self):
         raw = RaggedVerifyLayout.from_verify_lens(

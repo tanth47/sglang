@@ -185,9 +185,16 @@ def build_replay_fb_view(
         preserve_static_full_layout=preserve_static_full_verify_layout,
     )
     if capture_forward_mode.is_target_verify() and ragged_layout is not None:
-        extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
         extend_seq_lens = ragged_layout.verify_lens
-        extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
+        if preserve_static_full_verify_layout:
+            # Unified DSA consumes live verify partitions from device metadata
+            # and captures against the host-known graph tier. Do not recreate a
+            # CPU mirror of dynamic verify_lens in the replay hot path.
+            extend_num_tokens = ragged_layout.graph_num_tokens
+            extend_seq_lens_cpu = None
+        else:
+            extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
+            extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
         extend_start_loc = ragged_layout.extend_start_loc
     elif capture_forward_mode.is_target_verify() and extend_seq_lens_cpu is None:
         extend_num_tokens = num_tokens

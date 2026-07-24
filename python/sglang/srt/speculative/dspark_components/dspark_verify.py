@@ -89,7 +89,6 @@ class TargetVerifyExecutor:
         self.model_runner = model_runner
         self.kv_injector = kv_injector
         self.verify_epilogue = verify_epilogue
-        self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
 
@@ -240,14 +239,6 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
-            base_seq_lens_cpu = (
-                seq_lens_cpu_backup
-                if seq_lens_cpu_backup is not None
-                else batch.seq_lens.cpu()
-            )
-            batch.seq_lens_cpu = base_seq_lens_cpu
-            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         result = self._forward_prepared_verify(
             batch=batch,
@@ -358,14 +349,6 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
-            base_seq_lens_cpu = (
-                seq_lens_cpu_backup
-                if seq_lens_cpu_backup is not None
-                else batch.seq_lens.cpu()
-            )
-            batch.seq_lens_cpu = base_seq_lens_cpu
-            batch.seq_lens_sum = int(base_seq_lens_cpu.sum())
 
         return self._forward_prepared_verify(
             batch=batch,
@@ -456,14 +439,6 @@ class TargetVerifyExecutor:
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
         return target_verify, hidden_strided
-
-    def _verify_backend_self_adds_seq_lens(self) -> bool:
-        if self._verify_backend_self_adds_seq_lens_cache is None:
-            backend = self.target_worker.model_runner.attn_backend
-            self._verify_backend_self_adds_seq_lens_cache = hasattr(
-                backend, "make_forward_metadata_from_raw_verify"
-            )
-        return self._verify_backend_self_adds_seq_lens_cache
 
 
 class CommitInjectCtx(msgspec.Struct):

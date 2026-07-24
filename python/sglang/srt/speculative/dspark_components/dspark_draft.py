@@ -393,8 +393,11 @@ class DraftBlockProposer:
                 else int(batch.seq_lens_cpu.sum().item())
             )
         else:
-            draft_seq_lens_cpu = prefix_lens.detach().to("cpu")
-            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum().item())
+            # All participating backends opted out of host lengths. Keep the
+            # exact committed prefix device-resident; graph replay consumes it
+            # directly, while an eager fallback may explicitly materialize it.
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,

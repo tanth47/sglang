@@ -384,7 +384,17 @@ def required_padded_verify_slots(
     """Slots needed to pad a graph tier without enlarging a live request."""
     if num_tokens_per_req < 1:
         raise ValueError("num_tokens_per_req must be positive")
-    slack_tokens = layout.graph_num_tokens - materialize_total_verify_tokens(layout)
+    # Device-planned layouts intentionally omit a host mirror. Every live row
+    # verifies at least its anchor, so the batch size is a safe host-known
+    # lower bound for the logical token count. Using that bound may reserve
+    # extra dummy rows, but it never requires a per-step D2H read and guarantees
+    # each dummy row stays within the captured draft width.
+    known_tokens = (
+        layout.bs
+        if layout.total_verify_tokens is None
+        else int(layout.total_verify_tokens)
+    )
+    slack_tokens = layout.graph_num_tokens - known_tokens
     if slack_tokens <= 0:
         return layout.bs
     padding_slots = (slack_tokens + num_tokens_per_req - 1) // num_tokens_per_req

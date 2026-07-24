@@ -136,6 +136,9 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._uniform_layout_cache: dict[
+            tuple[int, int, Optional[int], bool], Optional[RaggedVerifyLayout]
+        ] = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -155,6 +158,10 @@ class DSparkVerifyPlanner:
             self._is_verify_all = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_uninitialized_sps_table(sps_table)
+                and (
+                    self._schedule_cfg.sps_target_accept_length <= 0
+                    or self._schedule_cfg.sps_dry_run
+                )
             )
             relay_lag_steps = (
                 0
@@ -203,14 +210,20 @@ class DSparkVerifyPlanner:
                 if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
                     sps_table
                 ):
-                    verify_budget_note = (
-                        "the verify budget degenerates to verify-all "
-                        "(zero scheduling gain)"
-                    )
-                    if self._align_verify_tokens_to_graph_tier:
-                        verify_budget_note += (
-                            ", except for conservative graph-safety caps near "
-                            "backend-specific attention boundaries"
+                    if self._is_verify_all:
+                        verify_budget_note = (
+                            "the verify budget degenerates to verify-all "
+                            "(zero scheduling gain)"
+                        )
+                        if self._align_verify_tokens_to_graph_tier:
+                            verify_budget_note += (
+                                ", except for conservative graph-safety caps near "
+                                "backend-specific attention boundaries"
+                            )
+                    else:
+                        verify_budget_note = (
+                            "the SPS cost objective is flat, but the target accept-"
+                            "length policy can still trim the verify budget"
                         )
                     logger.warning(
                         "DSpark SPS table is uninitialized (flat): %s. Pass a "
@@ -274,18 +287,29 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.lag_steps
 
+    @property
+    def needs_accept_feedback(self) -> bool:
+        return (
+            self._budget_planner is not None
+            and self._schedule_cfg.sps_target_accept_length > 0
+        )
+
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
 
-    def observe_accept_lens(
-        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    def observe_accept_lens_cpu(
+        self,
+        *,
+        accept_lens_cpu: torch.Tensor,
+        cap_trim_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         if self._budget_planner is None:
             return
-        self._budget_planner.observe_accept_lens(
-            accept_lens=accept_lens, cap_trim_lens=cap_trim_lens
+        self._budget_planner.observe_accept_lens_cpu(
+            accept_lens_cpu=accept_lens_cpu,
+            cap_trim_lens_cpu=cap_trim_lens_cpu,
         )
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
@@ -305,9 +329,9 @@ class DSparkVerifyPlanner:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
-            assert confidence_tap is not None, (
-                "dsv4 compute_confidence needs the compute_base_logits tap"
-            )
+            assert (
+                confidence_tap is not None
+            ), "dsv4 compute_confidence needs the compute_base_logits tap"
             with torch.inference_mode():
                 return compute_confidence_hook(
                     anchor_tokens=anchor_tokens,
@@ -379,6 +403,10 @@ class DSparkVerifyPlanner:
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
+
+    def reset_runtime_state(self) -> None:
+        if self._budget_planner is not None:
+            self._budget_planner.reset_runtime_state()
 
     def compute_budget_sync(
         self,
@@ -461,6 +489,20 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def _can_cache_uniform_layout(self, *, dp_tier_num_tokens: Optional[int]) -> bool:
+        return (
+            getattr(self, "_is_verify_all", False)
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and (
+                self._schedule_cfg.sps_target_accept_length <= 0
+                or self._schedule_cfg.sps_dry_run
+            )
+            and getattr(self._budget_planner, "forced_budget_frac", None) is None
+            and not self._uses_rocm_dsa_graph_safe_policy(
+                dp_tier_num_tokens=dp_tier_num_tokens
+            )
+        )
+
     def schedule_layout(
         self,
         *,
@@ -472,10 +514,43 @@ class DSparkVerifyPlanner:
         global_num_reqs: Optional[int] = None,
         dp_tier_num_tokens: Optional[int] = None,
         collect_sps_verify_lens: bool = False,
+        host_seq_lens_upper_bound: Optional[torch.Tensor] = None,
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._can_cache_uniform_layout(dp_tier_num_tokens=dp_tier_num_tokens):
+            # Verify-all is constant per physical graph tier. Keep the telemetry
+            # variant separate because it carries logical SPS lengths.
+            bs = int(req_pool_indices.shape[0])
+            tier_num_reqs = bs if global_num_reqs is None else int(global_num_reqs)
+            if dp_tier_num_tokens is not None:
+                assert global_num_reqs is not None, (
+                    "dp tier agreement requires the dp-global request count; "
+                    "keying the tier off the local bs diverges across ranks"
+                )
+                dp_tier_num_tokens = int(dp_tier_num_tokens)
+            key = (
+                bs,
+                tier_num_reqs,
+                dp_tier_num_tokens,
+                collect_sps_verify_lens,
+            )
+            if key not in self._uniform_layout_cache:
+                self._uniform_layout_cache[key] = uniform_ragged_layout(
+                    bs=bs,
+                    device=device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                    tier_num_reqs=tier_num_reqs,
+                    tier_num_tokens=dp_tier_num_tokens,
+                    carry_sps_verify_lens=collect_sps_verify_lens,
+                )
+            return self._uniform_layout_cache[key]
         sps_budget = budget
+        broadcast_group, broadcast_group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
         budget_for_layout, exact_budget = self._budget_aligned_to_graph_tier(
             req_pool_indices=req_pool_indices,
             budget=budget,
@@ -490,9 +565,13 @@ class DSparkVerifyPlanner:
             budget=budget_for_layout,
             exact_budget=exact_budget,
             sps_budget=sps_budget if collect_sps_verify_lens else None,
+            collect_sps_verify_lens=collect_sps_verify_lens,
+            broadcast_group=broadcast_group,
+            broadcast_group_size=broadcast_group_size,
         )
         verify_lens, budget_for_layout = self._adjust_rocm_dsa_graph_safe_sps_layout(
             prefix_lens=prefix_lens,
+            host_seq_lens_upper_bound=host_seq_lens_upper_bound,
             verify_lens=verify_lens,
             budget=budget_for_layout,
             global_num_reqs=global_num_reqs,
@@ -507,6 +586,7 @@ class DSparkVerifyPlanner:
                 graph_safe_layout = self._rocm_dsa_graph_safe_uniform_layout(
                     prefix_lens=prefix_lens,
                     device=device,
+                    host_seq_lens_upper_bound=host_seq_lens_upper_bound,
                     global_num_reqs=global_num_reqs,
                     dp_tier_num_tokens=dp_tier_num_tokens,
                 )
@@ -529,6 +609,8 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
+        elif broadcast_group_size > 1:
+            tier_num_tokens = tier_num_reqs * self.verify_num_draft_tokens
         elif self._dynamic_graph_tier and budget_for_layout is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
@@ -588,6 +670,15 @@ class DSparkVerifyPlanner:
         return bool(
             getattr(attn_backend, "use_dsa", False)
             and getattr(attn_backend, "dsa_index_topk", None) is not None
+            # The validated regime-neutral ROCm contract can replay the exact
+            # device lengths across pre/post-topk transitions. Applying a cap
+            # from a conservative host reservation would only trim real verify
+            # tokens early and reduce AL.
+            and not getattr(
+                attn_backend,
+                "supports_dsa_target_verify_post_topk_graph",
+                False,
+            )
             and ragged_capture_num_tokens(model_runner=self.model_runner) is not None
         )
 
@@ -596,8 +687,9 @@ class DSparkVerifyPlanner:
         *,
         prefix_lens: torch.Tensor,
         device: torch.device,
-        global_num_reqs: Optional[int],
-        dp_tier_num_tokens: Optional[int],
+        host_seq_lens_upper_bound: Optional[torch.Tensor] = None,
+        global_num_reqs: Optional[int] = None,
+        dp_tier_num_tokens: Optional[int] = None,
     ) -> Optional[RaggedVerifyLayout]:
         if not self._uses_rocm_dsa_graph_safe_policy(
             dp_tier_num_tokens=dp_tier_num_tokens
@@ -613,7 +705,12 @@ class DSparkVerifyPlanner:
             # whole-batch eager fallback until a single-forward graph contract exists.
             # TODO(GLM/ROCm DSA): add that contract or scheduler-side bucketing.
             return None
-        seq_lens_cpu = [int(x) for x in prefix_lens.detach().cpu().tolist()]
+        seq_lens_cpu = resolve_host_seq_lens_upper_bound(
+            prefix_lens=prefix_lens,
+            host_seq_lens_upper_bound=host_seq_lens_upper_bound,
+        )
+        if seq_lens_cpu is None:
+            return None
         attn_backend = getattr(self.model_runner, "attn_backend", None)
         dsa_index_topk = int(getattr(attn_backend, "dsa_index_topk"))
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
@@ -640,17 +737,14 @@ class DSparkVerifyPlanner:
         self,
         *,
         prefix_lens: torch.Tensor,
+        host_seq_lens_upper_bound: Optional[torch.Tensor],
         verify_lens: Optional[torch.Tensor],
         budget: Optional[int],
         global_num_reqs: Optional[int],
         dp_tier_num_tokens: Optional[int],
     ) -> tuple[Optional[torch.Tensor], Optional[int]]:
-        if (
-            verify_lens is None
-            or budget is None
-            or not self._uses_rocm_dsa_graph_safe_policy(
-                dp_tier_num_tokens=dp_tier_num_tokens
-            )
+        if verify_lens is None or not self._uses_rocm_dsa_graph_safe_policy(
+            dp_tier_num_tokens=dp_tier_num_tokens
         ):
             return verify_lens, budget
         tier_num_reqs = (
@@ -660,7 +754,12 @@ class DSparkVerifyPlanner:
         )
         if tier_num_reqs != 1:
             return verify_lens, budget
-        seq_lens_cpu = [int(x) for x in prefix_lens.detach().cpu().tolist()]
+        seq_lens_cpu = resolve_host_seq_lens_upper_bound(
+            prefix_lens=prefix_lens,
+            host_seq_lens_upper_bound=host_seq_lens_upper_bound,
+        )
+        if seq_lens_cpu is None:
+            return verify_lens, budget
         attn_backend = getattr(self.model_runner, "attn_backend", None)
         dsa_index_topk = int(getattr(attn_backend, "dsa_index_topk"))
         caps = rocm_dsa_graph_safe_sps_verify_len_caps(
@@ -675,14 +774,14 @@ class DSparkVerifyPlanner:
         )
         if caps is None:
             return verify_lens, budget
+        if all(cap >= self.verify_num_draft_tokens for cap in caps):
+            return verify_lens, budget
 
         cap_tensor = torch.tensor(caps, dtype=torch.int32, device=verify_lens.device)
         adjusted = torch.minimum(verify_lens, cap_tensor)
-        if torch.equal(adjusted, verify_lens):
-            return verify_lens, budget
-
         floor = max(self._schedule_cfg.min_verify_len, 1)
-        adjusted_budget = max(0, int(adjusted.to(torch.int64).sum().item()) - floor)
+        cap_budget = max(0, sum(caps) - floor)
+        adjusted_budget = cap_budget if budget is None else min(int(budget), cap_budget)
         return adjusted, adjusted_budget
 
     def _budget_aligned_to_graph_tier(
@@ -746,33 +845,58 @@ class DSparkVerifyPlanner:
         budget: Optional[int],
         exact_budget: bool = False,
         sps_budget: Optional[int] = None,
+        collect_sps_verify_lens: bool = False,
+        broadcast_group=None,
+        broadcast_group_size: int = 1,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self._budget_planner is None or confidence is None or budget is None:
-            return None, None
-        schedule_kwargs = dict(
-            confidence=confidence,
-            cfg=self._schedule_cfg,
+        ready = (
+            self._budget_planner is not None
+            and confidence is not None
+            and budget is not None
+            and (not collect_sps_verify_lens or sps_budget is not None)
         )
-        if sps_budget is None:
-            verify_lens = ScheduleVerifyLensTopk.execute(
-                budget=budget,
-                exact_budget=exact_budget,
-                **schedule_kwargs,
-            ).to(device=device, dtype=torch.int32)
-            sps_verify_lens = None
-        else:
-            verify_lens, sps_verify_lens = (
-                ScheduleVerifyLensTopk.execute_with_sps_budget(
-                    execution_budget=budget,
-                    sps_budget=sps_budget,
-                    exact_execution=exact_budget,
-                    **schedule_kwargs,
-                )
-            )
-            verify_lens = verify_lens.to(device=device, dtype=torch.int32)
-            sps_verify_lens = sps_verify_lens.to(device=device, dtype=torch.int32)
+        is_source = broadcast_group_size == 1 or broadcast_group.rank_in_group == 0
+        if broadcast_group_size == 1 and not ready:
+            return None, None
 
-        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        if is_source and ready:
+            schedule_kwargs = dict(
+                confidence=confidence,
+                cfg=self._schedule_cfg,
+            )
+            if collect_sps_verify_lens:
+                verify_lens, sps_verify_lens = (
+                    ScheduleVerifyLensTopk.execute_with_sps_budget(
+                        execution_budget=budget,
+                        sps_budget=sps_budget,
+                        exact_execution=exact_budget,
+                        **schedule_kwargs,
+                    )
+                )
+                verify_lens = verify_lens.to(device=device, dtype=torch.int32)
+                sps_verify_lens = sps_verify_lens.to(device=device, dtype=torch.int32)
+            else:
+                verify_lens = ScheduleVerifyLensTopk.execute(
+                    budget=budget,
+                    exact_budget=exact_budget,
+                    **schedule_kwargs,
+                ).to(device=device, dtype=torch.int32)
+                sps_verify_lens = None
+        else:
+            bs = int(req_pool_indices.shape[0])
+            verify_lens = torch.full(
+                (bs,),
+                self.verify_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+            sps_verify_lens = (
+                torch.full_like(verify_lens, self.verify_num_draft_tokens)
+                if collect_sps_verify_lens
+                else None
+            )
+
+        if is_source and ready and envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
             maybe_assert_async(
@@ -780,7 +904,11 @@ class DSparkVerifyPlanner:
                 f"DSpark verify-len budget violated (budget={budget})",
             )
 
-        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+        if (
+            is_source
+            and ready
+            and envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        ):
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=prefix_lens,
@@ -789,12 +917,9 @@ class DSparkVerifyPlanner:
                 verify_lens=verify_lens,
             )
 
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
+        if broadcast_group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)
-            if sps_verify_lens is not None:
+            if collect_sps_verify_lens:
                 broadcast_group.broadcast(sps_verify_lens, src=0)
 
         return verify_lens, sps_verify_lens
@@ -860,6 +985,30 @@ def graph_tier_fill_budget(
     fill_total = min(graph_num_tokens, bs * verify_num_draft_tokens)
     floor_tokens = bs * max(min_verify_len, 1)
     return max(0, fill_total - floor_tokens)
+
+
+def resolve_host_seq_lens_upper_bound(
+    *,
+    prefix_lens: torch.Tensor,
+    host_seq_lens_upper_bound: Optional[torch.Tensor],
+) -> Optional[list[int]]:
+    bs = int(prefix_lens.shape[0])
+    host_lens = host_seq_lens_upper_bound
+    if host_lens is None:
+        if prefix_lens.device.type != "cpu":
+            return None
+        host_lens = prefix_lens
+    if host_lens.device.type != "cpu":
+        raise ValueError(
+            "host_seq_lens_upper_bound must be a CPU tensor, got "
+            f"{host_lens.device}."
+        )
+    if host_lens.numel() < bs:
+        raise ValueError(
+            "host_seq_lens_upper_bound is shorter than the local batch: "
+            f"numel={host_lens.numel()}, bs={bs}."
+        )
+    return [int(x) for x in host_lens[:bs].tolist()]
 
 
 def rocm_dsa_target_verify_layout_graph_safe(
@@ -1000,12 +1149,15 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    tier_num_tokens: Optional[int] = None,
+    carry_sps_verify_lens: bool = False,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
     if ragged_layout_exceeds_captured_grid(
         num_reqs=tier_num_reqs,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_tokens_hint=tier_num_tokens,
     ):
         return None
     verify_lens_cpu = [verify_num_draft_tokens] * bs
@@ -1019,9 +1171,21 @@ def uniform_ragged_layout(
         ragged_verify_mode=ragged_verify_mode,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_num_tokens=tier_num_tokens,
+    )
+    sps_verify_lens = (
+        torch.full(
+            (bs,),
+            verify_num_draft_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        if carry_sps_verify_lens
+        else None
     )
     return RaggedVerifyLayout.from_verify_lens(
         verify_lens_cpu=verify_lens_cpu,
+        sps_verify_lens=sps_verify_lens,
         device=device,
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
@@ -1211,10 +1375,10 @@ class DSparkScheduleConfig(msgspec.Struct):
             )
         if self.survival_eps < 0:
             raise ValueError(f"survival_eps must be >= 0, got {self.survival_eps}.")
-        if self.sps_target_accept_length < 0:
+        if not (0 <= self.sps_target_accept_length <= max_len):
             raise ValueError(
-                "sps_target_accept_length must be >= 0, "
-                f"got {self.sps_target_accept_length}."
+                "sps_target_accept_length must be in [0, max_verify_len], "
+                f"got target={self.sps_target_accept_length}, max={max_len}."
             )
         if self.sps_min_schedule_batch_size < 1:
             raise ValueError(
@@ -1334,6 +1498,17 @@ class HostConfidenceBudgetPlanner:
         self._accept_len_ewma: Optional[float] = None
         self._accept_guard_cooldown = 0
 
+    def reset_runtime_state(self) -> None:
+        # req_generation restarts after a pool flush. Drop every generation-
+        # keyed carry slot and policy observation so a reused request slot
+        # cannot consume confidence or acceptance feedback from before flush.
+        self.last_decision = None
+        self._carry_confidence = None
+        self._carry_generation = None
+        self._carry_pos = 0
+        self._accept_len_ewma = None
+        self._accept_guard_cooldown = 0
+
     def compute_budget(
         self,
         *,
@@ -1392,18 +1567,33 @@ class HostConfidenceBudgetPlanner:
     def note_non_decode_step(self) -> None:
         self.last_decision = None
 
-    def observe_accept_lens(
-        self, *, accept_lens: torch.Tensor, cap_trim_lens: Optional[torch.Tensor] = None
+    def observe_accept_lens_cpu(
+        self,
+        *,
+        accept_lens_cpu: torch.Tensor,
+        cap_trim_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
-        if self.cfg.sps_target_accept_length <= 0 or accept_lens.numel() == 0:
+        if self.cfg.sps_target_accept_length <= 0 or accept_lens_cpu.numel() == 0:
             return
-        if cap_trim_lens is not None and cap_trim_lens.numel() > 0:
-            cap_trimmed = bool(torch.any(cap_trim_lens.to(torch.int32) > 0).item())
-            if cap_trimmed:
-                self._accept_guard_cooldown = max(
-                    self._accept_guard_cooldown, self.lag_steps + 1
+        if accept_lens_cpu.device.type != "cpu":
+            raise ValueError(
+                "DSpark accept feedback must be CPU-resident after result D2H."
+            )
+        if cap_trim_lens_cpu is not None:
+            if cap_trim_lens_cpu.device.type != "cpu":
+                raise ValueError(
+                    "DSpark cap-trim feedback must be CPU-resident after result D2H."
                 )
-        observed = float(accept_lens.to(torch.float32).mean().item())
+            if any(int(value) > 0 for value in cap_trim_lens_cpu.tolist()):
+                # Overlap launches one subsequent batch before result D2H is
+                # processed. Account for that extra in-flight decision in
+                # addition to the confidence relay lag.
+                self._accept_guard_cooldown = max(
+                    self._accept_guard_cooldown,
+                    self.lag_steps + 2,
+                )
+        accept_values = [float(value) for value in accept_lens_cpu.tolist()]
+        observed = sum(accept_values) / len(accept_values)
         if self._accept_len_ewma is None:
             self._accept_len_ewma = observed
         else:

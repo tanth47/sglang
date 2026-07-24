@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -43,6 +43,8 @@ def _get_overlap_plan_stream(
 @dataclass
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
+
+    supports_host_filter_indices = True
 
     # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
     topk_p: torch.Tensor
@@ -254,9 +256,19 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
+            if new_indices_cpu is not None:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
+            else:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
+                    new_indices.cpu()
+                ]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:
