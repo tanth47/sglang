@@ -17,9 +17,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 class _FakeBroadcastGroup:
@@ -27,6 +28,8 @@ class _FakeBroadcastGroup:
         self.rank_in_group = rank_in_group
         self.payload = payload
         self.calls = 0
+        self.ranks = [0, 1]
+        self.cpu_group = object()
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         self.calls += 1
@@ -36,6 +39,102 @@ class _FakeBroadcastGroup:
 
 
 class TestDSparkPlannerZeroOverhead(unittest.TestCase):
+    def test_tp_verify_tier_uses_source_cpu_control(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner.server_args = SimpleNamespace(tp_size=2)
+        group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32))
+        batch = SimpleNamespace(spec_verify_tier_num_tokens=-1)
+
+        def broadcast(tensor, *, src, group):
+            self.assertEqual(src, 0)
+            self.assertIs(group, group_ref.cpu_group)
+            tensor.fill_(3)
+
+        group_ref = group
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "torch.distributed.broadcast",
+                side_effect=broadcast,
+            ) as tier_broadcast,
+            mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
+        ):
+            planner._coordinate_verify_tier(
+                batch=batch, local_tier_num_tokens=-1
+            )
+
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 3)
+        tier_broadcast.assert_called_once()
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=3)
+
+    def test_verify_all_skips_tp_tier_collective(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner.server_args = SimpleNamespace(tp_size=2)
+        planner._is_verify_all = True
+        planner._budget_planner = SimpleNamespace(forced_budget_frac=None)
+        group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32))
+        batch = SimpleNamespace(spec_verify_tier_num_tokens=-1)
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "torch.distributed.broadcast",
+                side_effect=AssertionError("verify-all must not coordinate TP tier"),
+            ),
+            mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
+        ):
+            planner._coordinate_verify_tier(
+                batch=batch, local_tier_num_tokens=8
+            )
+
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
+
+    def test_verify_all_forced_budget_keeps_tp_tier_collective(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner.server_args = SimpleNamespace(tp_size=2)
+        planner._is_verify_all = True
+        planner._budget_planner = SimpleNamespace(forced_budget_frac=0.5)
+        group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32))
+        batch = SimpleNamespace(spec_verify_tier_num_tokens=-1)
+
+        def broadcast(tensor, *, src, group):
+            self.assertEqual(src, 0)
+            self.assertIs(group, group_ref.cpu_group)
+            tensor.fill_(4)
+
+        group_ref = group
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "torch.distributed.broadcast",
+                side_effect=broadcast,
+            ) as tier_broadcast,
+            mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
+        ):
+            planner._coordinate_verify_tier(
+                batch=batch, local_tier_num_tokens=-1
+            )
+
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 4)
+        tier_broadcast.assert_called_once()
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=4)
+
     def test_tp_non_source_broadcasts_without_local_confidence(self):
         planner = object.__new__(DSparkVerifyPlanner)
         planner._budget_planner = object()
@@ -140,13 +239,45 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
                 device=torch.device("cpu"),
                 confidence=None,
                 budget=None,
+                tp_tier_num_tokens=3,
             )
 
         self.assertIs(result, layout)
         self.assertTrue(
             torch.equal(assemble.call_args.kwargs["verify_lens"], source_lens)
         )
-        self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 8)
+        self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 4)
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch.object(
+                ScheduleVerifyLensTopk,
+                "execute",
+                side_effect=AssertionError("non-source rank must not schedule"),
+            ),
+            mock.patch.object(
+                RaggedVerifyLayout,
+                "from_verify_lens_device",
+                return_value=layout,
+            ) as unavailable_assemble,
+        ):
+            result = planner.schedule_layout(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                prefix_lens=torch.tensor([10, 20], dtype=torch.int64),
+                device=torch.device("cpu"),
+                confidence=None,
+                budget=0,
+                tp_tier_num_tokens=-1,
+            )
+
+        self.assertIs(result, layout)
+        self.assertEqual(
+            unavailable_assemble.call_args.kwargs["graph_num_tokens"], 8
+        )
 
     def test_uniform_cache_is_keyed_by_physical_dp_tier(self):
         planner = object.__new__(DSparkVerifyPlanner)
@@ -309,6 +440,23 @@ class TestDSparkDeviceOnlyLengths(unittest.TestCase):
         self.assertIsNone(seen["seq_lens_sum"])
         self.assertIsNone(batch.seq_lens_cpu)
         self.assertIsNone(batch.seq_lens_sum)
+
+
+class TestHostSyncSupportContracts(unittest.TestCase):
+    def test_post_copy_callback_is_exactly_once(self):
+        from sglang.srt.managers.utils import GenerationBatchResult
+
+        calls = []
+        result = GenerationBatchResult(
+            logits_output=SimpleNamespace(),
+            next_token_ids=torch.tensor([1]),
+            post_copy_cpu_callback=lambda value: calls.append(value),
+        )
+
+        result.run_post_copy_cpu_callback()
+        result.run_post_copy_cpu_callback()
+
+        self.assertEqual(calls, [result])
 
 
 if __name__ == "__main__":

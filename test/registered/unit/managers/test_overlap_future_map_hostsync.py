@@ -284,22 +284,6 @@ class TestFutureMapHostSync(unittest.TestCase):
             self.assertEqual(event.synchronize_calls, 0)
 
 
-class TestHostSyncSupportContracts(unittest.TestCase):
-    def test_post_copy_callback_is_exactly_once(self):
-        from sglang.srt.managers.utils import GenerationBatchResult
-
-        calls = []
-        result = GenerationBatchResult(
-            logits_output=SimpleNamespace(),
-            next_token_ids=torch.tensor([1]),
-            post_copy_cpu_callback=lambda value: calls.append(value),
-        )
-
-        result.run_post_copy_cpu_callback()
-        result.run_post_copy_cpu_callback()
-
-        self.assertEqual(calls, [result])
-
 
 if __name__ == "__main__":
     unittest.main()

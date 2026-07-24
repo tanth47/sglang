@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -12,11 +13,15 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
+    DsparkStepObservers,
     InfoComponent,
     _PendingStep,
     logger,
     resolve_components,
     resolve_enabled_components,
+)
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    VerifyBudgetDecision,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -58,12 +63,15 @@ def make_obs(
     num_verify_tokens=24,
     predicted_step_ms=None,
     predicted_theta=None,
+    budget=100,
+    planned_budget=None,
+    dry_run=False,
 ):
     return DecodeStepObservation(
         forward_ct=forward_ct,
         bs=bs,
         mode="static",
-        budget=100,
+        budget=budget,
         lag_steps=0,
         num_verify_tokens=num_verify_tokens,
         verify_tokens_local=num_verify_tokens,
@@ -81,6 +89,8 @@ def make_obs(
         cap_trim_lens=torch.zeros((bs,), dtype=torch.int32),
         commit_lens=torch.full((bs,), 4, dtype=torch.int32),
         rids=[f"r{i}" for i in range(bs)],
+        planned_budget=planned_budget,
+        dry_run=dry_run,
     )
 
 
@@ -253,7 +263,37 @@ class TestPredictedStepFields(CustomTestCase):
         self.assertNotIn("predicted_theta", record)
 
 
-def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
+class TestDryRunBudgetFields(CustomTestCase):
+    def test_record_defaults_preserve_legacy_serialization(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(make_obs(forward_ct=1, budget=24))
+
+        record = dumper.dump()["records"][0]
+
+        self.assertNotIn("planned_budget", record)
+        self.assertNotIn("dry_run", record)
+
+    def test_dry_run_record_keeps_applied_and_planned_budgets(self):
+        dumper, _ = make_dumper({"core"})
+        dumper.observe_decode_step(
+            make_obs(forward_ct=1, budget=24, planned_budget=8, dry_run=True)
+        )
+
+        record = dumper.dump()["records"][0]
+
+        self.assertEqual(record["budget"], 24)
+        self.assertEqual(record["planned_budget"], 8)
+        self.assertTrue(record["dry_run"])
+
+
+def _pending(
+    *,
+    bs,
+    budget,
+    num_verify_tokens,
+    predicted_step_ms,
+    dry_run=False,
+):
     return _PendingStep(
         forward_ct=1,
         bs=bs,
@@ -270,6 +310,7 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         rids=None,
         future=None,
         segment_events={},
+        dry_run=dry_run,
     )
 
 
@@ -329,6 +370,106 @@ class TestOnlineSpsReporter(CustomTestCase):
         )
         self.assertEqual(dumper._sps_window, [])
         self.assertEqual(dumper._sps_mismatched, 0)
+
+    def test_reporter_excludes_dry_run_samples(self):
+        dumper, _ = make_dumper(set(), sps_report_interval=2)
+        matched = dict(bs=4, budget=20, num_verify_tokens=24)
+        dumper._report_sps_prediction(
+            pending=_pending(
+                **matched, predicted_step_ms=100.0, dry_run=True
+            ),
+            step_gpu_ms=200.0,
+        )
+
+        self.assertEqual(dumper._sps_window, [])
+        self.assertEqual(dumper._sps_mismatched, 0)
+
+        with self.assertLogs(logger, level="INFO") as cm:
+            dumper._report_sps_prediction(
+                pending=_pending(**matched, predicted_step_ms=10.0), step_gpu_ms=12.0
+            )
+            dumper._report_sps_prediction(
+                pending=_pending(**matched, predicted_step_ms=8.0), step_gpu_ms=9.0
+            )
+        message = next(message for message in cm.output if "SPS prediction" in message)
+        self.assertIn("n=2", message)
+        self.assertIn("mean predicted=9.000ms", message)
+        self.assertIn("mean actual=10.500ms", message)
+        self.assertIn("M_mismatch_rate=0.0% (0/2)", message)
+
+
+class TestStepObserversDryRunBudget(CustomTestCase):
+    @staticmethod
+    def _observe_budget(decision, *, applied_budget):
+        observations = []
+        info_dumper = SimpleNamespace(enabled=True)
+        info_dumper.observe_decode_step = observations.append
+        planner = SimpleNamespace(
+            mode_value="compact",
+            lag_steps=2,
+            take_budget_decision=lambda: decision,
+        )
+        observers = object.__new__(DsparkStepObservers)
+        observers._planner = planner
+        observers._info_dumper = info_dumper
+        observers._block_accept_recorder = None
+
+        bs = 2
+        verify_ids_2d = torch.zeros((bs, 6), dtype=torch.int64)
+        observers.observe_verify_step(
+            forward_ct=7,
+            reqs=[SimpleNamespace(rid=f"r{i}") for i in range(bs)],
+            bs=bs,
+            proposal_folded=True,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=None,
+            layout=None,
+            confidence=None,
+            prefix_lens=torch.full((bs,), 128, dtype=torch.int64),
+            draft_tokens=torch.zeros((bs, 5), dtype=torch.int64),
+            draft_block=None,
+            sampling_info=None,
+            correct_len=torch.full((bs,), 3, dtype=torch.int32),
+            cap_trim_lens=torch.zeros((bs,), dtype=torch.int32),
+            bonus=torch.zeros((bs,), dtype=torch.int64),
+            commit_lens=torch.full((bs,), 4, dtype=torch.int32),
+            verify_token_budget=applied_budget,
+            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            verify_tier_num_tokens=int(verify_ids_2d.numel()),
+            dp_tier_num_tokens=None,
+        )
+        return observations[0]
+
+    def test_dry_run_maps_planned_budget_without_overwriting_applied_budget(self):
+        obs = self._observe_budget(
+            VerifyBudgetDecision(
+                budget=5,
+                predicted_step_seconds=0.012,
+                predicted_theta=0.75,
+                dry_run=True,
+            ),
+            applied_budget=12,
+        )
+
+        self.assertEqual(obs.budget, 12)
+        self.assertEqual(obs.planned_budget, 5)
+        self.assertTrue(obs.dry_run)
+        self.assertEqual(obs.predicted_step_ms, 12.0)
+        self.assertEqual(obs.predicted_theta, 0.75)
+
+    def test_applied_decision_does_not_duplicate_planned_budget(self):
+        obs = self._observe_budget(
+            VerifyBudgetDecision(
+                budget=5,
+                predicted_step_seconds=0.008,
+                predicted_theta=0.5,
+            ),
+            applied_budget=5,
+        )
+
+        self.assertEqual(obs.budget, 5)
+        self.assertIsNone(obs.planned_budget)
+        self.assertFalse(obs.dry_run)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA for d2h staging")

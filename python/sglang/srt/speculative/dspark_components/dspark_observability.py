@@ -109,6 +109,8 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
+    planned_budget: Optional[int] = None
+    dry_run: bool = False
 
 
 class DecodeStepObservation(msgspec.Struct):
@@ -133,6 +135,8 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    planned_budget: Optional[int] = None
+    dry_run: bool = False
 
 
 class _PendingStep(msgspec.Struct):
@@ -151,6 +155,8 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    planned_budget: Optional[int] = None
+    dry_run: bool = False
 
 
 class DsparkInfoDumper:
@@ -255,6 +261,10 @@ class DsparkInfoDumper:
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
+            planned_budget=(
+                None if obs.planned_budget is None else int(obs.planned_budget)
+            ),
+            dry_run=bool(obs.dry_run),
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -350,6 +360,8 @@ class DsparkInfoDumper:
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
+            record.planned_budget = pending.planned_budget
+            record.dry_run = pending.dry_run
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -374,6 +386,8 @@ class DsparkInfoDumper:
     def _report_sps_prediction(
         self, *, pending: _PendingStep, step_gpu_ms: Optional[float]
     ) -> None:
+        if pending.dry_run:
+            return
         predicted = pending.predicted_step_ms
         if predicted is None or step_gpu_ms is None:
             return
@@ -886,6 +900,7 @@ class DsparkStepObservers:
             )
         if self._info_dumper.enabled:
             budget_decision = planner.take_budget_decision()
+            dry_run = bool(budget_decision is not None and budget_decision.dry_run)
             predicted_step_ms = (
                 None
                 if budget_decision is None
@@ -925,6 +940,8 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    planned_budget=(budget_decision.budget if dry_run else None),
+                    dry_run=dry_run,
                 )
             )
 
