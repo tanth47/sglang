@@ -694,7 +694,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if on_publish is not None:
-            if confidence is not None:
+            publish_confidence = (
+                confidence is not None
+                and (
+                    self._verify_planner.needs_confidence_publication
+                    or self._observers.needs_budget_telemetry
+                )
+            )
+            if publish_confidence:
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)

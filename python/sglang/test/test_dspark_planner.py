@@ -294,6 +294,30 @@ class TestDSparkPlanner(unittest.TestCase):
         ):
             self.assertFalse(planner._can_cache_uniform_layout(dp_tier_num_tokens=None))
 
+    def test_verify_all_skips_confidence_publication_until_policy_needs_it(self):
+        planner = _uniform_cache_planner()
+        self.assertFalse(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(
+            gamma=3,
+            sps_target_accept_length=2.0,
+        )
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(
+            gamma=3,
+            sps_dry_run=True,
+        )
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3)
+        planner._budget_planner.forced_budget_frac = 0.5
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._budget_planner.forced_budget_frac = None
+        planner._is_verify_all = False
+        self.assertTrue(planner.needs_confidence_publication)
+
     def test_host_upper_bound_avoids_prefix_device_read(self):
         device_prefix = types.SimpleNamespace(
             shape=(1,),

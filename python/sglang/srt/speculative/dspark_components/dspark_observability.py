@@ -882,6 +882,10 @@ class DsparkStepObservers:
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
 
+    @property
+    def needs_budget_telemetry(self) -> bool:
+        return InfoComponent.CORE in self._info_components
+
     # --- step lifecycle -------------------------------------------------
 
     def begin_step(self) -> None:
