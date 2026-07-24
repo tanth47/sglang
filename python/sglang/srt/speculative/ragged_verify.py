@@ -218,8 +218,27 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     kv_lens_host: Optional[torch.Tensor] = None
     max_q_len: Optional[int] = None
     max_kv_len: Optional[int] = None
+    # Logical pre-alignment SPS decision; physical layout code must not read it.
+    sps_verify_lens: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
+        if self.sps_verify_lens is not None:
+            if self.sps_verify_lens.shape != self.verify_lens.shape:
+                raise ValueError(
+                    "sps_verify_lens must match the physical verify_lens shape, got "
+                    f"{tuple(self.sps_verify_lens.shape)} and "
+                    f"{tuple(self.verify_lens.shape)}"
+                )
+            if self.sps_verify_lens.dtype is not torch.int32:
+                raise ValueError(
+                    "sps_verify_lens must use torch.int32, got "
+                    f"{self.sps_verify_lens.dtype}"
+                )
+            if self.sps_verify_lens.device != self.verify_lens.device:
+                raise ValueError(
+                    "sps_verify_lens and verify_lens must share a device, got "
+                    f"{self.sps_verify_lens.device} and {self.verify_lens.device}"
+                )
         if self.verify_lens_cpu is None:
             return
         if not self.verify_lens_cpu:
@@ -252,6 +271,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         graph_num_tokens: int,
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
+        sps_verify_lens: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         from sglang.srt.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -266,6 +286,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             qo_indptr_device=indptr.qo_indptr,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            sps_verify_lens=sps_verify_lens,
         )
 
     @classmethod
@@ -276,6 +297,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         total_verify_tokens: int,
         graph_num_tokens: int,
         device: torch.device,
+        sps_verify_lens: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         verify_lens = torch.tensor(verify_lens_cpu, dtype=torch.int32, device=device)
         return cls._assemble_device(
@@ -283,6 +305,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=graph_num_tokens,
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
+            sps_verify_lens=sps_verify_lens,
         )
 
     @classmethod
@@ -291,9 +314,12 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         *,
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
+        sps_verify_lens: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
-            verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+            sps_verify_lens=sps_verify_lens,
         )
 
     @classmethod
@@ -304,6 +330,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         device: torch.device,
         grid: Sequence[int],
         graph_num_tokens_floor: int = 0,
+        sps_verify_lens: Optional[torch.Tensor] = None,
     ) -> RaggedVerifyLayout:
         verify_lens_list = [int(v) for v in verify_lens_cpu]
         total_verify_tokens = sum(verify_lens_list)
@@ -315,6 +342,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             total_verify_tokens=total_verify_tokens,
             graph_num_tokens=graph_num_tokens,
             device=device,
+            sps_verify_lens=sps_verify_lens,
         )
 
     def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:

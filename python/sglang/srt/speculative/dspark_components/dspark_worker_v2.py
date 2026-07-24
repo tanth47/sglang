@@ -97,7 +97,6 @@ def _folded_commit_reject_reason(
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -606,6 +605,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=dp_tier_num_tokens,
+            collect_sps_verify_lens=self._observers.requests_enabled,
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
