@@ -610,7 +610,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        tp_tier_num_tokens = int(batch.spec_verify_tier_num_tokens)
+        tp_tier_num_tokens = (
+            int(batch.spec_verify_tier_num_tokens)
+            if not self.server_args.disable_overlap_schedule
+            else None
+        )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
