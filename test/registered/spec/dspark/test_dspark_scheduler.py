@@ -295,8 +295,309 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
         self.assertEqual(total_extra, 3)
 
 
-class TestVerifyLenAnchorContract(CustomTestCase):
+class TestScheduleVerifyLensTopkExactBudget(CustomTestCase):
+    def _assert_production_graph_tier_preserves_legacy_prefixes(
+        self,
+        *,
+        survival: torch.Tensor,
+        legacy_budget: int,
+        graph_num_tokens: int,
+        cfg: DSparkScheduleConfig,
+        case: str,
+    ) -> None:
+        num_requests, gamma = survival.shape
+        capacity = num_requests * gamma
+        self.assertEqual(cfg.min_verify_len, 1)
+        self.assertEqual(cfg.resolved_max_verify_len(), gamma + 1)
+        self.assertGreaterEqual(legacy_budget, 0)
+        self.assertLessEqual(legacy_budget, capacity)
+        self.assertGreaterEqual(graph_num_tokens, num_requests + legacy_budget)
 
+        aligned_budget = graph_tier_fill_budget(
+            graph_num_tokens=graph_num_tokens,
+            bs=num_requests,
+            verify_num_draft_tokens=gamma + 1,
+            min_verify_len=cfg.min_verify_len,
+        )
+        self.assertGreaterEqual(aligned_budget, legacy_budget)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=legacy_budget, cfg=cfg
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival,
+            budget=aligned_budget,
+            cfg=cfg,
+            exact_budget=True,
+        )
+
+        self.assertTrue(
+            bool(torch.all(exact >= legacy).item()),
+            msg=(
+                f"legacy request-local prefix was lost ({case}): "
+                f"legacy_budget={legacy_budget} aligned_budget={aligned_budget} "
+                f"survival={survival.tolist()} legacy={legacy.tolist()} "
+                f"exact={exact.tolist()}"
+            ),
+        )
+        exact_extra = int((exact.to(torch.int64) - 1).sum().item())
+        self.assertEqual(exact_extra, aligned_budget, msg=case)
+        self.assertEqual(
+            int(exact.to(torch.int64).sum().item()),
+            min(graph_num_tokens, num_requests * (gamma + 1)),
+            msg=case,
+        )
+
+    def test_production_graph_tier_property_on_deterministic_random_cases(self):
+        generator = torch.Generator().manual_seed(20260724)
+        for trial in range(256):
+            num_requests = int(torch.randint(1, 7, (), generator=generator).item())
+            gamma = int(torch.randint(1, 9, (), generator=generator).item())
+            dtype = torch.float32 if trial % 2 == 0 else torch.float64
+            confidence = torch.rand(
+                num_requests, gamma, dtype=dtype, generator=generator
+            )
+            survival = torch.cumprod(confidence, dim=1)
+            if trial % 3 == 0:
+                survival = (survival * 8).round() / 8
+            if trial % 11 == 0:
+                row = trial % num_requests
+                cut = trial % gamma
+                survival[row, cut:] = float("nan")
+
+            survival_eps = (1e-6, 0.05, 0.25, 0.5)[trial % 4]
+            cfg = DSparkScheduleConfig(
+                gamma=gamma,
+                min_verify_len=1,
+                max_verify_len=gamma + 1,
+                survival_eps=survival_eps,
+            )
+            capacity = num_requests * gamma
+            legacy_budget = int(
+                torch.randint(0, capacity + 1, (), generator=generator).item()
+            )
+            padding = int(
+                torch.randint(
+                    0, capacity - legacy_budget + 1, (), generator=generator
+                ).item()
+            )
+            graph_num_tokens = num_requests + legacy_budget + padding
+
+            self._assert_production_graph_tier_preserves_legacy_prefixes(
+                survival=survival,
+                legacy_budget=legacy_budget,
+                graph_num_tokens=graph_num_tokens,
+                cfg=cfg,
+                case=f"trial={trial}",
+            )
+
+    def test_production_graph_tier_property_covers_ranking_and_budget_edges(self):
+        eps = 0.25
+        below_eps = torch.nextafter(
+            torch.tensor(eps, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+        ).item()
+        survival = torch.tensor(
+            [
+                [0.9, 0.5, eps, below_eps, float("nan")],
+                [0.9, 0.5, eps, below_eps, 0.0],
+                [0.9, 0.5, eps, eps, eps],
+            ],
+            dtype=torch.float32,
+        )
+        num_requests, gamma = survival.shape
+        cfg = DSparkScheduleConfig(
+            gamma=gamma,
+            min_verify_len=1,
+            max_verify_len=gamma + 1,
+            survival_eps=eps,
+        )
+        capacity = num_requests * gamma
+        cases = (
+            (0, num_requests),
+            (4, num_requests + 4),
+            (8, num_requests + 8),
+            (11, num_requests + 13),
+            (capacity, num_requests + capacity),
+        )
+        for legacy_budget, graph_num_tokens in cases:
+            with self.subTest(
+                legacy_budget=legacy_budget, graph_num_tokens=graph_num_tokens
+            ):
+                self._assert_production_graph_tier_preserves_legacy_prefixes(
+                    survival=survival,
+                    legacy_budget=legacy_budget,
+                    graph_num_tokens=graph_num_tokens,
+                    cfg=cfg,
+                    case=f"edge budget={legacy_budget}",
+                )
+
+    def test_production_graph_tier_property_for_single_request_single_gamma(self):
+        eps = 0.25
+        below_eps = torch.nextafter(
+            torch.tensor(eps, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+        ).item()
+        cfg = DSparkScheduleConfig(
+            gamma=1, min_verify_len=1, max_verify_len=2, survival_eps=eps
+        )
+        for value in (eps, below_eps, float("nan")):
+            survival = torch.tensor([[value]], dtype=torch.float32)
+            for budget in (0, 1):
+                with self.subTest(value=value, budget=budget):
+                    self._assert_production_graph_tier_preserves_legacy_prefixes(
+                        survival=survival,
+                        legacy_budget=budget,
+                        graph_num_tokens=1 + budget,
+                        cfg=cfg,
+                        case=f"R=1 G=1 value={value} budget={budget}",
+                    )
+
+    def test_prefix_preservation_scope_excludes_non_default_min(self):
+        """With min > 1, legacy and exact mode score different position windows."""
+        survival = torch.tensor([[0.99, 0.01], [0.50, 0.49]], dtype=torch.float32)
+        cfg = DSparkScheduleConfig(
+            gamma=2, min_verify_len=2, max_verify_len=3, survival_eps=1e-6
+        )
+        aligned_budget = graph_tier_fill_budget(
+            graph_num_tokens=5,
+            bs=2,
+            verify_num_draft_tokens=3,
+            min_verify_len=cfg.min_verify_len,
+        )
+        self.assertEqual(aligned_budget, 1)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=1, cfg=cfg
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival,
+            budget=aligned_budget,
+            cfg=cfg,
+            exact_budget=True,
+        )
+
+        self.assertTrue(torch.equal(legacy, torch.tensor([3, 2], dtype=torch.int32)))
+        self.assertTrue(torch.equal(exact, torch.tensor([2, 3], dtype=torch.int32)))
+        self.assertFalse(bool(torch.all(exact >= legacy).item()))
+
+    def test_all_zero_confidence_consumes_exact_budget_deterministically(self):
+        survival = torch.zeros(3, 4, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=4, survival_eps=1e-6)
+
+        first = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+        second = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        expected = torch.tensor([3, 3, 2], dtype=torch.int32)
+        self.assertTrue(torch.equal(first, expected))
+        self.assertTrue(torch.equal(second, expected))
+        extras = first.to(torch.int64) - 1
+        self.assertEqual(int(extras.sum().item()), 5)
+        self.assertLessEqual(int(extras.max().item() - extras.min().item()), 1)
+
+    def test_partial_valid_candidates_backfill_filtered_prefixes(self):
+        survival = torch.tensor(
+            [[0.90, 0.80, 0.0, 0.0], [0.95, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(gamma=4, survival_eps=0.5)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(legacy, torch.tensor([3, 2], dtype=torch.int32)))
+        self.assertTrue(torch.equal(exact, torch.tensor([4, 3], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 + 5)
+
+    def test_non_default_min_max_define_exact_capacity(self):
+        survival = torch.tensor(
+            [[0.99, 0.01, 0.01, 0.01, 0.01, 0.01], [0.50] * 6],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(
+            gamma=6, min_verify_len=2, max_verify_len=5, survival_eps=0.1
+        )
+
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+        capped = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=100, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(exact, torch.tensor([4, 5], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 * 2 + 5)
+        self.assertGreaterEqual(int(exact.min().item()), cfg.min_verify_len)
+        self.assertLessEqual(int(exact.max().item()), cfg.max_verify_len)
+        self.assertTrue(torch.equal(capped, torch.tensor([5, 5], dtype=torch.int32)))
+
+    def test_zero_min_uses_anchor_floor_without_losing_budget(self):
+        survival = torch.zeros(2, 3, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(
+            gamma=3, min_verify_len=0, max_verify_len=3, survival_eps=1e-6
+        )
+        exact = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=3, cfg=cfg, exact_budget=True
+        )
+
+        self.assertTrue(torch.equal(exact, torch.tensor([3, 2], dtype=torch.int32)))
+        self.assertEqual(int(exact.to(torch.int64).sum().item()), 2 + 3)
+
+    def test_flag_off_matches_legacy_oracle_byte_for_byte(self):
+        survival = torch.tensor(
+            [[0.90, 0.40, 0.30, 0.20], [0.80, 0.70, 0.10, 0.0]],
+            dtype=torch.float32,
+        )
+        cfg = DSparkScheduleConfig(
+            gamma=4, min_verify_len=2, max_verify_len=4, survival_eps=0.5
+        )
+        expected = schedule_verify_lens_topk_vanilla(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        implicit_off = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg
+        )
+        explicit_off = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=False
+        )
+
+        self.assertEqual(implicit_off.numpy().tobytes(), expected.numpy().tobytes())
+        self.assertEqual(explicit_off.numpy().tobytes(), expected.numpy().tobytes())
+
+    def test_nan_is_filtered_in_legacy_and_selectable_last_in_exact_mode(self):
+        nan = float("nan")
+        survival = torch.tensor(
+            [[0.90, nan, nan], [0.80, 0.70, 0.60]], dtype=torch.float32
+        )
+        cfg = DSparkScheduleConfig(gamma=3, survival_eps=1e-6)
+
+        legacy = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=6, cfg=cfg
+        )
+        exact_finite_only = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=4, cfg=cfg, exact_budget=True
+        )
+        exact_with_nan = schedule_verify_lens_topk_from_survival(
+            survival_probs=survival, budget=5, cfg=cfg, exact_budget=True
+        )
+
+        finite_only = torch.tensor([2, 4], dtype=torch.int32)
+        self.assertTrue(torch.equal(legacy, finite_only))
+        self.assertTrue(torch.equal(exact_finite_only, finite_only))
+        self.assertTrue(
+            torch.equal(exact_with_nan, torch.tensor([3, 4], dtype=torch.int32))
+        )
+
+
+class TestVerifyLenAnchorContract(CustomTestCase):
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):
         survival = _survival_from_confidence(
@@ -709,6 +1010,124 @@ def _fake_model_runner(
             dsa_index_topk=dsa_index_topk,
         ),
     )
+
+
+class TestScheduleLayoutGraphTierAlignment(CustomTestCase):
+    @staticmethod
+    def _planner(*, align, mode, capture_num_tokens):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = align
+        planner._ragged_verify_mode = mode
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=7)
+        planner._budget_planner = object()
+        planner._dynamic_graph_tier = True
+        planner.verify_num_draft_tokens = 8
+        planner.model_runner = _fake_model_runner(capture_num_tokens, max_bs=8)
+        planner.server_args = types.SimpleNamespace(tp_size=1)
+        return planner
+
+    def test_exact_activation_requires_resolved_compact_capture_tier(self):
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+
+        active = self._planner(
+            align=True,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+        budget, exact_budget = active._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=7,
+            global_num_reqs=None,
+            dp_tier_num_tokens=None,
+        )
+        self.assertEqual(budget, 14)
+        self.assertTrue(exact_budget)
+
+        for mode, capture_num_tokens in (
+            (RaggedVerifyMode.CAP_ACCEPT, [8, 16]),
+            (RaggedVerifyMode.COMPACT, None),
+        ):
+            with self.subTest(mode=mode, capture_num_tokens=capture_num_tokens):
+                inactive = self._planner(
+                    align=True,
+                    mode=mode,
+                    capture_num_tokens=capture_num_tokens,
+                )
+                budget, exact_budget = inactive._budget_aligned_to_graph_tier(
+                    req_pool_indices=req_pool_indices,
+                    budget=7,
+                    global_num_reqs=None,
+                    dp_tier_num_tokens=None,
+                )
+                self.assertEqual(budget, 7)
+                self.assertFalse(exact_budget)
+
+    def test_schedule_layout_fills_resolved_graph_tier_with_low_confidence(self):
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        prefix_lens = torch.tensor([100, 200], dtype=torch.int64)
+        confidence = torch.tensor(
+            [
+                [0.90, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.80, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        aligned = self._planner(
+            align=True,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+        inactive = self._planner(
+            align=False,
+            mode=RaggedVerifyMode.COMPACT,
+            capture_num_tokens=[8, 16],
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(None, 1),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner.is_hip",
+                return_value=False,
+            ),
+        ):
+            aligned_layout = aligned.schedule_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=torch.device("cpu"),
+                confidence=confidence,
+                budget=7,
+            )
+            inactive_layout = inactive.schedule_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=torch.device("cpu"),
+                confidence=confidence,
+                budget=7,
+            )
+
+        self.assertIsNotNone(aligned_layout)
+        self.assertEqual(int(aligned_layout.verify_lens.sum().item()), 16)
+        self.assertEqual(aligned_layout.graph_num_tokens, 16)
+        self.assertTrue(
+            torch.equal(
+                aligned_layout.verify_lens,
+                torch.tensor([8, 8], dtype=torch.int32),
+            )
+        )
+
+        self.assertIsNotNone(inactive_layout)
+        self.assertEqual(int(inactive_layout.verify_lens.sum().item()), 4)
+        self.assertEqual(inactive_layout.graph_num_tokens, 16)
+        self.assertTrue(
+            torch.equal(
+                inactive_layout.verify_lens,
+                torch.tensor([2, 2], dtype=torch.int32),
+            )
+        )
 
 
 class TestBudgetTierSelection(CustomTestCase):

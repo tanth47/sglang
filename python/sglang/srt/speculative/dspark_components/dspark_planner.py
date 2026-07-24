@@ -474,7 +474,7 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        budget_for_layout = self._budget_aligned_to_graph_tier(
+        budget_for_layout, exact_budget = self._budget_aligned_to_graph_tier(
             req_pool_indices=req_pool_indices,
             budget=budget,
             global_num_reqs=global_num_reqs,
@@ -486,6 +486,7 @@ class DSparkVerifyPlanner:
             device=device,
             confidence=confidence,
             budget=budget_for_layout,
+            exact_budget=exact_budget,
         )
         verify_lens, budget_for_layout = self._adjust_rocm_dsa_graph_safe_sps_layout(
             prefix_lens=prefix_lens,
@@ -685,18 +686,11 @@ class DSparkVerifyPlanner:
         budget: Optional[int],
         global_num_reqs: Optional[int],
         dp_tier_num_tokens: Optional[int],
-    ) -> Optional[int]:
-        # Flag off (default): returns budget unchanged, so the schedule below is
-        # byte-for-byte the original. On: ceils role 1's verify-token total up to the
-        # padded graph tier graph_num_tokens = round_up(dp-max tier, captured token
-        # bucket), which folds in the cuda-graph bucket round-up (H1) and the dp
-        # cross-rank max (H2); role 2 (the single top-k) then admits that many real
-        # draft tokens. graph_num_tokens is derived from the same (request count,
-        # gathered dp tier, original budget) inputs the layout below uses, so the two
-        # agree by construction -- this only feeds the larger budget into the top-k,
-        # it does not touch the layout's own tier computation.
+    ) -> tuple[Optional[int], bool]:
+        # The activation bit is true only when compact alignment resolves a real
+        # captured tier. Callers otherwise retain the legacy filtered schedule.
         if not self._align_verify_tokens_to_graph_tier or budget is None:
-            return budget
+            return budget, False
         tier_num_reqs = (
             int(req_pool_indices.shape[0])
             if global_num_reqs is None
@@ -721,15 +715,20 @@ class DSparkVerifyPlanner:
             tier_num_tokens=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor <= 0 or capture_num_tokens is None:
-            return budget
+        if (
+            graph_num_tokens_floor <= 0
+            or not capture_num_tokens
+            or graph_num_tokens_floor > capture_num_tokens[-1]
+        ):
+            return budget, False
         graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-        return graph_tier_fill_budget(
+        aligned_budget = graph_tier_fill_budget(
             graph_num_tokens=graph_num_tokens,
             bs=int(req_pool_indices.shape[0]),
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             min_verify_len=self._schedule_cfg.min_verify_len,
         )
+        return aligned_budget, True
 
     def _schedule_verify_lens(
         self,
@@ -739,14 +738,20 @@ class DSparkVerifyPlanner:
         device: torch.device,
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
+        exact_budget: bool = False,
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
+        schedule_kwargs = dict(
             confidence=confidence,
             budget=budget,
             cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
+        )
+        if exact_budget:
+            schedule_kwargs["exact_budget"] = True
+        verify_lens = ScheduleVerifyLensTopk.execute(**schedule_kwargs).to(
+            device=device, dtype=torch.int32
+        )
 
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -1284,7 +1289,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,
