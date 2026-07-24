@@ -92,6 +92,7 @@ class _FakeTargetWorker:
         return SimpleNamespace(
             logits_output=SimpleNamespace(next_token_logits=torch.empty(0)),
             can_run_cuda_graph=False,
+            model_forward_calls=1,
         )
 
 
@@ -248,7 +249,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
         self.assertEqual(seen["seq_lens_sum"], 30)
 
-    def test_dspark_draft_proposer_derives_cpu_lens_from_gpu_only_batch(self):
+    def test_dspark_draft_proposer_keeps_gpu_lens_device_only(self):
         seen = {}
         gamma = 4
         bs = 2
@@ -259,7 +260,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
 
             def forward(self, forward_batch):
                 seen["seq_lens"] = forward_batch.seq_lens.clone()
-                seen["seq_lens_cpu"] = forward_batch.seq_lens_cpu.clone()
+                seen["seq_lens_cpu"] = forward_batch.seq_lens_cpu
                 seen["seq_lens_sum"] = forward_batch.seq_lens_sum
                 return SimpleNamespace(
                     logits_output=SimpleNamespace(
@@ -305,10 +306,10 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         )
 
         self.assertEqual(seen["seq_lens"].tolist(), [10, 20])
-        self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
-        self.assertEqual(seen["seq_lens_sum"], 30)
+        self.assertIsNone(seen["seq_lens_cpu"])
+        self.assertIsNone(seen["seq_lens_sum"])
 
-    def test_dspark_target_verify_passes_prefix_seq_lens_cpu_not_reserved(self):
+    def test_dspark_target_verify_keeps_gpu_lens_device_only_not_reserved(self):
         target_worker = _FakeTargetWorker()
         executor = TargetVerifyExecutor(
             target_worker=target_worker,
@@ -334,7 +335,7 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
         seen = {}
 
         def capture_prepare(_verify_input, verify_batch, _target_worker):
-            seen["seq_lens_cpu"] = verify_batch.seq_lens_cpu.clone()
+            seen["seq_lens_cpu"] = verify_batch.seq_lens_cpu
             seen["seq_lens_sum"] = verify_batch.seq_lens_sum
             return SimpleNamespace(), False
 
@@ -347,8 +348,8 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                 sampling_info=None,
             )
 
-        self.assertEqual(seen["seq_lens_cpu"].tolist(), [10, 20])
-        self.assertEqual(seen["seq_lens_sum"], 30)
+        self.assertIsNone(seen["seq_lens_cpu"])
+        self.assertIsNone(seen["seq_lens_sum"])
         self.assertIsNone(batch.seq_lens_cpu)
         self.assertIsNone(batch.seq_lens_sum)
 
