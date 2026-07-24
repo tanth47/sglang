@@ -610,6 +610,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
+        tp_tier_num_tokens = int(batch.spec_verify_tier_num_tokens)
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -618,6 +619,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=dp_tier_num_tokens,
+            tp_tier_num_tokens=tp_tier_num_tokens,
             collect_sps_verify_lens=self._observers.requests_enabled,
             host_seq_lens_upper_bound=draft_input.reserved_seq_lens_cpu,
         )

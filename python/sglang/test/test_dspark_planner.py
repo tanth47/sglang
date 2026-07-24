@@ -72,6 +72,8 @@ class _FakeBroadcastGroup:
         self.rank_in_group = rank_in_group
         self.source_payloads = list(source_payloads)
         self.calls = []
+        self.ranks = [0, 1]
+        self.cpu_group = object()
 
     def broadcast(self, tensor: torch.Tensor, src: int) -> None:
         if self.rank_in_group != src:
@@ -80,6 +82,39 @@ class _FakeBroadcastGroup:
 
 
 class TestDSparkPlanner(unittest.TestCase):
+    def test_tp_verify_tier_uses_source_cpu_control(self):
+        planner = _uniform_cache_planner()
+        planner.server_args.tp_size = 2
+        group = _FakeBroadcastGroup(rank_in_group=1)
+        batch = types.SimpleNamespace(spec_verify_tier_num_tokens=-1)
+
+        def broadcast(tensor, *, src, group):
+            self.assertEqual(src, 0)
+            self.assertIs(group, group_ref.cpu_group)
+            tensor.fill_(3)
+
+        group_ref = group
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "torch.distributed.broadcast",
+                side_effect=broadcast,
+            ) as tier_broadcast,
+            mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
+        ):
+            planner._coordinate_verify_tier(
+                batch=batch, local_tier_num_tokens=-1
+            )
+
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 3)
+        tier_broadcast.assert_called_once()
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=3)
+
     def test_verify_all_uniform_layout_cache_reuses_layout_and_none(self):
         for cached_layout in (object(), None):
             with self.subTest(cached_layout=cached_layout):
@@ -426,6 +461,7 @@ class TestDSparkPlanner(unittest.TestCase):
                 device=torch.device("cpu"),
                 confidence=None,
                 budget=None,
+                tp_tier_num_tokens=3,
             )
 
         self.assertIs(result, layout)
@@ -435,7 +471,42 @@ class TestDSparkPlanner(unittest.TestCase):
                 source_physical,
             )
         )
-        self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 8)
+        self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 4)
+
+        unavailable_group = _FakeBroadcastGroup(
+            rank_in_group=1,
+            source_payloads=(source_physical,),
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(unavailable_group, 2),
+            ),
+            mock.patch.object(
+                ScheduleVerifyLensTopk,
+                "execute",
+                side_effect=AssertionError("non-source rank must not schedule"),
+            ),
+            mock.patch.object(
+                RaggedVerifyLayout,
+                "from_verify_lens_device",
+                return_value=layout,
+            ) as unavailable_assemble,
+        ):
+            result = planner.schedule_layout(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                prefix_lens=torch.tensor([10, 20], dtype=torch.int64),
+                device=torch.device("cpu"),
+                confidence=None,
+                budget=0,
+                tp_tier_num_tokens=-1,
+            )
+
+        self.assertIs(result, layout)
+        self.assertEqual(
+            unavailable_assemble.call_args.kwargs["graph_num_tokens"], 8
+        )
 
     def test_sps_target_accept_length_default_keeps_sps_argmax(self):
         decision = compute_verify_token_budget(
