@@ -305,9 +305,9 @@ class DSparkVerifyPlanner:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
-            assert (
-                confidence_tap is not None
-            ), "dsv4 compute_confidence needs the compute_base_logits tap"
+            assert confidence_tap is not None, (
+                "dsv4 compute_confidence needs the compute_base_logits tap"
+            )
             with torch.inference_mode():
                 return compute_confidence_hook(
                     anchor_tokens=anchor_tokens,
@@ -471,22 +471,25 @@ class DSparkVerifyPlanner:
         budget: Optional[int],
         global_num_reqs: Optional[int] = None,
         dp_tier_num_tokens: Optional[int] = None,
+        collect_sps_verify_lens: bool = False,
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        sps_budget = budget
         budget_for_layout, exact_budget = self._budget_aligned_to_graph_tier(
             req_pool_indices=req_pool_indices,
             budget=budget,
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=dp_tier_num_tokens,
         )
-        verify_lens = self._schedule_verify_lens(
+        verify_lens, sps_verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
             budget=budget_for_layout,
             exact_budget=exact_budget,
+            sps_budget=sps_budget if collect_sps_verify_lens else None,
         )
         verify_lens, budget_for_layout = self._adjust_rocm_dsa_graph_safe_sps_layout(
             prefix_lens=prefix_lens,
@@ -553,7 +556,9 @@ class DSparkVerifyPlanner:
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens,
+                sps_verify_lens=sps_verify_lens,
+                graph_num_tokens=graph_num_tokens,
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -563,6 +568,7 @@ class DSparkVerifyPlanner:
         )
         return RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
+            sps_verify_lens=sps_verify_lens,
             device=device,
             grid=grid,
             graph_num_tokens_floor=graph_num_tokens_floor,
@@ -739,19 +745,32 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
         exact_budget: bool = False,
-    ) -> Optional[torch.Tensor]:
+        sps_budget: Optional[int] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if self._budget_planner is None or confidence is None or budget is None:
-            return None
+            return None, None
         schedule_kwargs = dict(
             confidence=confidence,
-            budget=budget,
             cfg=self._schedule_cfg,
         )
-        if exact_budget:
-            schedule_kwargs["exact_budget"] = True
-        verify_lens = ScheduleVerifyLensTopk.execute(**schedule_kwargs).to(
-            device=device, dtype=torch.int32
-        )
+        if sps_budget is None:
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                budget=budget,
+                exact_budget=exact_budget,
+                **schedule_kwargs,
+            ).to(device=device, dtype=torch.int32)
+            sps_verify_lens = None
+        else:
+            verify_lens, sps_verify_lens = (
+                ScheduleVerifyLensTopk.execute_with_sps_budget(
+                    execution_budget=budget,
+                    sps_budget=sps_budget,
+                    exact_execution=exact_budget,
+                    **schedule_kwargs,
+                )
+            )
+            verify_lens = verify_lens.to(device=device, dtype=torch.int32)
+            sps_verify_lens = sps_verify_lens.to(device=device, dtype=torch.int32)
 
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -775,8 +794,10 @@ class DSparkVerifyPlanner:
         )
         if group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)
+            if sps_verify_lens is not None:
+                broadcast_group.broadcast(sps_verify_lens, src=0)
 
-        return verify_lens
+        return verify_lens, sps_verify_lens
 
     def _log_verify_lens_decision(
         self,

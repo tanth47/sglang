@@ -1,11 +1,14 @@
 import unittest
+from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
+    DsparkStepObservers,
     InfoComponent,
     _PendingStep,
     logger,
@@ -64,6 +67,7 @@ def make_obs(
     commit_inject_path=None,
     predicted_step_ms=None,
     predicted_theta=None,
+    sps_verify_lens=None,
 ):
     if planned_num_verify_tokens is None:
         planned_num_verify_tokens = num_verify_tokens
@@ -88,6 +92,7 @@ def make_obs(
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
         verify_lens=torch.full((bs,), 6, dtype=torch.int32),
+        sps_verify_lens=sps_verify_lens,
         confidence=torch.full((bs, 5), 0.9),
         req_pool_indices=torch.arange(bs, dtype=torch.int64),
         prefix_lens=torch.full((bs,), 128, dtype=torch.int64),
@@ -416,6 +421,52 @@ class TestPredictedStepFields(unittest.TestCase):
         record = next(r for r in dumper.dump()["records"] if r["forward_ct"] == 1)
         self.assertNotIn("predicted_step_ms", record)
         self.assertNotIn("predicted_theta", record)
+
+
+class TestRequestVerifyLengthTelemetry(unittest.TestCase):
+    def test_exact_sps_lengths_are_separate_from_physical_lengths(self):
+        dumper, _ = make_dumper({"core"})
+        host = {
+            "req_pool_indices": torch.tensor([4, 7]),
+            "prefix_lens": torch.tensor([128, 256]),
+            "verify_lens": torch.tensor([8, 8]),
+            "draft_tokens": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "bonus_tokens": torch.tensor([9, 10]),
+            "correct_len": torch.tensor([2, 1]),
+            "cap_trim_lens": torch.tensor([0, 1]),
+            "commit_lens": torch.tensor([3, 2]),
+            "sps_verify_lens": torch.tensor([3, 5]),
+        }
+        reqs = dumper._build_reqs(host=host, bs=2, rids=["r4", "r7"])
+        self.assertEqual([req.verify_len for req in reqs], [8, 8])
+        self.assertEqual([req.sps_verify_len for req in reqs], [3, 5])
+
+    def test_absent_sps_lengths_keep_legacy_request_schema(self):
+        dumper, _ = make_dumper({"core"})
+        host = {
+            "req_pool_indices": torch.tensor([4]),
+            "prefix_lens": torch.tensor([128]),
+            "draft_tokens": torch.tensor([[1, 2, 3]]),
+            "bonus_tokens": torch.tensor([9]),
+            "correct_len": torch.tensor([2]),
+            "cap_trim_lens": torch.tensor([0]),
+            "commit_lens": torch.tensor([3]),
+        }
+        req = dumper._build_reqs(host=host, bs=1, rids=None)[0]
+        built = msgspec.to_builtins(req)
+        self.assertEqual(built["verify_len"], 6)
+        self.assertNotIn("sps_verify_len", built)
+
+
+class TestStepObserversConfiguration(unittest.TestCase):
+    def test_requests_enabled_ignores_rank_gated_dumper_state(self):
+        observers = object.__new__(DsparkStepObservers)
+        observers._info_components = {InfoComponent.REQS}
+        observers._info_dumper = SimpleNamespace(enabled=False)
+        self.assertTrue(observers.requests_enabled)
+        observers._info_components = {InfoComponent.CORE}
+        observers._info_dumper.enabled = True
+        self.assertFalse(observers.requests_enabled)
 
 
 def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):

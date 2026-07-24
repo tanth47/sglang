@@ -506,6 +506,24 @@ def _case_schedule_verify_lens_topk(tc):
                     exact_budget=exact_budget,
                 )
 
+    for confidence in (confidences[0], confidences[2], confidences[4]):
+        for exact_execution in (False, True):
+            got = cls.triton_with_sps_budget(
+                confidence=confidence,
+                execution_budget=7,
+                sps_budget=3,
+                cfg=cfg,
+                exact_execution=exact_execution,
+            )
+            ref = cls.torch_with_sps_budget(
+                confidence=confidence,
+                execution_budget=7,
+                sps_budget=3,
+                cfg=cfg,
+                exact_execution=exact_execution,
+            )
+            tc._eq(got, ref)
+
     bounded_cfg = DSparkScheduleConfig(
         gamma=gamma, min_verify_len=2, max_verify_len=4, survival_eps=0.5
     )
@@ -517,6 +535,25 @@ def _case_schedule_verify_lens_topk(tc):
             cfg=bounded_cfg,
             exact_budget=True,
         )
+
+    union_cfg = DSparkScheduleConfig(
+        gamma=gamma, min_verify_len=2, max_verify_len=5, survival_eps=0.5
+    )
+    got = cls.triton_with_sps_budget(
+        confidence=confidences[2],
+        execution_budget=5,
+        sps_budget=2,
+        cfg=union_cfg,
+        exact_execution=True,
+    )
+    ref = cls.torch_with_sps_budget(
+        confidence=confidences[2],
+        execution_budget=5,
+        sps_budget=2,
+        cfg=union_cfg,
+        exact_execution=True,
+    )
+    tc._eq(got, ref)
 
 
 def _case_softmax_temp(tc):

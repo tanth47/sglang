@@ -98,6 +98,7 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     bonus_token: int
     draft_tokens: list[int]
     rid: Optional[str] = None
+    sps_verify_len: Optional[int] = None
     confidence: Optional[list[float]] = None
     survival: Optional[list[float]] = None
 
@@ -163,6 +164,7 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    sps_verify_lens: Optional[torch.Tensor] = None
     compact_verify: Optional[bool] = None
     proposal_folded: Optional[bool] = None
     fold_eligible: Optional[bool] = None
@@ -408,6 +410,8 @@ class DsparkInfoDumper:
         }
         if obs.verify_lens is not None:
             tensors["verify_lens"] = obs.verify_lens
+        if obs.sps_verify_lens is not None:
+            tensors["sps_verify_lens"] = obs.sps_verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
@@ -545,6 +549,9 @@ class DsparkInfoDumper:
         cap_trim = host["cap_trim_lens"].tolist()
         commit = host["commit_lens"].tolist()
         verify_lens = host["verify_lens"].tolist() if "verify_lens" in host else None
+        sps_verify_lens = (
+            host["sps_verify_lens"].tolist() if "sps_verify_lens" in host else None
+        )
         if "confidence" in host:
             conf_host = host["confidence"].float()
             conf_rows = conf_host.tolist()
@@ -566,6 +573,9 @@ class DsparkInfoDumper:
                     req_pool_index=int(req_ids[row]),
                     prefix_len=int(prefixes[row]),
                     verify_len=verify_len,
+                    sps_verify_len=(
+                        None if sps_verify_lens is None else int(sps_verify_lens[row])
+                    ),
                     acc_len=int(commit[row]),
                     correct_drafts=int(correct[row]),
                     cap_trim=int(cap_trim[row]),
@@ -597,7 +607,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -757,7 +766,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,
@@ -846,6 +854,7 @@ class DsparkStepObservers:
         self._gamma = int(gamma)
         self._verify_num_draft_tokens = int(verify_num_draft_tokens)
         self._simulate_acc_len = float(simulate_acc_len)
+        self._info_components = resolve_enabled_components()
 
         self._confidence_probe = ConfidenceMetricsProbe(
             gamma=gamma,
@@ -853,7 +862,7 @@ class DsparkStepObservers:
             tp_rank=tp_rank,
         )
         self._info_dumper = DsparkInfoDumper(
-            components=resolve_enabled_components(),
+            components=self._info_components,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             attn_tp_rank=get_parallel().attn_tp_rank,
@@ -880,6 +889,10 @@ class DsparkStepObservers:
 
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
         return self._info_dumper.segment(name)
+
+    @property
+    def requests_enabled(self) -> bool:
+        return InfoComponent.REQS in self._info_components
 
     def note_prefill_step(self) -> None:
         self._info_dumper.note_non_decode_step()
@@ -1062,6 +1075,9 @@ class DsparkStepObservers:
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
                     verify_lens=layout.verify_lens if layout is not None else None,
+                    sps_verify_lens=(
+                        layout.sps_verify_lens if layout is not None else None
+                    ),
                     confidence=confidence,
                     req_pool_indices=req_pool_indices,
                     prefix_lens=prefix_lens,
