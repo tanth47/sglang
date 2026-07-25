@@ -463,7 +463,15 @@ class DeepseekSparseAttnBackend(
         ragged_layout,
         num_tokens_per_req: int,
     ) -> Optional[int]:
-        if self.supports_unified_dsa_target_verify_graph:
+        physical_tier_is_full = bool(
+            getattr(ragged_layout, "fills_graph_token_tier", False)
+            or (
+                ragged_layout.total_verify_tokens is not None
+                and ragged_layout.total_verify_tokens
+                == ragged_layout.graph_num_tokens
+            )
+        )
+        if self.supports_unified_dsa_target_verify_graph and physical_tier_is_full:
             # Unified DSA expands token rows inside each request slot. Its slot
             # capacity therefore depends on logical batch size, not token-tier
             # slack or dummy rows used by generic ragged backends.

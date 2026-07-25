@@ -94,20 +94,29 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
 
         resolve_slots = DeepseekSparseAttnBackend.required_ragged_verify_slots
         forward_batch = SimpleNamespace(batch_size=16)
+        proven_layout = SimpleNamespace(
+            fills_graph_token_tier=True,
+            total_verify_tokens=None,
+            graph_num_tokens=112,
+        )
         self.assertEqual(
             resolve_slots(
                 SimpleNamespace(supports_unified_dsa_target_verify_graph=True),
                 forward_batch=forward_batch,
-                ragged_layout=object(),
+                ragged_layout=proven_layout,
                 num_tokens_per_req=8,
             ),
             16,
         )
         self.assertIsNone(
             resolve_slots(
-                SimpleNamespace(supports_unified_dsa_target_verify_graph=False),
+                SimpleNamespace(supports_unified_dsa_target_verify_graph=True),
                 forward_batch=forward_batch,
-                ragged_layout=object(),
+                ragged_layout=SimpleNamespace(
+                    fills_graph_token_tier=False,
+                    total_verify_tokens=None,
+                    graph_num_tokens=128,
+                ),
                 num_tokens_per_req=8,
             )
         )

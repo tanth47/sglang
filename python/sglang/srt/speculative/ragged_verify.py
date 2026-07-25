@@ -220,8 +220,17 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     max_kv_len: Optional[int] = None
     # Logical pre-alignment SPS decision; physical layout code must not read it.
     sps_verify_lens: Optional[torch.Tensor] = None
+    # Host-known guarantee that device-planned physical lengths exactly fill
+    # graph_num_tokens. Backends may use it without materializing verify_lens.
+    fills_graph_token_tier: bool = False
 
     def __post_init__(self) -> None:
+        if self.fills_graph_token_tier and self.total_verify_tokens is not None:
+            if self.total_verify_tokens != self.graph_num_tokens:
+                raise ValueError(
+                    "fills_graph_token_tier requires total_verify_tokens to "
+                    "equal graph_num_tokens"
+                )
         if self.sps_verify_lens is not None:
             if self.sps_verify_lens.shape != self.verify_lens.shape:
                 raise ValueError(
@@ -272,6 +281,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens_cpu: Optional[list[int]] = None,
         total_verify_tokens: Optional[int] = None,
         sps_verify_lens: Optional[torch.Tensor] = None,
+        fills_graph_token_tier: bool = False,
     ) -> RaggedVerifyLayout:
         from sglang.srt.speculative.ragged_verify_kernels import (
             BuildQoIndptr,
@@ -287,6 +297,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens_cpu=verify_lens_cpu,
             total_verify_tokens=total_verify_tokens,
             sps_verify_lens=sps_verify_lens,
+            fills_graph_token_tier=fills_graph_token_tier,
         )
 
     @classmethod
@@ -315,11 +326,13 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         verify_lens: torch.Tensor,
         graph_num_tokens: int,
         sps_verify_lens: Optional[torch.Tensor] = None,
+        fills_graph_token_tier: bool = False,
     ) -> RaggedVerifyLayout:
         return cls._assemble_device(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             sps_verify_lens=sps_verify_lens,
+            fills_graph_token_tier=fills_graph_token_tier,
         )
 
     @classmethod
@@ -361,6 +374,7 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
             total_verify_tokens=self.graph_num_tokens,
+            fills_graph_token_tier=True,
         )
 
 

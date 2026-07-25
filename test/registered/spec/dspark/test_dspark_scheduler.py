@@ -1111,6 +1111,7 @@ class TestScheduleLayoutGraphTierAlignment(CustomTestCase):
 
         self.assertIsNotNone(aligned_layout)
         self.assertEqual(int(aligned_layout.verify_lens.sum().item()), 16)
+        self.assertTrue(aligned_layout.fills_graph_token_tier)
         self.assertEqual(aligned_layout.graph_num_tokens, 16)
         self.assertTrue(
             torch.equal(
@@ -1121,6 +1122,7 @@ class TestScheduleLayoutGraphTierAlignment(CustomTestCase):
 
         self.assertIsNotNone(inactive_layout)
         self.assertEqual(int(inactive_layout.verify_lens.sum().item()), 4)
+        self.assertFalse(inactive_layout.fills_graph_token_tier)
         self.assertEqual(inactive_layout.graph_num_tokens, 16)
         self.assertTrue(
             torch.equal(

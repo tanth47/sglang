@@ -387,7 +387,8 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
     def test_backend_slot_requirement_avoids_dynamic_layout_host_read(self):
         layout = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=torch.full((16,), 7, dtype=torch.int32, device=_DEVICE),
-            graph_num_tokens=128,
+            graph_num_tokens=112,
+            fills_graph_token_tier=True,
         )
         required_slots = mock.Mock(return_value=16)
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
@@ -424,6 +425,10 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
             num_tokens_per_req=8,
         )
         runner._log_graph_reject.assert_not_called()
+        padded = layout.padded_to_bucket(padded_bs=16)
+        self.assertEqual(padded.verify_lens.tolist(), [7] * 16)
+        self.assertEqual(int(padded.verify_lens.sum()), 112)
+        self.assertLessEqual(int(padded.verify_lens.max()), 8)
 
     def test_device_layout_uses_conservative_slots_without_host_read(self):
         raw = RaggedVerifyLayout.from_verify_lens_device(
@@ -547,6 +552,15 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
+
+    def test_fill_guarantee_rejects_inconsistent_host_total(self):
+        with self.assertRaisesRegex(ValueError, "fills_graph_token_tier requires"):
+            RaggedVerifyLayout._assemble_device(
+                verify_lens=torch.tensor([7, 7], dtype=torch.int32),
+                graph_num_tokens=16,
+                total_verify_tokens=14,
+                fills_graph_token_tier=True,
+            )
 
 
 class TestStaticFullVerifyLayout(unittest.TestCase):

@@ -683,10 +683,18 @@ class DSparkVerifyPlanner:
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            effective_floor = max(self._schedule_cfg.min_verify_len, 1)
+            scheduled_total = (
+                bs * effective_floor
+                + (0 if budget_for_layout is None else int(budget_for_layout))
+            )
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens,
                 sps_verify_lens=sps_verify_lens,
                 graph_num_tokens=graph_num_tokens,
+                fills_graph_token_tier=(
+                    exact_budget and scheduled_total == graph_num_tokens
+                ),
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
