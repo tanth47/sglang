@@ -1105,9 +1105,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         admission_tokens = ragged_layout.graph_num_tokens
         capture_slots = self._ragged_capture_slots(admission_tokens)
-        required_slots = required_padded_verify_slots(
-            ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+        required_slots_hook = getattr(
+            self.attn_backend, "required_ragged_verify_slots", None
         )
+        required_slots = (
+            required_slots_hook(
+                forward_batch=forward_batch,
+                ragged_layout=ragged_layout,
+                num_tokens_per_req=self.num_tokens_per_req,
+            )
+            if required_slots_hook is not None
+            else None
+        )
+        if required_slots is None:
+            required_slots = required_padded_verify_slots(
+                ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+            )
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[-1]
         is_slots_supported = required_slots <= capture_slots
 

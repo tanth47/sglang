@@ -78,6 +78,57 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
         self.assertFalse(AttentionBackend.supports_ragged_verify_graph)
+        self.assertIsNone(
+            AttentionBackend.required_ragged_verify_slots(
+                object(),
+                forward_batch=SimpleNamespace(batch_size=2),
+                ragged_layout=object(),
+                num_tokens_per_req=8,
+            )
+        )
+
+    def test_unified_dsa_slot_requirement_is_logical_batch_size(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnBackend,
+        )
+
+        resolve_slots = DeepseekSparseAttnBackend.required_ragged_verify_slots
+        forward_batch = SimpleNamespace(batch_size=16)
+        self.assertEqual(
+            resolve_slots(
+                SimpleNamespace(supports_unified_dsa_target_verify_graph=True),
+                forward_batch=forward_batch,
+                ragged_layout=object(),
+                num_tokens_per_req=8,
+            ),
+            16,
+        )
+        self.assertIsNone(
+            resolve_slots(
+                SimpleNamespace(supports_unified_dsa_target_verify_graph=False),
+                forward_batch=forward_batch,
+                ragged_layout=object(),
+                num_tokens_per_req=8,
+            )
+        )
+
+    def test_dsa_eager_target_verify_rehydrates_cpu_lengths(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnBackend,
+        )
+
+        forward_batch = SimpleNamespace(
+            seq_lens=torch.tensor([17, 29], dtype=torch.int32),
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+        )
+        actual = DeepseekSparseAttnBackend._target_verify_seq_lens_cpu(
+            forward_batch
+        )
+
+        self.assertEqual(actual, [17, 29])
+        self.assertEqual(forward_batch.seq_lens_cpu.tolist(), [17, 29])
+        self.assertEqual(forward_batch.seq_lens_sum, 46)
 
     def test_ragged_implementing_backends_declare_the_flag(self):
         """Every backend with a ragged-verify metadata path must opt in; a

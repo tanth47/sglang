@@ -53,6 +53,16 @@ class AttentionBackend(ABC):
     ) -> int:
         return min(num_tokens, max_bs)
 
+    def required_ragged_verify_slots(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        num_tokens_per_req: int,
+    ) -> Optional[int]:
+        """Return a backend-specific replay slot requirement, if known."""
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

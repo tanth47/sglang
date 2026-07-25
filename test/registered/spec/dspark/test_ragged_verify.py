@@ -4,7 +4,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -381,6 +384,47 @@ class TestDsaTargetVerifyGraphAdmission(unittest.TestCase):
 
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
+    def test_backend_slot_requirement_avoids_dynamic_layout_host_read(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.full((16,), 7, dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=128,
+        )
+        required_slots = mock.Mock(return_value=16)
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.attn_backend = SimpleNamespace(
+            supports_ragged_verify_graph=True,
+            can_run_ragged_verify_graph=mock.Mock(return_value=(True, "")),
+            required_ragged_verify_slots=required_slots,
+        )
+        runner.num_tokens_per_req = 8
+        runner.capture_num_tokens = [8, 16, 32, 64, 128]
+        runner.require_mlp_sync = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner._ragged_capture_slots = mock.Mock(return_value=16)
+        runner._log_graph_reject = mock.Mock()
+        forward_batch = SimpleNamespace(
+            batch_size=16,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            spec_info=SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+        )
+
+        with mock.patch(
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+            "required_padded_verify_slots",
+            side_effect=AssertionError("unexpected verify-lens D2H"),
+        ):
+            self.assertTrue(
+                runner._can_run_ragged_verify_graph(forward_batch, layout)
+            )
+
+        required_slots.assert_called_once_with(
+            forward_batch=forward_batch,
+            ragged_layout=layout,
+            num_tokens_per_req=8,
+        )
+        runner._log_graph_reject.assert_not_called()
+
     def test_device_layout_uses_conservative_slots_without_host_read(self):
         raw = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEVICE),
@@ -467,6 +511,7 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
 
         self.assertEqual(replay_view.extend_num_tokens, 8)
         self.assertIsNone(replay_view.extend_seq_lens_cpu)
+        self.assertIsNone(replay_view.seq_lens_cpu)
         self.assertIs(replay_view.extend_seq_lens, layout.verify_lens)
 
     def test_padded_layout_decoupled_slots_spread_slack(self):

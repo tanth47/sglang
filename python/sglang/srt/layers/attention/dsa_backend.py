@@ -456,6 +456,29 @@ class DeepseekSparseAttnBackend(
         slots = (num_tokens + num_tokens_per_req - 1) // num_tokens_per_req
         return min(max_bs, max(1, slots))
 
+    def required_ragged_verify_slots(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        num_tokens_per_req: int,
+    ) -> Optional[int]:
+        if self.supports_unified_dsa_target_verify_graph:
+            # Unified DSA expands token rows inside each request slot. Its slot
+            # capacity therefore depends on logical batch size, not token-tier
+            # slack or dummy rows used by generic ragged backends.
+            return int(forward_batch.batch_size)
+        return None
+
+    @staticmethod
+    def _target_verify_seq_lens_cpu(forward_batch: ForwardBatch) -> List[int]:
+        if forward_batch.seq_lens_cpu is None:
+            # Eager fallback only. Graph replay deliberately keeps these
+            # lengths device-resident to avoid a per-step host sync.
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+        return [int(x) for x in forward_batch.seq_lens_cpu.tolist()]
+
     def can_run_ragged_verify_graph(
         self,
         *,
@@ -1248,12 +1271,7 @@ class DeepseekSparseAttnBackend(
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
-            seq_lens_cpu = (
-                forward_batch.seq_lens_cpu.tolist()
-                if forward_batch.seq_lens_cpu is not None
-                else forward_batch.seq_lens.cpu().tolist()
-            )
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu]
+            seq_lens_cpu = self._target_verify_seq_lens_cpu(forward_batch)
             if ragged_layout is None:
                 lengths = compute_uniform_extend_lengths(
                     seq_lens=forward_batch.seq_lens,
