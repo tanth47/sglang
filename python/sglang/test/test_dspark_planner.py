@@ -90,19 +90,15 @@ class _FakeBroadcastGroup:
 
 
 class TestDSparkPlanner(unittest.TestCase):
-    def test_tp_verify_tier_uses_source_cpu_control(self):
+    def test_tp_verify_tier_is_collective_free(self):
         planner = _uniform_cache_planner()
         planner._is_verify_all = False
         planner.server_args.tp_size = 2
         group = _FakeBroadcastGroup(rank_in_group=1)
-        batch = types.SimpleNamespace(spec_verify_tier_num_tokens=-1)
+        batch = types.SimpleNamespace(
+            spec_verify_tier_num_tokens=-1, batch_size=lambda: 2
+        )
 
-        def broadcast(tensor, *, src, group):
-            self.assertEqual(src, 0)
-            self.assertIs(group, group_ref.cpu_group)
-            tensor.fill_(3)
-
-        group_ref = group
         with (
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_planner."
@@ -112,7 +108,7 @@ class TestDSparkPlanner(unittest.TestCase):
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_planner."
                 "torch.distributed.broadcast",
-                side_effect=broadcast,
+                side_effect=AssertionError("pure TP must not coordinate on CPU"),
             ) as tier_broadcast,
             mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
         ):
@@ -120,9 +116,9 @@ class TestDSparkPlanner(unittest.TestCase):
                 batch=batch, local_tier_num_tokens=-1
             )
 
-        self.assertEqual(batch.spec_verify_tier_num_tokens, 3)
-        tier_broadcast.assert_called_once()
-        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=3)
+        self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
+        tier_broadcast.assert_not_called()
+        gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
 
     def test_verify_all_skips_tp_tier_collective(self):
         planner = _uniform_cache_planner()
@@ -302,9 +298,9 @@ class TestDSparkPlanner(unittest.TestCase):
         ):
             self.assertFalse(planner._can_cache_uniform_layout(dp_tier_num_tokens=None))
 
-    def test_verify_all_skips_confidence_publication_until_policy_needs_it(self):
+    def test_verify_all_keeps_confidence_publication_warm(self):
         planner = _uniform_cache_planner()
-        self.assertFalse(planner.needs_confidence_publication)
+        self.assertTrue(planner.needs_confidence_publication)
 
         planner._schedule_cfg = DSparkScheduleConfig(
             gamma=3,

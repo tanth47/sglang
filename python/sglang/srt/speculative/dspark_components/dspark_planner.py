@@ -510,14 +510,10 @@ class DSparkVerifyPlanner:
     @property
     def needs_confidence_publication(self) -> bool:
         """Whether overlap scheduling can consume a relayed confidence block."""
-        if not self.schedules_verify_budget:
-            return False
-        return not (
-            getattr(self, "_is_verify_all", False)
-            and self._schedule_cfg.sps_target_accept_length <= 0
-            and not self._schedule_cfg.sps_dry_run
-            and getattr(self._budget_planner, "forced_budget_frac", None) is None
-        )
+        # Keep the relay warm even while the current policy verifies all tokens.
+        # A live forced-budget update can then consume an already-published block
+        # instead of waiting for the relay ring to fill from cold.
+        return self.schedules_verify_budget
 
     def should_compute_confidence_for_scheduling(
         self,
@@ -716,6 +712,14 @@ class DSparkVerifyPlanner:
                 fills_graph_token_tier=(
                     exact_budget and scheduled_total == graph_num_tokens
                 ),
+            )
+        if not is_dp_attention_enabled():
+            # Keep exact TP verify lengths device-resident in cap-accept and eager
+            # compact mode. Full-block capacity is a conservative safe fallback.
+            return RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=verify_lens,
+                sps_verify_lens=sps_verify_lens,
+                graph_num_tokens=bs * self.verify_num_draft_tokens,
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(

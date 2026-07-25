@@ -4,9 +4,17 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
+    ScheduleVerifyLensTopk,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkScheduleConfig,
     DSparkVerifyPlanner,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
+)
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -183,4 +191,94 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
 
         self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
         gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
+
+    def _assert_eager_tp_layout_stays_device_side(
+        self, *, mode: RaggedVerifyMode
+    ) -> None:
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._align_verify_tokens_to_graph_tier = False
+        planner._budget_planner = object()
+        planner._dynamic_graph_tier = False
+        planner._is_verify_all = False
+        planner._ragged_verify_mode = mode
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=3)
+        planner._uniform_layout_cache = {}
+        planner.verify_num_draft_tokens = 4
+        planner.model_runner = SimpleNamespace(decode_cuda_graph_runner=None)
+        planner.server_args = SimpleNamespace(tp_size=2)
+        source_lens = torch.tensor([1, 2], dtype=torch.int32)
+        group = _FakeBroadcastGroup(source_lens)
+        layout = object()
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "verify_lens_broadcast_group",
+                return_value=(group, 2),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner."
+                "is_dp_attention_enabled",
+                return_value=False,
+            ),
+            mock.patch.object(
+                ScheduleVerifyLensTopk,
+                "execute",
+                side_effect=AssertionError("non-source rank must not schedule"),
+            ),
+            mock.patch.object(
+                RaggedVerifyLayout,
+                "from_verify_lens",
+                side_effect=AssertionError("pure TP materialized verify lengths"),
+            ),
+            mock.patch.object(
+                RaggedVerifyLayout,
+                "from_verify_lens_device",
+                return_value=layout,
+            ) as assemble,
+        ):
+            result = planner.schedule_layout(
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                prefix_lens=torch.tensor([10, 20], dtype=torch.int64),
+                device=torch.device("cpu"),
+                confidence=None,
+                budget=None,
+            )
+
+        self.assertIs(result, layout)
+        self.assertTrue(
+            torch.equal(assemble.call_args.kwargs["verify_lens"], source_lens)
+        )
+        self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 8)
+
+    def test_cap_accept_tp_fallback_stays_device_side(self):
+        self._assert_eager_tp_layout_stays_device_side(
+            mode=RaggedVerifyMode.CAP_ACCEPT
+        )
+
+    def test_compact_eager_tp_fallback_stays_device_side(self):
+        self._assert_eager_tp_layout_stays_device_side(mode=RaggedVerifyMode.COMPACT)
+
+    def test_verify_all_to_forced_budget_keeps_confidence_relay_warm(self):
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = SimpleNamespace(forced_budget_frac=None)
+        planner._is_verify_all = True
+        worker = object.__new__(DSparkWorkerV2)
+        worker._verify_planner = planner
+        worker._observers = SimpleNamespace(needs_budget_telemetry=False)
+
+        confidence = torch.ones(1)
+        self.assertTrue(planner.needs_confidence_publication)
+        self.assertTrue(worker._should_publish_confidence(confidence))
+
+        planner._budget_planner.forced_budget_frac = 0.5
+        self.assertTrue(planner.needs_confidence_publication)
+        self.assertTrue(worker._should_publish_confidence(confidence))
+
+        planner._budget_planner.forced_budget_frac = None
+        planner._is_verify_all = False
+        self.assertTrue(planner.needs_confidence_publication)
+
+        planner._budget_planner = None
+        self.assertFalse(planner.needs_confidence_publication)
 
