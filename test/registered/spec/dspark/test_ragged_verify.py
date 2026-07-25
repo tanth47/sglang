@@ -390,7 +390,11 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
             graph_num_tokens=112,
             fills_graph_token_tier=True,
         )
-        required_slots = mock.Mock(return_value=16)
+        required_slots = mock.Mock(
+            side_effect=lambda *, ragged_layout, **_: (
+                16 if ragged_layout.fills_graph_token_tier else None
+            )
+        )
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         runner.attn_backend = SimpleNamespace(
             supports_ragged_verify_graph=True,
@@ -398,7 +402,7 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
             required_ragged_verify_slots=required_slots,
         )
         runner.num_tokens_per_req = 8
-        runner.capture_num_tokens = [8, 16, 32, 64, 128]
+        runner.capture_num_tokens = [8, 16, 32, 64, 112, 128]
         runner.require_mlp_sync = False
         runner.is_encoder_decoder = False
         runner.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -429,6 +433,21 @@ class TestPaddedRaggedVerifyGeometry(unittest.TestCase):
         self.assertEqual(padded.verify_lens.tolist(), [7] * 16)
         self.assertEqual(int(padded.verify_lens.sum()), 112)
         self.assertLessEqual(int(padded.verify_lens.max()), 8)
+
+        unsafe_layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.full((16,), 7, dtype=torch.int32, device=_DEVICE),
+            graph_num_tokens=128,
+        )
+        runner._log_graph_reject.reset_mock()
+        self.assertFalse(
+            runner._can_run_ragged_verify_graph(forward_batch, unsafe_layout)
+        )
+        _, reason = runner._log_graph_reject.call_args.args
+        details = runner._log_graph_reject.call_args.kwargs
+        self.assertEqual(reason, "ragged_eligibility")
+        self.assertEqual(details["capture_slots"], 16)
+        self.assertEqual(details["required_slots"], 30)
+        self.assertFalse(details["slots_supported"])
 
     def test_device_layout_uses_conservative_slots_without_host_read(self):
         raw = RaggedVerifyLayout.from_verify_lens_device(
