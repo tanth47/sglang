@@ -397,9 +397,11 @@ class DSparkVerifyPlanner:
             else:
                 tier_tensor = torch.tensor(
                     [
-                        int(local_tier_num_tokens)
-                        if broadcast_group.rank_in_group == 0
-                        else -1
+                        (
+                            int(local_tier_num_tokens)
+                            if broadcast_group.rank_in_group == 0
+                            else -1
+                        )
                     ],
                     dtype=torch.int64,
                 )
@@ -670,7 +672,7 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
-        elif tp_tier_num_tokens is not None:
+        elif tp_tier_num_tokens is not None and not is_dp_attention_enabled():
             tier_num_tokens = (
                 int(tp_tier_num_tokens) if int(tp_tier_num_tokens) >= 0 else None
             )
@@ -701,9 +703,8 @@ class DSparkVerifyPlanner:
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
-            scheduled_total = (
-                bs * effective_floor
-                + (0 if budget_for_layout is None else int(budget_for_layout))
+            scheduled_total = bs * effective_floor + (
+                0 if budget_for_layout is None else int(budget_for_layout)
             )
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens,
@@ -714,13 +715,24 @@ class DSparkVerifyPlanner:
                 ),
             )
         if not is_dp_attention_enabled():
-            # Keep exact TP verify lengths device-resident in cap-accept and eager
-            # compact mode. Full-block capacity is a conservative safe fallback.
-            return RaggedVerifyLayout.from_verify_lens_device(
+            # Cap-accept verifies the full target block, while compact eager uses
+            # this as a conservative packing capacity. Both can keep the exact
+            # per-request lengths device-resident; the full-block capacity avoids
+            # a D2H reduction solely to discover the exact token count.
+            graph_num_tokens = bs * self.verify_num_draft_tokens
+            layout = RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens,
                 sps_verify_lens=sps_verify_lens,
-                graph_num_tokens=bs * self.verify_num_draft_tokens,
+                graph_num_tokens=graph_num_tokens,
             )
+            if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+                # Eager compact consumers allocate metadata from this field. The
+                # exact total is device-only, so advertise the conservative packing
+                # capacity instead of synchronizing to materialize it on the host.
+                return msgspec.structs.replace(
+                    layout, total_verify_tokens=graph_num_tokens
+                )
+            return layout
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
             verify_lens_cpu=verify_lens_cpu,
