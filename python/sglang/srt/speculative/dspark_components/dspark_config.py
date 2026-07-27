@@ -57,6 +57,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    sample_from_anchor: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -67,8 +68,10 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
 
 class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
+    draft_query_width: int
     verify_num_draft_tokens: int
     mask_token_id: int
+    sample_from_anchor: bool
 
 
 def resolve_runtime_config(
@@ -119,8 +122,10 @@ def resolve_runtime_config(
 
     return DSparkRuntimeConfig(
         gamma=gamma,
+        draft_query_width=gamma if draft_config.sample_from_anchor else gamma + 1,
         verify_num_draft_tokens=gamma + 1,
         mask_token_id=mask_token_id,
+        sample_from_anchor=draft_config.sample_from_anchor,
     )
 
 
@@ -316,6 +321,20 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
                 f"Supported: {SUPPORTED_DSPARK_MARKOV_HEAD_TYPES}."
             )
 
+    raw_sample_from_anchor = dspark_cfg.get(
+        "sample_from_anchor",
+        _cfg_get(
+            text_config,
+            "sample_from_anchor",
+            _cfg_get(draft_hf_config, "sample_from_anchor", False),
+        ),
+    )
+    if not isinstance(raw_sample_from_anchor, bool):
+        raise ValueError(
+            "DSpark sample_from_anchor must be a bool, got "
+            f"{raw_sample_from_anchor!r}."
+        )
+
     raw_mask_token_id = (
         prefixed_noise_token_id
         if prefixed_noise_token_id is not None
@@ -365,4 +384,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        sample_from_anchor=raw_sample_from_anchor,
     )

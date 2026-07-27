@@ -78,10 +78,22 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 class DsparkDraftSampler:
 
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
+    def __init__(
+        self,
+        *,
+        model,
+        gamma,
+        max_bs,
+        device,
+        sample_from_anchor=False,
+        confidence_fn=None,
+        out=None,
+    ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.sample_from_anchor = bool(sample_from_anchor)
+        self.draft_query_width = self.gamma + (not self.sample_from_anchor)
         if out is not None:
             assert out.shape == (int(max_bs) * self.gamma,) and out.dtype == torch.int64
             self.out = out
@@ -97,20 +109,21 @@ class DsparkDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        draft_width = self.gamma + 1
+        draft_width = self.draft_query_width
         if hidden_states.shape[0] % draft_width != 0:
             raise RuntimeError(
-                "DSpark folded draft sampler expects full blocks with "
-                f"anchor + gamma tokens, got {hidden_states.shape[0]} rows "
-                f"for gamma={self.gamma}."
+                "DSpark folded draft sampler expects a full draft query block: "
+                "anchor + gamma rows, or gamma rows when sampling from anchor; "
+                f"draft_query_width={draft_width}, got {hidden_states.shape[0]} "
+                f"rows for gamma={self.gamma} and "
+                f"sample_from_anchor={self.sample_from_anchor}."
             )
         bs = hidden_states.shape[0] // draft_width
         hidden_3d = hidden_states.view(bs, draft_width, -1)
         ids_2d = input_ids.view(bs, draft_width)
         anchor = ids_2d[:, 0]
-        # Slot 0 conditions the block. Slots 1..gamma are the draft tokens
-        # used by the verifier and confidence scheduler.
-        draft_hidden = hidden_3d[:, 1:, :].contiguous()
+        hidden_start = 0 if self.sample_from_anchor else 1
+        draft_hidden = hidden_3d[:, hidden_start:, :].contiguous()
         hidden_for_logits = draft_hidden.reshape(bs * self.gamma, -1)
 
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_for_logits)
@@ -136,6 +149,7 @@ def maybe_build_draft_sampler(
     *,
     draft_model,
     gamma: int,
+    sample_from_anchor: bool,
     max_bs: int,
     device,
     tp_rank: int,
@@ -162,6 +176,7 @@ def maybe_build_draft_sampler(
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
+        sample_from_anchor=sample_from_anchor,
         max_bs=max_bs,
         device=device,
         confidence_fn=confidence_fn,
@@ -261,11 +276,14 @@ class DraftBlockProposer:
         gamma: int,
         mask_token_id: int,
         draft_block_spec_info,
+        sample_from_anchor: bool = False,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
         self.gamma = gamma
+        self.sample_from_anchor = bool(sample_from_anchor)
+        self.draft_query_width = self.gamma + (not self.sample_from_anchor)
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
@@ -383,7 +401,7 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
-        draft_width = gamma + 1
+        draft_width = self.draft_query_width
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
@@ -442,10 +460,9 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        # Slot 0 is the anchor token used to condition semi-autoregressive
-        # drafting. Only slots 1..gamma are speculative token hidden states.
         raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
-        draft_hidden_3d = raw_hidden_3d[:, 1:, :].contiguous()
+        hidden_start = 0 if self.sample_from_anchor else 1
+        draft_hidden_3d = raw_hidden_3d[:, hidden_start:, :].contiguous()
         raw_hidden = draft_hidden_3d.reshape(bs * gamma, -1)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,

@@ -115,19 +115,27 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
         )
         self.gamma = runtime_config.gamma
+        self.draft_query_width = runtime_config.draft_query_width
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self.sample_from_anchor = runtime_config.sample_from_anchor
+        self.draft_model_runner.server_args.override(
+            "dspark.draft_query_width",
+            speculative_num_draft_tokens=self.draft_query_width,
+        )
 
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "gamma=%s, draft_query_width=%s, verify_num_draft_tokens=%s, "
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
+                self.draft_query_width,
                 self.verify_num_draft_tokens,
+                self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -136,7 +144,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.verify_num_draft_tokens), device=self.device
+            draft_token_num=int(self.draft_query_width), device=self.device
         )
 
         target_model = self.target_worker.model_runner.model
@@ -184,6 +192,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
             gamma=self.gamma,
+            sample_from_anchor=self.sample_from_anchor,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
@@ -320,6 +329,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
+            sample_from_anchor=self.sample_from_anchor,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
