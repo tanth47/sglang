@@ -8,6 +8,7 @@ from sglang.srt.models.dspark import EntryClass
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
+    resolve_runtime_config,
 )
 from sglang.srt.utils.hf_transformers import get_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,6 +43,14 @@ def _glm52_redhat_dspark_config_dict() -> dict:
             "vocab_size": 154880,
         },
     }
+
+def _glm52_redhat_anchor_dspark_config_dict() -> dict:
+    config = _glm52_redhat_dspark_config_dict()
+    config["aux_hidden_state_layer_ids"] = [2, 20, 39, 58, 75]
+    config["sample_from_anchor"] = True
+    config["speculators_config"]["proposal_methods"][0]["speculative_tokens"] = 8
+    config["transformer_layer_config"]["num_hidden_layers"] = 3
+    return config
 
 
 def _to_namespace(value):
@@ -92,6 +101,56 @@ class TestGLM52RedHatDSparkConfig(CustomTestCase):
         self.assertEqual(parsed.markov_rank, 256)
         self.assertEqual(parsed.markov_head_type, "vanilla")
         self.assertEqual(parsed.mask_token_id, 154856)
+
+    def test_legacy_layout_uses_anchor_plus_gamma_draft_queries(self):
+        for explicit_sample_from_anchor in (None, False):
+            with self.subTest(sample_from_anchor=explicit_sample_from_anchor):
+                raw_config = _glm52_redhat_dspark_config_dict()
+                if explicit_sample_from_anchor is not None:
+                    raw_config["sample_from_anchor"] = explicit_sample_from_anchor
+
+                parsed = parse_dspark_draft_config(draft_hf_config=raw_config)
+                runtime = resolve_runtime_config(
+                    draft_hf_config=raw_config,
+                    speculative_num_draft_tokens=None,
+                    target_vocab_size=154880,
+                )
+
+                self.assertFalse(parsed.sample_from_anchor)
+                self.assertEqual(parsed.gamma, 7)
+                self.assertFalse(runtime.sample_from_anchor)
+                self.assertEqual(runtime.gamma, 7)
+                self.assertEqual(runtime.draft_query_width, 8)
+                self.assertEqual(runtime.verify_num_draft_tokens, 8)
+
+    def test_anchor_layout_uses_gamma_draft_queries_and_gamma_plus_one_verify(self):
+        raw_config = _glm52_redhat_anchor_dspark_config_dict()
+
+        parsed = parse_dspark_draft_config(draft_hf_config=raw_config)
+        runtime = resolve_runtime_config(
+            draft_hf_config=raw_config,
+            speculative_num_draft_tokens=None,
+            target_vocab_size=154880,
+        )
+
+        self.assertTrue(parsed.sample_from_anchor)
+        self.assertEqual(parsed.gamma, 8)
+        self.assertTrue(runtime.sample_from_anchor)
+        self.assertEqual(runtime.gamma, 8)
+        self.assertEqual(runtime.draft_query_width, 8)
+        self.assertEqual(runtime.verify_num_draft_tokens, 9)
+
+    def test_anchor_layout_cli_cap_keeps_draft_and_verify_widths_distinct(self):
+        runtime = resolve_runtime_config(
+            draft_hf_config=_glm52_redhat_anchor_dspark_config_dict(),
+            speculative_num_draft_tokens=8,
+            target_vocab_size=154880,
+        )
+
+        self.assertTrue(runtime.sample_from_anchor)
+        self.assertEqual(runtime.gamma, 7)
+        self.assertEqual(runtime.draft_query_width, 7)
+        self.assertEqual(runtime.verify_num_draft_tokens, 8)
 
     def test_dspark_parser_selects_default_proposal_method(self):
         raw_config = _glm52_redhat_dspark_config_dict()
