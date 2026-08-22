@@ -12,14 +12,22 @@ from sglang.srt.state_capturer.base import BaseTopkCapturer
 logger = logging.getLogger(__name__)
 
 _mixed_spec_debug_capture: Optional[dict[int, torch.Tensor]] = None
+_mixed_spec_debug_aux_capture: Optional[
+    dict[str, dict[int, torch.Tensor]]
+] = None
+_MIXED_SPEC_DEBUG_AUX_LAYERS = frozenset({0, 1, 38, 77})
 
 
 def begin_mixed_spec_debug_capture() -> None:
     """Capture only the current forward's indexer top-k tensors on device."""
-    global _mixed_spec_debug_capture
-    if _mixed_spec_debug_capture is not None:
+    global _mixed_spec_debug_capture, _mixed_spec_debug_aux_capture
+    if (
+        _mixed_spec_debug_capture is not None
+        or _mixed_spec_debug_aux_capture is not None
+    ):
         raise RuntimeError("A mixed-spec indexer capture is already active.")
     _mixed_spec_debug_capture = {}
+    _mixed_spec_debug_aux_capture = {}
 
 
 def end_mixed_spec_debug_capture() -> dict[int, torch.Tensor]:
@@ -29,6 +37,30 @@ def end_mixed_spec_debug_capture() -> dict[int, torch.Tensor]:
     captured = _mixed_spec_debug_capture
     _mixed_spec_debug_capture = None
     return captured
+
+
+def end_mixed_spec_debug_aux_capture() -> dict[str, dict[int, torch.Tensor]]:
+    global _mixed_spec_debug_aux_capture
+    if _mixed_spec_debug_aux_capture is None:
+        raise RuntimeError("No mixed-spec auxiliary capture is active.")
+    captured = _mixed_spec_debug_aux_capture
+    _mixed_spec_debug_aux_capture = None
+    return captured
+
+
+def maybe_capture_mixed_spec_debug_tensor(
+    name: str, layer_id: int, value: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Capture selected-layer tensors only while the differential gate is active."""
+    if (
+        value is not None
+        and _mixed_spec_debug_aux_capture is not None
+        and layer_id in _MIXED_SPEC_DEBUG_AUX_LAYERS
+    ):
+        _mixed_spec_debug_aux_capture.setdefault(name, {})[layer_id] = (
+            value.detach().clone()
+        )
+    return value
 
 
 class IndexerTopkCapturer(BaseTopkCapturer):

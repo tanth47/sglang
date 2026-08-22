@@ -96,6 +96,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.state_capturer.indexer_topk import (
     begin_mixed_spec_debug_capture,
+    end_mixed_spec_debug_aux_capture,
     end_mixed_spec_debug_capture,
 )
 from sglang.srt.utils.async_probe import (
@@ -1361,6 +1362,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "mean_abs": mean_abs,
             }
 
+        def concat_aux_captures(prefill_capture, verify_capture):
+            return {
+                name: {
+                    layer_id: torch.cat(
+                        [
+                            prefill_capture[name][layer_id],
+                            verify_capture[name][layer_id],
+                        ]
+                    )
+                    for layer_id in prefill_capture[name].keys()
+                    & verify_capture[name].keys()
+                }
+                for name in prefill_capture.keys() & verify_capture.keys()
+            }
+
         def capture_kv(out_cache_loc: torch.Tensor):
             pool = self.target_worker.model_runner.token_to_kv_pool
             start_layer = getattr(pool, "start_layer", 0) or 0
@@ -1424,6 +1440,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=capture_mode,
             )
         prefill_reference_topk = end_mixed_spec_debug_capture()
+        prefill_reference_aux = end_mixed_spec_debug_aux_capture()
         prefill_out_cache_loc = prefill_batch.out_cache_loc.detach().clone()
         prefill_reference_logits = clone_tensor(
             prefill_reference.logits_output.next_token_logits
@@ -1453,6 +1470,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 is_verify=True,
             )
         verify_reference_topk = end_mixed_spec_debug_capture()
+        verify_reference_aux = end_mixed_spec_debug_aux_capture()
         verify_out_cache_loc = running_batch.out_cache_loc.detach().clone()
         verify_reference_logits = clone_tensor(
             verify_reference.logits_output.next_token_logits
@@ -1477,7 +1495,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
             for layer_id in prefill_reference_topk.keys()
             & verify_reference_topk.keys()
         }
+        reference_aux = concat_aux_captures(
+            prefill_reference_aux, verify_reference_aux
+        )
         reference_kv = capture_kv(reference_out_cache_loc)
+
+        # Establish the numerical repeatability floor for the exact same split
+        # shapes before attributing any delta to the mixed layout.
+        restore(prefill_batch, prefill_state)
+        restore(running_batch, running_state)
+        with spec_stage_span("mixed_differential_split_prefill_repeat"):
+            prefill_repeat = self.target_worker.forward_batch_generation(
+                prefill_batch,
+                is_verify=True,
+                capture_hidden_mode=capture_mode,
+            )
+        running_batch.spec_info = verify_input
+        with self.plan_stream_ctx:
+            verify_forward_batch_repeat, can_run_cuda_graph = (
+                eagle_prepare_for_verify(
+                    verify_input,
+                    self.req_to_token_pool,
+                    running_batch,
+                    self.target_worker,
+                )
+            )
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+        assert not can_run_cuda_graph
+        with spec_stage_span("mixed_differential_split_verify_repeat"):
+            verify_repeat = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch_repeat,
+                is_verify=True,
+            )
+        split_repeat_logits = torch.cat(
+            [
+                clone_tensor(prefill_repeat.logits_output.next_token_logits),
+                clone_tensor(verify_repeat.logits_output.next_token_logits),
+            ]
+        )
+        split_repeat_hidden = torch.cat(
+            [
+                clone_tensor(prefill_repeat.logits_output.hidden_states),
+                clone_tensor(verify_repeat.logits_output.hidden_states),
+            ]
+        )
 
         restore(prefill_batch, prefill_state)
         restore(running_batch, running_state)
@@ -1492,6 +1557,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=capture_mode,
             )
         mixed_indexer_topk = end_mixed_spec_debug_capture()
+        mixed_aux = end_mixed_spec_debug_aux_capture()
         mixed_logits = clone_tensor(mixed_output.logits_output.next_token_logits)
         mixed_hidden = clone_tensor(mixed_output.logits_output.hidden_states)
         mixed_out_cache_loc = prefill_batch.out_cache_loc.detach().clone()
@@ -1500,6 +1566,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         comparisons = {
             "logits": compare(reference_logits, mixed_logits),
             "hidden": compare(reference_hidden, mixed_hidden),
+            "split_repeatability": {
+                "logits": compare(reference_logits, split_repeat_logits),
+                "hidden": compare(reference_hidden, split_repeat_hidden),
+            },
             "out_cache_loc_exact": torch.equal(
                 reference_out_cache_loc, mixed_out_cache_loc
             ),
@@ -1512,6 +1582,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             & mixed_indexer_topk.keys()
         }
         comparisons["indexer_topk"] = indexer_topk_comparisons
+        aux_comparisons = {
+            name: {
+                layer_id: compare(
+                    reference_aux[name][layer_id], mixed_aux[name][layer_id]
+                )
+                for layer_id in reference_aux[name].keys()
+                & mixed_aux[name].keys()
+            }
+            for name in reference_aux.keys() & mixed_aux.keys()
+        }
+        comparisons["aux"] = aux_comparisons
         kv_comparisons = {
             name: compare(reference_kv[name], mixed_kv[name])
             for name in reference_kv.keys() & mixed_kv.keys()
@@ -1520,8 +1601,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass_checks = [
             comparisons["logits"].get("allclose_1e-2", False),
             comparisons["hidden"].get("allclose_1e-2", False),
+            comparisons["split_repeatability"]["logits"].get(
+                "allclose_1e-2", False
+            ),
+            comparisons["split_repeatability"]["hidden"].get(
+                "allclose_1e-2", False
+            ),
             comparisons["out_cache_loc_exact"],
             bool(indexer_topk_comparisons),
+            bool(aux_comparisons),
             bool(kv_comparisons),
         ]
         pass_checks.extend(
@@ -1531,6 +1619,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass_checks.extend(
             result.get("allclose_1e-2", False)
             for result in kv_comparisons.values()
+        )
+        pass_checks.extend(
+            result.get(
+                "exact" if name == "mapped_page_table" else "allclose_1e-2",
+                False,
+            )
+            for name, layer_results in aux_comparisons.items()
+            for result in layer_results.values()
         )
 
         artifact = {
@@ -1556,6 +1652,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     layer_id: value.cpu()
                     for layer_id, value in reference_indexer_topk.items()
                 },
+                "aux": {
+                    name: {
+                        layer_id: value.cpu()
+                        for layer_id, value in layer_values.items()
+                    }
+                    for name, layer_values in reference_aux.items()
+                },
                 "kv": {name: value.cpu() for name, value in reference_kv.items()},
             },
             "mixed": {
@@ -1565,6 +1668,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "indexer_topk": {
                     layer_id: value.cpu()
                     for layer_id, value in mixed_indexer_topk.items()
+                },
+                "aux": {
+                    name: {
+                        layer_id: value.cpu()
+                        for layer_id, value in layer_values.items()
+                    }
+                    for name, layer_values in mixed_aux.items()
                 },
                 "kv": {name: value.cpu() for name, value in mixed_kv.items()},
             },

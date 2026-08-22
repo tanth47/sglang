@@ -192,6 +192,9 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_mixed_spec_debug_tensor,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -2262,6 +2265,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        maybe_capture_mixed_spec_debug_tensor(
+            "self_attn_output", self.layer_id, hidden_states
+        )
         get_attn_tp_context().clear_attn_inputs()
 
         maybe_prefetch_next_full_attention_kv(
@@ -2270,6 +2276,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        maybe_capture_mixed_spec_debug_tensor(
+            "mlp_input", self.layer_id, hidden_states
         )
 
         fuse_mlp_allreduce = (
@@ -2318,6 +2327,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        maybe_capture_mixed_spec_debug_tensor(
+            "layer_output", self.layer_id, hidden_states
+        )
 
         return hidden_states, residual, topk_indices
 

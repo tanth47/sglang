@@ -66,6 +66,9 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_mixed_spec_debug_tensor,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -1987,6 +1990,10 @@ class DeepseekSparseAttnBackend(
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
+
+        maybe_capture_mixed_spec_debug_tensor(
+            "mapped_page_table", layer.layer_id, page_table_1
+        )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
