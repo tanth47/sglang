@@ -140,9 +140,106 @@ def _generate(
         output["error"] = repr(exc)
 
 
+def _generate_stream(
+    base_url: str,
+    mode: str,
+    run_id: str,
+    spec: dict[str, Any],
+    output: dict[str, Any],
+    barrier: threading.Event,
+    barrier_tokens: int,
+) -> None:
+    started_at = time.monotonic()
+    try:
+        with requests.post(
+            f"{base_url}/generate",
+            json={
+                "rid": f"g4-{mode}-{run_id}-{spec['name']}",
+                "text": spec["text"],
+                "stream": True,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": spec["max_new_tokens"],
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": 0,
+                "return_text_in_logprobs": False,
+            },
+            stream=True,
+            timeout=300,
+        ) as response:
+            response.raise_for_status()
+            token_ids = []
+            last_body = None
+            stream_chunks = 0
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if isinstance(raw_line, bytes):
+                    raw_line = raw_line.decode("utf-8")
+                if not raw_line or not raw_line.startswith("data:"):
+                    continue
+                payload = raw_line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                body = json.loads(payload)
+                if "error" in body:
+                    raise RuntimeError(f"Streaming generation failed: {body}")
+                meta_info = body["meta_info"]
+                token_ids.extend(_token_ids(meta_info))
+                completion_tokens = int(meta_info["completion_tokens"])
+                output["stream_completion_tokens"] = completion_tokens
+                stream_chunks += 1
+                last_body = body
+                if completion_tokens >= barrier_tokens:
+                    barrier.set()
+
+        if last_body is None:
+            raise AssertionError(f"{spec['name']}: empty streaming response")
+        meta_info = last_body["meta_info"]
+        completion_tokens = int(meta_info["completion_tokens"])
+        if len(token_ids) != completion_tokens:
+            raise AssertionError(
+                f"{spec['name']}: streamed {len(token_ids)=} != "
+                f"{completion_tokens=}"
+            )
+        if completion_tokens < barrier_tokens:
+            raise AssertionError(
+                f"{spec['name']}: completed before barrier "
+                f"{completion_tokens=} < {barrier_tokens=}"
+            )
+        output.update(
+            {
+                "status_code": response.status_code,
+                "text": last_body["text"],
+                "token_ids": token_ids,
+                "finish_reason": meta_info.get("finish_reason"),
+                "prompt_tokens": int(meta_info["prompt_tokens"]),
+                "completion_tokens": completion_tokens,
+                "spec_accept_rate": meta_info.get("spec_accept_rate"),
+                "spec_accept_length": meta_info.get("spec_accept_length"),
+                "spec_num_correct_drafts": meta_info.get(
+                    "spec_num_correct_drafts"
+                ),
+                "spec_num_proposed_drafts": meta_info.get(
+                    "spec_num_proposed_drafts"
+                ),
+                "spec_verify_ct": meta_info.get("spec_verify_ct"),
+                "stream_chunks": stream_chunks,
+                "elapsed_seconds": time.monotonic() - started_at,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - manual diagnostic path
+        output["error"] = repr(exc)
+        barrier.set()
+
+
 def capture(args: argparse.Namespace) -> None:
     if args.max_new_tokens_cap is not None and args.max_new_tokens_cap <= 0:
         raise ValueError("--max-new-tokens-cap must be positive")
+    if args.serial and args.stream_barrier:
+        raise ValueError("--serial and --stream-barrier are mutually exclusive")
+    if args.stream_barrier and args.barrier_timeout_seconds <= 0:
+        raise ValueError("--barrier-timeout-seconds must be positive")
     health = requests.get(f"{args.base_url}/health", timeout=10)
     health.raise_for_status()
     cache_flush_response = None
@@ -157,28 +254,81 @@ def capture(args: argparse.Namespace) -> None:
             spec["max_new_tokens"] = min(
                 spec["max_new_tokens"], args.max_new_tokens_cap
             )
+    if args.stream_barrier:
+        for spec, barrier_tokens in zip(
+            specs[:2],
+            (args.alpha_barrier_tokens, args.beta_barrier_tokens),
+        ):
+            if not 0 < barrier_tokens <= spec["max_new_tokens"]:
+                raise ValueError(
+                    f"{spec['name']} barrier must be in [1, "
+                    f"{spec['max_new_tokens']}]"
+                )
     run_id = args.run_id or str(time.time_ns())
     outputs = {spec["name"]: {} for spec in specs}
     threads: dict[str, threading.Thread] = {}
 
-    def start(spec: dict[str, Any]) -> None:
+    def start(
+        spec: dict[str, Any],
+        barrier: threading.Event | None = None,
+        barrier_tokens: int | None = None,
+    ) -> None:
+        target = _generate
+        thread_args: tuple[Any, ...] = (
+            args.base_url,
+            args.mode,
+            run_id,
+            spec,
+            outputs[spec["name"]],
+        )
+        if barrier is not None:
+            if barrier_tokens is None:
+                raise AssertionError("A stream barrier requires a token count")
+            target = _generate_stream
+            thread_args += (barrier, barrier_tokens)
         thread = threading.Thread(
-            target=_generate,
-            args=(
-                args.base_url,
-                args.mode,
-                run_id,
-                spec,
-                outputs[spec["name"]],
-            ),
+            target=target,
+            args=thread_args,
         )
         threads[spec["name"]] = thread
         thread.start()
 
+    trigger = {"type": "serial" if args.serial else "wall_clock"}
     if args.serial:
         for spec in specs:
             start(spec)
             threads[spec["name"]].join(timeout=360)
+            if threads[spec["name"]].is_alive():
+                raise AssertionError(f"Serial request timed out: {spec['name']}")
+    elif args.stream_barrier:
+        alpha_barrier = threading.Event()
+        beta_barrier = threading.Event()
+        start(specs[0], alpha_barrier, args.alpha_barrier_tokens)
+        if not alpha_barrier.wait(args.barrier_timeout_seconds):
+            raise AssertionError("decode_alpha did not reach its stream barrier")
+        if "error" in outputs[specs[0]["name"]]:
+            raise AssertionError(outputs[specs[0]["name"]]["error"])
+        start(specs[1], beta_barrier, args.beta_barrier_tokens)
+        if not beta_barrier.wait(args.barrier_timeout_seconds):
+            raise AssertionError("decode_beta did not reach its stream barrier")
+        if "error" in outputs[specs[1]["name"]]:
+            raise AssertionError(outputs[specs[1]["name"]]["error"])
+        trigger = {
+            "type": "stream_token_barrier",
+            "alpha_barrier_tokens": args.alpha_barrier_tokens,
+            "beta_barrier_tokens": args.beta_barrier_tokens,
+            "observed_at_prefill_launch": {
+                spec["name"]: outputs[spec["name"]].get(
+                    "stream_completion_tokens"
+                )
+                for spec in specs[:2]
+            },
+        }
+        prefill_specs = specs[2:]
+        for index, spec in enumerate(prefill_specs):
+            start(spec)
+            if index + 1 < len(prefill_specs):
+                time.sleep(args.prefill_request_stagger_seconds)
     else:
         # Staggering gives the two running requests different decode lengths
         # before the three heterogeneous prefills arrive together.
@@ -209,6 +359,7 @@ def capture(args: argparse.Namespace) -> None:
         "cache_flushed_before": args.flush_cache_before,
         "cache_flush_response": cache_flush_response,
         "scheduling": "serial" if args.serial else "concurrent",
+        "trigger": trigger,
         "max_new_tokens_cap": args.max_new_tokens_cap,
         "health_before": health.status_code,
         "health_after": final_health.status_code,
@@ -472,6 +623,12 @@ def main() -> None:
     capture_parser.add_argument("--run-id")
     capture_parser.add_argument("--flush-cache-before", action="store_true")
     capture_parser.add_argument("--serial", action="store_true")
+    capture_parser.add_argument("--stream-barrier", action="store_true")
+    capture_parser.add_argument("--alpha-barrier-tokens", type=int, default=8)
+    capture_parser.add_argument("--beta-barrier-tokens", type=int, default=4)
+    capture_parser.add_argument(
+        "--barrier-timeout-seconds", type=float, default=120
+    )
     capture_parser.add_argument("--max-new-tokens-cap", type=int)
     capture_parser.add_argument("--decode-stagger-seconds", type=float, default=0.6)
     capture_parser.add_argument("--prefill-delay-seconds", type=float, default=0.6)
