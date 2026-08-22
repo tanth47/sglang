@@ -11,6 +11,25 @@ from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
 
+_mixed_spec_debug_capture: Optional[dict[int, torch.Tensor]] = None
+
+
+def begin_mixed_spec_debug_capture() -> None:
+    """Capture only the current forward's indexer top-k tensors on device."""
+    global _mixed_spec_debug_capture
+    if _mixed_spec_debug_capture is not None:
+        raise RuntimeError("A mixed-spec indexer capture is already active.")
+    _mixed_spec_debug_capture = {}
+
+
+def end_mixed_spec_debug_capture() -> dict[int, torch.Tensor]:
+    global _mixed_spec_debug_capture
+    if _mixed_spec_debug_capture is None:
+        raise RuntimeError("No mixed-spec indexer capture is active.")
+    captured = _mixed_spec_debug_capture
+    _mixed_spec_debug_capture = None
+    return captured
+
 
 class IndexerTopkCapturer(BaseTopkCapturer):
     def __init__(
@@ -66,6 +85,8 @@ def maybe_capture_indexer_topk(
     """
     if topk_indices is None:
         return None
+    if _mixed_spec_debug_capture is not None:
+        _mixed_spec_debug_capture[layer_id] = topk_indices.detach().clone()
     if (cap := get_global_indexer_capturer()) is not None:
         cap.capture(layer_id=layer_id, topk_indices=topk_indices)
     return topk_indices
