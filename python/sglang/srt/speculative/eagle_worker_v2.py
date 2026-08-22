@@ -75,7 +75,11 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
-from sglang.srt.speculative.mixed_spec_info import MixedSpecMode
+from sglang.srt.speculative.mixed_spec_info import (
+    EAGLE_VERIFY_WIDTH,
+    MixedSpecBatchInfo,
+    MixedSpecMode,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -1221,6 +1225,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def forward_mixed_spec_verify_target_for_differential(
+        self,
+        prefill_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,
+    ) -> tuple[GenerationBatchResult, EagleVerifyInput, MixedSpecBatchInfo]:
+        """Run one eager top-k=1 mixed target forward without acceptance.
+
+        This V1 entry point is intentionally not called by the serving
+        scheduler. It exists for the split-vs-mixed differential gate: draft
+        the running partition, compose ``[prefill rows..., 6 verify rows...]``,
+        and run one target forward with sampling disabled. The caller must use
+        disposable/transactional batch state because target KV rows are written.
+        """
+        assert self.topk == 1, "Mixed verify V1 only supports a linear EAGLE tree."
+        assert prefill_batch.forward_mode.is_extend()
+        assert running_batch.forward_mode.is_decode()
+        assert prefill_batch.input_ids is not None
+        assert running_batch.spec_info is not None
+        assert not prefill_batch.return_logprob
+        assert not running_batch.return_logprob
+        assert not prefill_batch.has_grammar
+        assert not running_batch.has_grammar
+
+        self.activate_step_by_batch(running_batch.batch_size())
+        assert self.speculative_num_draft_tokens == EAGLE_VERIFY_WIDTH, (
+            "Mixed verify V1 requires exactly six target verify rows per request."
+        )
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("mixed_draft"),
+        ):
+            verify_input = self.draft_worker.draft(running_batch)
+
+        assert verify_input.is_verify_input()
+        mixed_spec_info = prefill_batch.mix_with_running_verify(
+            running_batch, verify_input
+        )
+        assert mixed_spec_info.mode is MixedSpecMode.VERIFY
+
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        with spec_stage_span("mixed_target_verify"):
+            batch_output = self.target_worker.forward_batch_generation(
+                prefill_batch,
+                is_verify=True,
+                capture_hidden_mode=target_capture_mode,
+            )
+
+        logits = batch_output.logits_output.next_token_logits
+        if logits is not None:
+            mixed_spec_info.split_target_outputs(logits)
+        hidden_states = batch_output.logits_output.hidden_states
+        if hidden_states is not None and target_capture_mode.is_full():
+            mixed_spec_info.split_flattened_tokens(hidden_states)
+
+        return batch_output, verify_input, mixed_spec_info
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

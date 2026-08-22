@@ -9,6 +9,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.logits_processor import (  # noqa: E402
+    LogitsMetadata,
+    LogitsProcessor,
+)
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
@@ -17,7 +21,9 @@ from sglang.srt.managers.scheduler import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.mixed_spec_info import (  # noqa: E402
+    EAGLE_VERIFY_WIDTH,
     MixedSpecBatchInfo,
     MixedSpecMode,
 )
@@ -49,6 +55,50 @@ class TestMixedSpecBatchInfo(unittest.TestCase):
     def test_target_only_layout_rejects_empty_decode_partition(self):
         with self.assertRaisesRegex(ValueError, "at least one decode request"):
             MixedSpecBatchInfo.target_only([3], decode_bs=0)
+
+    def test_verify_layout_and_output_partitions_are_authoritative(self):
+        info = MixedSpecBatchInfo.verify([3, 5], verify_bs=2)
+
+        self.assertIs(info.mode, MixedSpecMode.VERIFY)
+        self.assertEqual(info.query_lens, (3, 5, 6, 6))
+        self.assertEqual(info.query_start_loc, (0, 3, 8, 14, 20))
+        self.assertEqual(info.prefill_num_tokens, 8)
+        self.assertEqual(info.verify_num_tokens, 12)
+        self.assertEqual(info.target_logit_row_indices, (2, 7, *range(8, 20)))
+        self.assertEqual(info.target_output_rows, 14)
+        self.assertEqual(
+            info.causal_context_lens([0, 0, 10, 20]),
+            (
+                1,
+                2,
+                3,
+                1,
+                2,
+                3,
+                4,
+                5,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+            ),
+        )
+
+        prefill, verify = info.split_target_outputs(torch.arange(14))
+        self.assertTrue(torch.equal(prefill, torch.tensor([0, 1])))
+        self.assertTrue(torch.equal(verify, torch.arange(2, 14)))
+
+        prefill_tokens, verify_tokens = info.split_flattened_tokens(torch.arange(20))
+        self.assertTrue(torch.equal(prefill_tokens, torch.arange(8)))
+        self.assertTrue(torch.equal(verify_tokens, torch.arange(8, 20)))
 
 
 class TestPrepareMixedSpecTargetOnly(unittest.TestCase):
@@ -97,6 +147,177 @@ class TestPrepareMixedSpecTargetOnly(unittest.TestCase):
             torch.equal(batch.orig_seq_lens, torch.tensor([4, 6], dtype=torch.int32))
         )
         self.assertEqual([req.kv_committed_len for req in reqs], [3, 5])
+
+
+class TestPrepareMixedSpecVerify(unittest.TestCase):
+    def test_stages_six_reserved_rows_without_committing_request_kv(self):
+        reqs = [
+            types.SimpleNamespace(kv_committed_len=3),
+            types.SimpleNamespace(kv_committed_len=5),
+        ]
+        req_to_token = torch.tensor(
+            [
+                [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
+                [200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211],
+            ],
+            dtype=torch.int64,
+        )
+        draft_token = torch.arange(12, dtype=torch.int64)
+        verify_input = types.SimpleNamespace(
+            draft_token=draft_token,
+            draft_token_num=EAGLE_VERIFY_WIDTH,
+        )
+        batch = ScheduleBatch(
+            reqs=reqs,
+            device="cpu",
+            enable_overlap=False,
+            spec_algorithm=_SpecAlgorithm(),
+            req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+            req_pool_indices=torch.tensor([1, 0], dtype=torch.int64),
+            seq_lens=torch.tensor([3, 5], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int64),
+            orig_seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        )
+
+        running_input_ids, prefix_lens = batch.prepare_for_mixed_spec_verify(
+            verify_input
+        )
+
+        self.assertIs(running_input_ids, draft_token)
+        self.assertEqual(prefix_lens, [3, 5])
+        self.assertTrue(
+            torch.equal(
+                batch.out_cache_loc,
+                torch.tensor(
+                    [203, 204, 205, 206, 207, 208, 105, 106, 107, 108, 109, 110]
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(batch.seq_lens, torch.tensor([9, 11])))
+        self.assertTrue(torch.equal(batch.seq_lens_cpu, torch.tensor([9, 11])))
+        self.assertTrue(
+            torch.equal(batch.orig_seq_lens, torch.tensor([9, 11], dtype=torch.int32))
+        )
+        self.assertEqual([req.kv_committed_len for req in reqs], [3, 5])
+
+    def test_composes_exact_heterogeneous_target_forward_accounting(self):
+        model_config = types.SimpleNamespace(is_encoder_decoder=False)
+        prefill_sampling_info = MagicMock()
+        running_sampling_info = MagicMock()
+        prefill_batch = ScheduleBatch(
+            reqs=[types.SimpleNamespace(), types.SimpleNamespace()],
+            device="cpu",
+            enable_overlap=False,
+            spec_algorithm=_SpecAlgorithm(),
+            model_config=model_config,
+            sampling_info=prefill_sampling_info,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([3, 5], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int64),
+            orig_seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            out_cache_loc=torch.arange(8, dtype=torch.int64),
+            input_ids=torch.arange(8, dtype=torch.int64),
+            prefix_lens=[0, 0],
+            extend_lens=[3, 5],
+            extend_num_tokens=8,
+            extend_logprob_start_lens=[0, 0],
+            is_prefill_only=False,
+            return_logprob=False,
+            has_grammar=False,
+            return_hidden_states=False,
+        )
+
+        req_to_token = torch.arange(4 * 40, dtype=torch.int64).reshape(4, 40)
+        running_reqs = [
+            types.SimpleNamespace(kv_committed_len=10),
+            types.SimpleNamespace(kv_committed_len=20),
+        ]
+        running_batch = ScheduleBatch(
+            reqs=running_reqs,
+            device="cpu",
+            enable_overlap=False,
+            spec_algorithm=_SpecAlgorithm(),
+            model_config=model_config,
+            sampling_info=running_sampling_info,
+            req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+            req_pool_indices=torch.tensor([2, 3], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([2, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int64),
+            orig_seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+            is_prefill_only=False,
+            return_logprob=False,
+            has_grammar=False,
+            return_hidden_states=False,
+        )
+        verify_input = types.SimpleNamespace(
+            draft_token=torch.arange(100, 112, dtype=torch.int64),
+            draft_token_num=EAGLE_VERIFY_WIDTH,
+        )
+
+        info = prefill_batch.mix_with_running_verify(running_batch, verify_input)
+
+        self.assertIs(info.mode, MixedSpecMode.VERIFY)
+        self.assertEqual(tuple(prefill_batch.extend_lens), (3, 5, 6, 6))
+        self.assertEqual(prefill_batch.extend_num_tokens, 20)
+        self.assertEqual(prefill_batch.prefix_lens, [0, 0, 10, 20])
+        self.assertTrue(
+            torch.equal(prefill_batch.seq_lens, torch.tensor([3, 5, 16, 26]))
+        )
+        self.assertTrue(
+            torch.equal(
+                prefill_batch.input_ids,
+                torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, *range(100, 112)]),
+            )
+        )
+        self.assertEqual(prefill_batch.out_cache_loc.numel(), 20)
+        self.assertIsNone(prefill_batch.spec_info)
+        self.assertEqual([req.kv_committed_len for req in running_reqs], [10, 20])
+        prefill_sampling_info.merge_batch.assert_called_once_with(
+            running_sampling_info
+        )
+
+
+class TestMixedSpecVerifyLogits(unittest.TestCase):
+    def test_keeps_prefill_last_rows_and_every_verify_row(self):
+        info = MixedSpecBatchInfo.verify([3, 5], verify_bs=2)
+        hidden_states = torch.arange(40, dtype=torch.float32).reshape(20, 2)
+        before_norm = hidden_states + 100
+        aux_hidden_states = [hidden_states + 200, hidden_states + 300]
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.MIXED,
+            extend_seq_lens=torch.tensor(info.query_lens, dtype=torch.int32),
+            mixed_spec_info=info,
+        )
+
+        (
+            pruned_states,
+            pruned_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+        ) = LogitsProcessor._get_pruned_states(
+            None,
+            hidden_states,
+            before_norm,
+            aux_hidden_states,
+            metadata,
+        )
+
+        expected = torch.tensor(info.target_logit_row_indices)
+        self.assertTrue(torch.equal(pruned_states, hidden_states[expected]))
+        self.assertTrue(torch.equal(pruned_before_norm, before_norm[expected]))
+        self.assertTrue(
+            torch.equal(aux_pruned_states[0], aux_hidden_states[0][expected])
+        )
+        self.assertTrue(
+            torch.equal(aux_pruned_states[1], aux_hidden_states[1][expected])
+        )
+        self.assertIsNone(sample_indices)
+        self.assertIsNone(input_logprob_indices)
+        self.assertEqual(token_to_seq_idx, [])
 
 
 class TestMixedSpecInputResolution(unittest.TestCase):

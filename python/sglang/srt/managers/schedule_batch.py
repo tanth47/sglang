@@ -109,7 +109,11 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
+from sglang.srt.speculative.mixed_spec_info import (
+    EAGLE_VERIFY_WIDTH,
+    MixedSpecBatchInfo,
+    MixedSpecMode,
+)
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -2571,14 +2575,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         *,
         running_input_ids: Optional[torch.Tensor] = None,
         mixed_spec_info: Optional[MixedSpecBatchInfo] = None,
+        running_prefix_lens: Optional[List[int]] = None,
     ):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        if mixed_spec_info is not None:
+            assert mixed_spec_info.prefill_bs == self.batch_size()
+            assert mixed_spec_info.decode_bs == running_bs
+            assert (
+                mixed_spec_info.query_lens[: mixed_spec_info.prefill_bs]
+                == tuple(self.extend_lens)
+            )
+        is_mixed_verify = (
+            mixed_spec_info is not None
+            and mixed_spec_info.mode is MixedSpecMode.VERIFY
+        )
 
-        for req in running_batch.reqs:
-            req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+        if not is_mixed_verify:
+            for req in running_batch.reqs:
+                req._refresh_fill_ids()
+                full_len = len(req.full_untruncated_fill_ids)
+                req.set_extend_range(full_len - 1, full_len)
+        else:
+            assert running_prefix_lens is not None
+            assert len(running_prefix_lens) == running_bs
 
         # Non-spec/overlap decode tokens live in FutureMap. Synchronous spec-v2
         # passes its bonus tokens directly because it does not populate FutureMap.
@@ -2596,12 +2616,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens = self.prefix_lens + [
-            len(r.origin_input_ids) + len(r.output_ids) + delta
-            for r in running_batch.reqs
-        ]
-        self.extend_lens = self.extend_lens + [1] * running_bs
-        self.extend_num_tokens = self.extend_num_tokens + running_bs
+        if is_mixed_verify:
+            running_query_lens = list(
+                mixed_spec_info.query_lens[mixed_spec_info.prefill_bs :]
+            )
+            self.prefix_lens = self.prefix_lens + running_prefix_lens
+            self.extend_lens = self.extend_lens + running_query_lens
+            self.extend_num_tokens = self.extend_num_tokens + sum(running_query_lens)
+        else:
+            self.prefix_lens = self.prefix_lens + [
+                len(r.origin_input_ids) + len(r.output_ids) + delta
+                for r in running_batch.reqs
+            ]
+            self.extend_lens = self.extend_lens + [1] * running_bs
+            self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs
@@ -2612,6 +2640,46 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if mixed_spec_info is not None:
             assert tuple(self.extend_lens) == mixed_spec_info.query_lens
             assert self.extend_num_tokens == mixed_spec_info.num_tokens
+
+    def mix_with_running_verify(
+        self, running_batch: ScheduleBatch, verify_input
+    ) -> MixedSpecBatchInfo:
+        """Compose a resolved prefill batch and a six-row EAGLE verify batch.
+
+        This is a forward-only V1 primitive. It deliberately clears ``spec_info``
+        on the combined target batch so MIXED uses heterogeneous extend metadata,
+        not the uniform TARGET_VERIFY metadata. Acceptance and request-level KV
+        commit remain separate later-stage operations.
+        """
+        assert self.input_ids is not None
+        prefill_input_ids = self.input_ids
+        prefill_query_lens = tuple(self.extend_lens)
+
+        running_input_ids, running_prefix_lens = (
+            running_batch.prepare_for_mixed_spec_verify(verify_input)
+        )
+        mixed_spec_info = MixedSpecBatchInfo.verify(
+            prefill_query_lens, verify_bs=running_batch.batch_size()
+        )
+        self.mix_with_running(
+            running_batch,
+            running_input_ids=running_input_ids,
+            mixed_spec_info=mixed_spec_info,
+            running_prefix_lens=running_prefix_lens,
+        )
+
+        self.input_ids = torch.cat(
+            [
+                prefill_input_ids,
+                running_input_ids.to(
+                    device=prefill_input_ids.device,
+                    dtype=prefill_input_ids.dtype,
+                ),
+            ]
+        )
+        self.mix_running_input_ids = None
+        self.spec_info = None
+        return mixed_spec_info
 
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
@@ -2894,6 +2962,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         return running_input_ids
+
+    def prepare_for_mixed_spec_verify(
+        self, verify_input
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Stage all six EAGLE verify rows without committing request KV state.
+
+        The generic MIXED attention path expects ``seq_lens`` to include every
+        row in the heterogeneous extend. Return the old lengths separately so
+        the caller can use them as the running partition's prefix lengths.
+        """
+        assert not self.spec_algorithm.is_none()
+        assert not self.enable_overlap
+        assert verify_input.draft_token_num == EAGLE_VERIFY_WIDTH
+        assert (
+            verify_input.draft_token.numel()
+            == self.batch_size() * EAGLE_VERIFY_WIDTH
+        )
+        assert self.seq_lens_cpu is not None
+
+        prefix_lens = [int(x) for x in self.seq_lens_cpu.tolist()]
+        offsets = torch.arange(EAGLE_VERIFY_WIDTH, device=self.seq_lens.device)
+        write_positions = self.seq_lens[:, None] + offsets[None, :]
+        self.out_cache_loc = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices[:, None], write_positions
+        ].reshape(-1)
+
+        self.seq_lens = self.seq_lens + EAGLE_VERIFY_WIDTH
+        self.seq_lens_cpu = self.seq_lens_cpu + EAGLE_VERIFY_WIDTH
+        if self.orig_seq_lens is not None:
+            self.orig_seq_lens = self.orig_seq_lens + EAGLE_VERIFY_WIDTH
+        self.seq_lens_sum = None
+
+        return verify_input.draft_token, prefix_lens
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE

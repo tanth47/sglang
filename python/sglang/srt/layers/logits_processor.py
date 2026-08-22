@@ -48,6 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo, MixedSpecMode
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -242,6 +243,9 @@ class LogitsMetadata:
     # EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # Host-side row layout for mixed prefill + speculative target forwards.
+    mixed_spec_info: Optional[MixedSpecBatchInfo] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -298,6 +302,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            mixed_spec_info=forward_batch.mixed_spec_info,
         )
 
     def compute_dp_attention_metadata(self):
@@ -506,6 +511,35 @@ class LogitsProcessor(nn.Module):
             pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
+            sample_indices = None
+            input_logprob_indices = None
+
+        elif (
+            logits_metadata.mixed_spec_info is not None
+            and logits_metadata.mixed_spec_info.mode is MixedSpecMode.VERIFY
+        ):
+            if logits_metadata.extend_return_logprob:
+                raise ValueError(
+                    "Mixed EAGLE verify does not support prompt input logprobs yet."
+                )
+            info = logits_metadata.mixed_spec_info
+            if hidden_states.shape[0] < info.num_tokens:
+                raise ValueError(
+                    f"Mixed target forward has {hidden_states.shape[0]} hidden rows, "
+                    f"but its layout requires {info.num_tokens}."
+                )
+            target_rows = torch.tensor(
+                info.target_logit_row_indices,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            pruned_states = hidden_states[target_rows]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[target_rows]
+            if aux_hidden_states is not None:
+                aux_pruned_states = [
+                    hidden[target_rows] for hidden in aux_hidden_states
+                ]
             sample_indices = None
             input_logprob_indices = None
 
