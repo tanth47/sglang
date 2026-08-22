@@ -383,7 +383,42 @@ class SamplingBatchInfo:
         return merged_dict
 
     def merge_batch(self, other: SamplingBatchInfo):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self_len = len(self)
+        other_len = len(other)
+
+        if (
+            self.penalizer_orchestrator is not None
+            and other.penalizer_orchestrator is not None
+        ):
+            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        else:
+            # Scheduler forward isolation replaces the scheduled batch's
+            # orchestrator with pre-accumulated penalty tensors. Mixed forwards
+            # can then merge that forward-only batch with a still-scheduled
+            # running batch. Preserve the forward-only representation instead
+            # of trying to call merge() through a None orchestrator.
+            if self.penalizer_orchestrator is not None:
+                self.update_penalties()
+                self.penalizer_orchestrator = None
+            if other.penalizer_orchestrator is not None:
+                other.update_penalties()
+
+            self.acc_additive_penalties = merge_bias_tensor(
+                self.acc_additive_penalties,
+                other.acc_additive_penalties,
+                self_len,
+                other_len,
+                self.device,
+                0.0,
+            )
+            self.acc_scaling_penalties = merge_bias_tensor(
+                self.acc_scaling_penalties,
+                other.acc_scaling_penalties,
+                self_len,
+                other_len,
+                self.device,
+                1.0,
+            )
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
@@ -404,9 +439,6 @@ class SamplingBatchInfo:
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
-
-        self_len = len(self)
-        other_len = len(other)
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

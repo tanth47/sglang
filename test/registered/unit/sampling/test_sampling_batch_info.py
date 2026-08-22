@@ -330,6 +330,42 @@ class TestFilterBatch(CustomTestCase):
 # merge_batch
 class TestMergeBatch(CustomTestCase):
 
+    def test_merge_forward_only_with_scheduled_penalties(self):
+        """Mixed forward merge keeps neutral rows and materialized penalties."""
+        info1 = _make_info(batch_size=2, penalizer_orchestrator=None)
+        info1.acc_additive_penalties = torch.full((2, VOCAB_SIZE), 2.0)
+        info1.acc_scaling_penalties = torch.full((2, VOCAB_SIZE), 3.0)
+
+        orchestrator = MagicMock(is_required=True)
+        orchestrator.accumulate_additive_penalties.side_effect = lambda out: out.fill_(
+            5.0
+        )
+        orchestrator.accumulate_scaling_penalties.return_value = torch.full(
+            (1, VOCAB_SIZE), 7.0
+        )
+        info2 = _make_info(batch_size=1, penalizer_orchestrator=orchestrator)
+
+        info1.merge_batch(info2)
+
+        self.assertIsNone(info1.penalizer_orchestrator)
+        self.assertEqual(info1.acc_additive_penalties.shape, (3, VOCAB_SIZE))
+        self.assertEqual(info1.acc_scaling_penalties.shape, (3, VOCAB_SIZE))
+        self.assertTrue(torch.all(info1.acc_additive_penalties[:2] == 2.0))
+        self.assertTrue(torch.all(info1.acc_additive_penalties[2:] == 5.0))
+        self.assertTrue(torch.all(info1.acc_scaling_penalties[:2] == 3.0))
+        self.assertTrue(torch.all(info1.acc_scaling_penalties[2:] == 7.0))
+
+    def test_merge_forward_only_pads_missing_penalties_with_neutral_values(self):
+        info1 = _make_info(batch_size=1, penalizer_orchestrator=None)
+        info1.acc_additive_penalties = torch.full((1, VOCAB_SIZE), 2.0)
+        info1.acc_scaling_penalties = torch.full((1, VOCAB_SIZE), 3.0)
+        info2 = _make_info(batch_size=2, penalizer_orchestrator=None)
+
+        info1.merge_batch(info2)
+
+        self.assertTrue(torch.all(info1.acc_additive_penalties[1:] == 0.0))
+        self.assertTrue(torch.all(info1.acc_scaling_penalties[1:] == 1.0))
+
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)
