@@ -140,6 +140,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if server_args.speculative_adaptive:
             _init_adaptive_speculative_params(server_args)
 
+    if (
+        getattr(server_args, "enable_mixed_spec_chunk", False)
+        and server_args.speculative_algorithm != "EAGLE"
+    ):
+        raise ValueError(
+            "--enable-mixed-spec-chunk currently requires "
+            "--speculative-algorithm NEXTN or EAGLE."
+        )
+
     if algo is not None:
         algo.handle_server_args(server_args)
 
@@ -482,6 +491,11 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
     if server_args.enable_mixed_chunk:
+        if getattr(server_args, "enable_mixed_spec_chunk", False):
+            raise ValueError(
+                "--enable-mixed-chunk and --enable-mixed-spec-chunk cannot be "
+                "enabled together."
+            )
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
@@ -631,6 +645,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    _validate_mixed_spec_chunk(server_args, model_arch, resolved_view(server_args))
+
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
@@ -645,6 +661,85 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
+        )
+
+
+def _validate_mixed_spec_chunk(server_args: ServerArgs, model_arch: str, view) -> None:
+    """Fail closed for the deliberately narrow first mixed-spec implementation."""
+    if not getattr(server_args, "enable_mixed_spec_chunk", False):
+        return
+
+    unsupported = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            unsupported.append(message)
+
+    require(
+        server_args.speculative_algorithm == "EAGLE",
+        "--speculative-algorithm NEXTN/EAGLE",
+    )
+    require(model_arch == "GlmMoeDsaForCausalLM", "GLM-5.2 DSA target model")
+    require(
+        server_args.chunked_prefill_size is not None
+        and server_args.chunked_prefill_size > 0,
+        "positive --chunked-prefill-size",
+    )
+    require(
+        not getattr(server_args, "enable_mixed_chunk", False),
+        "--enable-mixed-chunk disabled",
+    )
+    require(
+        server_args.speculative_num_steps == 5,
+        "--speculative-num-steps 5",
+    )
+    require(
+        server_args.speculative_eagle_topk == 1,
+        "--speculative-eagle-topk 1",
+    )
+    require(
+        server_args.speculative_num_draft_tokens == 6,
+        "--speculative-num-draft-tokens 6",
+    )
+    require(
+        server_args.speculative_attention_mode == "prefill",
+        "--speculative-attention-mode prefill",
+    )
+    require(
+        server_args.tp_size in (4, 8),
+        "--tp-size 4 for smoke testing or --tp-size 8 for acceptance",
+    )
+    require(server_args.dp_size == 1, "--dp-size 1")
+    require(server_args.pp_size == 1, "--pp-size 1")
+    require(view.disable_overlap_schedule, "--disable-overlap-schedule")
+    require(view.disable_cuda_graph, "eager execution (--disable-cuda-graph)")
+    require(not view.enable_dp_attention, "DP attention disabled")
+    require(
+        view.dsa_prefill_backend == "tilelang"
+        and view.dsa_decode_backend == "tilelang",
+        "TileLang DSA prefill and decode backends",
+    )
+    require(not server_args.speculative_adaptive, "adaptive speculation disabled")
+    require(
+        not view.enable_multi_layer_eagle,
+        "multi-layer EAGLE disabled",
+    )
+    require(
+        not server_args.speculative_use_rejection_sampling,
+        "greedy speculative sampling",
+    )
+    require(server_args.disaggregation_mode == "null", "P/D disaggregation disabled")
+    require(not server_args.enable_lora, "LoRA disabled")
+    require(
+        not view.enable_hisparse and not view.enable_hierarchical_cache,
+        "HiCache/HiSparse disabled",
+    )
+
+    if unsupported:
+        raise ValueError(
+            "--enable-mixed-spec-chunk currently requires: "
+            + "; ".join(unsupported)
+            + ". Disable the flag to use the existing non-mixed scheduler."
         )
 
 

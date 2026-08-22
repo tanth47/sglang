@@ -86,10 +86,19 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
+    - Synchronous mixed spec-v2: direct bonus-token staging from spec_info.
     """
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
-        if batch.mix_running_indices is not None:
+        if batch.mix_running_input_ids is not None:
+            assert batch.mix_running_indices is None
+            decode_gpu = batch.mix_running_input_ids.to(
+                device=batch.device,
+                dtype=prefill_gpu.dtype,
+                non_blocking=True,
+            )
+            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+        elif batch.mix_running_indices is not None:
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(
@@ -102,6 +111,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
+        batch.mix_running_input_ids = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
         if _DEBUG_ASSERT:

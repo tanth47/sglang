@@ -109,6 +109,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -1856,6 +1857,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Authoritative partition/layout for mixed prefill + speculative fallback.
+    mixed_spec_info: Optional[MixedSpecBatchInfo] = None
 
     # For split prefill
     split_index: int = 0
@@ -1885,6 +1888,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # Synchronous spec-v2 keeps the latest target token in spec_info rather
+    # than FutureMap. This staging tensor is consumed by resolve_forward_inputs.
+    mix_running_input_ids: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -2559,7 +2565,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
-    def mix_with_running(self, running_batch: ScheduleBatch):
+    def mix_with_running(
+        self,
+        running_batch: ScheduleBatch,
+        *,
+        running_input_ids: Optional[torch.Tensor] = None,
+        mixed_spec_info: Optional[MixedSpecBatchInfo] = None,
+    ):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2568,9 +2580,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             full_len = len(req.full_untruncated_fill_ids)
             req.set_extend_range(full_len - 1, full_len)
 
-        # Decode tokens of the running portion live in future_map.output_tokens_buf.
+        # Non-spec/overlap decode tokens live in FutureMap. Synchronous spec-v2
+        # passes its bonus tokens directly because it does not populate FutureMap.
         self.input_ids = None
-        self.mix_running_indices = running_batch.req_pool_indices
+        self.mix_running_indices = (
+            running_batch.req_pool_indices if running_input_ids is None else None
+        )
+        self.mix_running_input_ids = running_input_ids
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
@@ -2591,6 +2607,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+        self.mixed_spec_info = mixed_spec_info
+
+        if mixed_spec_info is not None:
+            assert tuple(self.extend_lens) == mixed_spec_info.query_lens
+            assert self.extend_num_tokens == mixed_spec_info.num_tokens
 
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
@@ -2841,8 +2862,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
+    def prepare_for_mixed_spec_target_only(self) -> torch.Tensor:
+        """Prepare one target-only extend row per running spec request.
+
+        Spec-v2 reserves a wider decode region but normally derives target
+        output locations later from a verify tree. A mixed target-only step has
+        no verify tree, so select the already-reserved slot at the current
+        sequence tail and advance only the batch-local sequence lengths. The
+        request's committed watermark advances after the forward succeeds.
+        """
+        assert not self.spec_algorithm.is_none()
+        assert not self.enable_overlap
+
+        self.prepare_for_decode()
+
+        assert self.spec_info is not None
+        running_input_ids = getattr(self.spec_info, "bonus_tokens", None)
+        assert running_input_ids is not None
+        assert running_input_ids.numel() == self.batch_size()
+
+        write_positions = self.seq_lens
+        self.out_cache_loc = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices, write_positions
+        ]
+
+        self.seq_lens = self.seq_lens + 1
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self.seq_lens_cpu + 1
+        if self.orig_seq_lens is not None:
+            self.orig_seq_lens = self.orig_seq_lens + 1
+        self.seq_lens_sum = None
+
+        return running_input_ids
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.mixed_spec_info = None
+        self.mix_running_input_ids = None
         server_args = get_server_args()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
@@ -3070,6 +3126,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             has_grammar=self.has_grammar,
             decoding_reqs=self.decoding_reqs,
+            mixed_spec_info=self.mixed_spec_info,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,

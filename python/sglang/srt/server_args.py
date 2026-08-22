@@ -932,6 +932,13 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    enable_mixed_spec_chunk: A[
+        bool,
+        "Enable the experimental target-only fallback that mixes chunked prefill "
+        "with running NEXTN requests. Mixed iterations skip draft/verify, emit one "
+        "target token per running request, and resynchronize the draft state.",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)

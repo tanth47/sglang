@@ -248,6 +248,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -298,6 +299,16 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 DECODE_STEP_MAX_US = 2_000_000
+
+
+def _supports_mixed_spec_target_only_requests(
+    new_batch: ScheduleBatch, running_batch: ScheduleBatch
+) -> bool:
+    """Return whether both partitions fit the deliberately narrow V0 scope."""
+    return not (new_batch.has_grammar or running_batch.has_grammar) and all(
+        req.sampling_params.top_k == 1
+        for req in new_batch.reqs + running_batch.reqs
+    )
 
 
 def _accumulate_decode_moment(
@@ -1038,6 +1049,10 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
+        )
+        self.is_mixed_spec_chunk = (
+            self.chunked_prefill_size is not None
+            and getattr(self.server_args, "enable_mixed_spec_chunk", False)
         )
 
         # Init the dynamic chunking predictor for PP
@@ -2973,7 +2988,9 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs
+            if (self.is_mixed_chunk or self.is_mixed_spec_chunk)
+            else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -3141,17 +3158,39 @@ class Scheduler(
 
         # Mixed-style chunked prefill
         if (
-            self.is_mixed_chunk
+            (self.is_mixed_chunk or self.is_mixed_spec_chunk)
             and not running_batch.is_empty()
             and not (new_batch.return_logprob or running_batch.return_logprob)
+            # The legacy mixed-chunk path keeps its existing request support.
+            # The experimental spec path falls back unless every request is
+            # grammar-free and normalized to greedy sampling (top_k == 1).
+            and (
+                not self.is_mixed_spec_chunk
+                or _supports_mixed_spec_target_only_requests(
+                    new_batch, running_batch
+                )
+            )
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
-                running_batch.prepare_for_decode()
-                new_batch.mix_with_running(running_batch)
+                if self.is_mixed_spec_chunk:
+                    mixed_spec_info = MixedSpecBatchInfo.target_only(
+                        new_batch.extend_lens, running_batch.batch_size()
+                    )
+                    running_input_ids = (
+                        running_batch.prepare_for_mixed_spec_target_only()
+                    )
+                    new_batch.mix_with_running(
+                        running_batch,
+                        running_input_ids=running_input_ids,
+                        mixed_spec_info=mixed_spec_info,
+                    )
+                else:
+                    running_batch.prepare_for_decode()
+                    new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full

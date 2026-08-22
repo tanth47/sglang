@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -465,6 +466,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Host-side partition contract for mixed prefill + speculative fallback.
+    mixed_spec_info: Optional[MixedSpecBatchInfo] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
@@ -757,6 +760,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            mixed_spec_info=batch.mixed_spec_info,
         )
 
         ret._maybe_init_non_generation_fields(batch)
@@ -871,6 +875,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
+            if ret.mixed_spec_info is not None:
+                assert ret.forward_mode.is_mixed()
+                assert ret.mixed_spec_info.batch_size == ret.batch_size
+                assert ret.mixed_spec_info.num_tokens == ret.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,

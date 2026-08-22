@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.mixed_spec_info import MixedSpecMode
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -81,6 +82,23 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+
+    @staticmethod
+    def _commit_mixed_spec_target_only(
+        batch: ScheduleBatch, req_index: int, req: Req
+    ) -> None:
+        info = batch.mixed_spec_info
+        if info is None or not info.is_decode_index(req_index):
+            return
+
+        assert info.mode is MixedSpecMode.TARGET_ONLY
+        assert batch.decoding_reqs is not None and req in batch.decoding_reqs
+        # The target forward consumed the previous bonus token. The newly
+        # sampled token remains uncommitted and seeds the next EAGLE iteration.
+        next_committed_len = req.kv_committed_len + 1
+        if batch.seq_lens_cpu is not None:
+            assert next_committed_len == int(batch.seq_lens_cpu[req_index])
+        req.kv_committed_len = next_committed_len
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -229,6 +247,8 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+
+                    self._commit_mixed_spec_target_only(batch, i, req)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)

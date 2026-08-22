@@ -75,6 +75,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.mixed_spec_info import MixedSpecMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -1123,6 +1124,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if batch.mixed_spec_info is not None:
+                assert batch.forward_mode.is_mixed()
+                assert batch.mixed_spec_info.mode is MixedSpecMode.TARGET_ONLY
+                assert tuple(batch.extend_lens) == batch.mixed_spec_info.query_lens
+
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
