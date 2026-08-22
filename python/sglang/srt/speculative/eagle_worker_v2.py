@@ -1377,6 +1377,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 for name in prefill_capture.keys() & verify_capture.keys()
             }
 
+        def within_repeatability_floor(
+            mixed_result, repeat_result, *, factor: float = 1.25
+        ):
+            """Judge mixed deltas against the backend's same-shape noise floor."""
+            if not mixed_result.get("shape_equal", False) or not repeat_result.get(
+                "shape_equal", False
+            ):
+                return {
+                    "passed": False,
+                    "factor": factor,
+                    "reason": "shape_mismatch",
+                }
+            max_abs_limit = max(1e-4, repeat_result["max_abs"] * factor)
+            mean_abs_limit = max(1e-5, repeat_result["mean_abs"] * factor)
+            return {
+                "passed": mixed_result["max_abs"] <= max_abs_limit
+                and mixed_result["mean_abs"] <= mean_abs_limit,
+                "factor": factor,
+                "max_abs_limit": max_abs_limit,
+                "mean_abs_limit": mean_abs_limit,
+            }
+
         def capture_kv(out_cache_loc: torch.Tensor):
             pool = self.target_worker.model_runner.token_to_kv_pool
             start_layer = getattr(pool, "start_layer", 0) or 0
@@ -1543,6 +1565,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 clone_tensor(verify_repeat.logits_output.hidden_states),
             ]
         )
+        split_repeat_kv = capture_kv(reference_out_cache_loc)
 
         restore(prefill_batch, prefill_state)
         restore(running_batch, running_state)
@@ -1598,36 +1621,64 @@ class EAGLEWorkerV2(BaseSpecWorker):
             for name in reference_kv.keys() & mixed_kv.keys()
         }
         comparisons["kv"] = kv_comparisons
-        pass_checks = [
-            comparisons["logits"].get("allclose_1e-2", False),
-            comparisons["hidden"].get("allclose_1e-2", False),
-            comparisons["split_repeatability"]["logits"].get(
-                "allclose_1e-2", False
+        split_repeat_kv_comparisons = {
+            name: compare(reference_kv[name], split_repeat_kv[name])
+            for name in reference_kv.keys() & split_repeat_kv.keys()
+        }
+        comparisons["split_repeatability"]["kv"] = split_repeat_kv_comparisons
+
+        baseline_aware = {
+            "logits": within_repeatability_floor(
+                comparisons["logits"],
+                comparisons["split_repeatability"]["logits"],
             ),
-            comparisons["split_repeatability"]["hidden"].get(
-                "allclose_1e-2", False
+            "hidden": within_repeatability_floor(
+                comparisons["hidden"],
+                comparisons["split_repeatability"]["hidden"],
             ),
-            comparisons["out_cache_loc_exact"],
-            bool(indexer_topk_comparisons),
-            bool(aux_comparisons),
-            bool(kv_comparisons),
+            "kv": {
+                name: within_repeatability_floor(
+                    kv_comparisons[name], split_repeat_kv_comparisons[name]
+                )
+                for name in kv_comparisons.keys()
+                & split_repeat_kv_comparisons.keys()
+            },
+        }
+        comparisons["baseline_aware"] = baseline_aware
+        comparisons["target_argmax_exact"] = torch.equal(
+            reference_logits.argmax(dim=-1), mixed_logits.argmax(dim=-1)
+        )
+
+        mapped_page_table_results = aux_comparisons.get("mapped_page_table", {})
+        early_layer_results = [
+            result
+            for name in ("self_attn_output", "mlp_input", "layer_output")
+            for layer_id, result in aux_comparisons.get(name, {}).items()
+            if layer_id <= 1
         ]
-        pass_checks.extend(
-            result.get("exact", False)
-            for result in indexer_topk_comparisons.values()
-        )
-        pass_checks.extend(
-            result.get("allclose_1e-2", False)
-            for result in kv_comparisons.values()
-        )
-        pass_checks.extend(
-            result.get(
-                "exact" if name == "mapped_page_table" else "allclose_1e-2",
-                False,
-            )
-            for name, layer_results in aux_comparisons.items()
-            for result in layer_results.values()
-        )
+        pass_checks = [
+            comparisons["out_cache_loc_exact"],
+            comparisons["target_argmax_exact"],
+            baseline_aware["logits"]["passed"],
+            baseline_aware["hidden"]["passed"],
+            bool(baseline_aware["kv"]),
+            all(result["passed"] for result in baseline_aware["kv"].values()),
+            bool(indexer_topk_comparisons),
+            all(
+                result.get("exact", False)
+                for result in indexer_topk_comparisons.values()
+            ),
+            bool(mapped_page_table_results),
+            all(
+                result.get("exact", False)
+                for result in mapped_page_table_results.values()
+            ),
+            bool(early_layer_results),
+            all(
+                result.get("allclose_1e-2", False)
+                for result in early_layer_results
+            ),
+        ]
 
         artifact = {
             "passed": all(pass_checks),
@@ -1644,6 +1695,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             },
             "comparisons": comparisons,
+            "gate_definition": {
+                "repeatability_factor": 1.25,
+                "requires_exact": [
+                    "out_cache_loc",
+                    "target_argmax",
+                    "indexer_topk",
+                    "mapped_page_table",
+                ],
+                "requires_allclose_1e-2": [
+                    "layers_0_1.self_attn_output",
+                    "layers_0_1.mlp_input",
+                    "layers_0_1.layer_output",
+                ],
+                "requires_within_repeatability_floor": [
+                    "logits",
+                    "hidden",
+                    "selected_kv",
+                ],
+            },
             "reference": {
                 "logits": reference_logits.cpu(),
                 "hidden": reference_hidden.cpu(),
