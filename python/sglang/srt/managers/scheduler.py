@@ -248,7 +248,6 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
-from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -301,10 +300,10 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 DECODE_STEP_MAX_US = 2_000_000
 
 
-def _supports_mixed_spec_target_only_requests(
+def _supports_mixed_spec_verify_requests(
     new_batch: ScheduleBatch, running_batch: ScheduleBatch
 ) -> bool:
-    """Return whether both partitions fit the deliberately narrow V0 scope."""
+    """Return whether both partitions fit the deliberately narrow V1 scope."""
     return not (new_batch.has_grammar or running_batch.has_grammar) and all(
         req.sampling_params.top_k == 1
         for req in new_batch.reqs + running_batch.reqs
@@ -3166,7 +3165,7 @@ class Scheduler(
             # grammar-free and normalized to greedy sampling (top_k == 1).
             and (
                 not self.is_mixed_spec_chunk
-                or _supports_mixed_spec_target_only_requests(
+                or _supports_mixed_spec_verify_requests(
                     new_batch, running_batch
                 )
             )
@@ -3183,17 +3182,12 @@ class Scheduler(
                             running_batch
                         )
                     else:
-                        mixed_spec_info = MixedSpecBatchInfo.target_only(
-                            new_batch.extend_lens, running_batch.batch_size()
-                        )
-                        running_input_ids = (
-                            running_batch.prepare_for_mixed_spec_target_only()
-                        )
-                        new_batch.mix_with_running(
-                            running_batch,
-                            running_input_ids=running_input_ids,
-                            mixed_spec_info=mixed_spec_info,
-                        )
+                        # Allocate the normal EAGLE reserve and advance only
+                        # scheduler-owned decode clocks. The worker composes a
+                        # disposable heterogeneous forward view, then the
+                        # scheduler rejoins the two partitions after acceptance.
+                        running_batch.prepare_for_decode()
+                        new_batch.mixed_spec_running_batch = running_batch
                 else:
                     running_batch.prepare_for_decode()
                     new_batch.mix_with_running(running_batch)
@@ -3520,15 +3514,18 @@ class Scheduler(
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
+                if batch_result.mixed_spec_decode_result is not None:
+                    self._materialize_mixed_spec_result(batch, batch_result)
+                else:
+                    # The isolation restore reverted the worker's in-forward SB
+                    # edits; re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
                 batch_result.copy_done = self.device_module.Event()
@@ -3591,6 +3588,48 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _materialize_mixed_spec_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Atomically publish both logical next states after a mixed verify."""
+        running_batch = batch.mixed_spec_running_batch
+        decode_result = result.mixed_spec_decode_result
+        assert running_batch is not None
+        assert decode_result is not None
+        assert result.mixed_spec_info is not None
+
+        def apply_next_state(
+            partition: ScheduleBatch, partition_result: GenerationBatchResult
+        ) -> None:
+            assert partition_result.next_draft_input is not None
+            assert partition_result.new_seq_lens is not None
+            partition.spec_info = partition_result.next_draft_input
+            partition.seq_lens = partition_result.new_seq_lens
+            if partition.seq_lens_cpu is not None:
+                partition.seq_lens_cpu = partition_result.new_seq_lens.to("cpu")
+                partition.seq_lens_sum = int(partition.seq_lens_cpu.sum())
+            partition.input_ids = None
+
+        apply_next_state(batch, result)
+        apply_next_state(running_batch, decode_result)
+        running_batch.launch_ts = batch.launch_ts
+        running_batch.forward_iter = batch.forward_iter
+
+        # Result processing needs the two ownership domains separately even
+        # though the scheduler carries one rejoined batch into the next loop.
+        result.mixed_spec_prefill_batch = batch.copy()
+        result.mixed_spec_prefill_batch.decoding_reqs = None
+        result.mixed_spec_prefill_batch.mixed_spec_info = None
+        result.mixed_spec_decode_batch = running_batch.copy()
+
+        decoding_reqs = running_batch.reqs[:]
+        batch.merge_batch(running_batch)
+        batch.decoding_reqs = decoding_reqs
+        batch.mixed_spec_info = result.mixed_spec_info
+        batch.mixed_spec_running_batch = None
+        batch.input_ids = None
+        batch.seq_lens_sum = None
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
@@ -3667,6 +3706,36 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
+        if (
+            isinstance(result, GenerationBatchResult)
+            and result.mixed_spec_decode_result is not None
+        ):
+            prefill_batch = result.mixed_spec_prefill_batch
+            decode_batch = result.mixed_spec_decode_batch
+            decode_result = result.mixed_spec_decode_result
+            assert prefill_batch is not None
+            assert decode_batch is not None
+
+            self.batch_result_processor.process_batch_result_prefill(
+                prefill_batch, result
+            )
+            self.batch_result_processor.process_batch_result_decode(
+                decode_batch, decode_result
+            )
+            self._record_step_counters(prefill_batch, result)
+            self._record_step_counters(decode_batch, decode_result)
+            self.metrics_reporter.log_batch_result_stats(prefill_batch, result)
+            self.metrics_reporter.log_batch_result_stats(
+                decode_batch, decode_result
+            )
+            if self.enable_fpm:
+                # One physical target forward produced both logical results.
+                self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+            self._maybe_clear_mm_inputs(batch)
+            self.maybe_send_health_check_signal()
+            self.metrics_reporter.update_device_timer()
+            return
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

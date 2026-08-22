@@ -15,8 +15,10 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.mixed_spec_info import MixedSpecBatchInfo
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +88,14 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # Mixed prefill/spec V1 carries two logical results through one physical
+    # target forward. The scheduler fills the two process-batch snapshots while
+    # materializing the successful next state.
+    mixed_spec_decode_result: Optional["GenerationBatchResult"] = None
+    mixed_spec_info: Optional["MixedSpecBatchInfo"] = None
+    mixed_spec_prefill_batch: Optional["ScheduleBatch"] = None
+    mixed_spec_decode_batch: Optional["ScheduleBatch"] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -164,6 +174,13 @@ class GenerationBatchResult:
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
+
+        if self.mixed_spec_decode_result is not None:
+            self.mixed_spec_decode_result.copy_done = self.copy_done
+            self.mixed_spec_decode_result.copy_to_cpu(
+                return_logprob=False,
+                return_hidden_states=return_hidden_states,
+            )
 
         self.copy_done.record()
 

@@ -603,6 +603,54 @@ def run_eagle_verify(
             # and will be applied to produce wrong results
             batch.sampling_info.vocab_mask = None
 
+    return finish_eagle_verify(
+        batch,
+        verify_input=verify_input,
+        logits_output=logits_output,
+        target_worker=target_worker,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        topk=topk,
+        num_steps=num_steps,
+        num_draft_tokens=num_draft_tokens,
+        device=device,
+        can_run_cuda_graph=can_run_cuda_graph,
+        finalize_tree_path=finalize_tree_path,
+        vocab_mask=vocab_mask,
+        routed_experts_output=forward_batch_output.routed_experts_output,
+        indexer_topk_output=forward_batch_output.indexer_topk_output,
+        extra_keep_alive_refs=[verify_forward_batch],
+    )
+
+
+def finish_eagle_verify(
+    batch: ScheduleBatch,
+    *,
+    verify_input: EagleVerifyInput,
+    logits_output: Any,
+    target_worker: TpModelWorker,
+    token_to_kv_pool_allocator: Any,
+    topk: int,
+    num_steps: int,
+    num_draft_tokens: int,
+    device: str,
+    can_run_cuda_graph: bool,
+    finalize_tree_path: bool,
+    vocab_mask=None,
+    routed_experts_output=None,
+    indexer_topk_output=None,
+    extra_keep_alive_refs=None,
+) -> GenerationBatchResult:
+    """Finish EAGLE acceptance after target logits already exist.
+
+    Normal speculative decode calls this immediately after its dedicated target
+    verify forward. Mixed prefill/spec decode uses the same acceptance owner
+    after demultiplexing the verify rows from a heterogeneous target forward.
+    Keeping sampling, accepted-path compaction, rejected-state clearing, and
+    next-draft seeding here prevents the mixed path from growing a second KV
+    lifecycle implementation.
+    """
+    bs = len(batch.seq_lens)
+
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
@@ -680,7 +728,7 @@ def run_eagle_verify(
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
         new_seq_lens=new_seq_lens,
-        routed_experts_output=forward_batch_output.routed_experts_output,
-        indexer_topk_output=forward_batch_output.indexer_topk_output,
-        extra_keep_alive_refs=[verify_forward_batch],
+        routed_experts_output=routed_experts_output,
+        indexer_topk_output=indexer_topk_output,
+        extra_keep_alive_refs=extra_keep_alive_refs,
     )

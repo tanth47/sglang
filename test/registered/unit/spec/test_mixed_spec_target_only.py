@@ -12,16 +12,22 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.logits_processor import (  # noqa: E402
     LogitsMetadata,
     LogitsProcessor,
+    LogitsProcessorOutput,
 )
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
-    _supports_mixed_spec_target_only_requests,
+    Scheduler,
+    _supports_mixed_spec_verify_requests,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.eagle_worker_common import (  # noqa: E402
+    finish_eagle_verify,
+)
 from sglang.srt.speculative.mixed_spec_info import (  # noqa: E402
     EAGLE_VERIFY_WIDTH,
     MixedSpecBatchInfo,
@@ -356,17 +362,17 @@ class TestMixedSpecRequestScope(unittest.TestCase):
 
     def test_accepts_only_grammar_free_greedy_requests(self):
         self.assertTrue(
-            _supports_mixed_spec_target_only_requests(
+            _supports_mixed_spec_verify_requests(
                 self._batch(1, 1), self._batch(1)
             )
         )
         self.assertFalse(
-            _supports_mixed_spec_target_only_requests(
+            _supports_mixed_spec_verify_requests(
                 self._batch(1, has_grammar=True), self._batch(1)
             )
         )
         self.assertFalse(
-            _supports_mixed_spec_target_only_requests(
+            _supports_mixed_spec_verify_requests(
                 self._batch(1), self._batch(1, 8)
             )
         )
@@ -408,6 +414,236 @@ class TestMixedSpecCommit(unittest.TestCase):
                 batch, 0, decode_req
             )
         self.assertEqual(decode_req.kv_committed_len, 20)
+
+
+class TestMixedSpecVerifySettlement(unittest.TestCase):
+    @staticmethod
+    def _req(base_len):
+        req = types.SimpleNamespace(
+            kv_committed_len=base_len,
+            is_retracted=False,
+            grammar=None,
+            spec_verify_ct=0,
+            spec_num_correct_drafts=0,
+            spec_num_block_accept_tokens=0,
+            spec_num_cap_tokens=0,
+        )
+        req.finished = lambda: False
+        req.update_spec_correct_drafts_histogram = MagicMock()
+        req.update_spec_cap_lens_histogram = MagicMock()
+        return req
+
+    def test_forced_accept_lengths_publish_only_after_rejoin_then_commit(self):
+        model_config = types.SimpleNamespace(is_encoder_decoder=False)
+        prefill_req = self._req(8)
+        decode_reqs = [self._req(20 + i) for i in range(EAGLE_VERIFY_WIDTH)]
+
+        prefill_draft = MagicMock()
+        decode_draft = MagicMock()
+        prefill_batch = ScheduleBatch(
+            reqs=[prefill_req],
+            device="cpu",
+            enable_overlap=False,
+            spec_algorithm=_SpecAlgorithm(),
+            model_config=model_config,
+            sampling_info=MagicMock(),
+            req_pool_indices=torch.tensor([0]),
+            req_pool_indices_cpu=torch.tensor([0]),
+            seq_lens=torch.tensor([8]),
+            seq_lens_cpu=torch.tensor([8]),
+            orig_seq_lens=torch.tensor([8], dtype=torch.int32),
+            input_ids=torch.tensor([1]),
+            out_cache_loc=torch.tensor([100]),
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=[8],
+            prefix_lens=[0],
+            extend_num_tokens=8,
+            extend_logprob_start_lens=[0],
+            return_logprob=False,
+            has_grammar=False,
+            is_prefill_only=False,
+        )
+        base_lens = torch.tensor(
+            [req.kv_committed_len for req in decode_reqs], dtype=torch.int64
+        )
+        running_batch = ScheduleBatch(
+            reqs=decode_reqs,
+            device="cpu",
+            enable_overlap=False,
+            spec_algorithm=_SpecAlgorithm(),
+            model_config=model_config,
+            sampling_info=MagicMock(),
+            req_pool_indices=torch.arange(1, 1 + EAGLE_VERIFY_WIDTH),
+            req_pool_indices_cpu=torch.arange(1, 1 + EAGLE_VERIFY_WIDTH),
+            seq_lens=base_lens.clone(),
+            seq_lens_cpu=base_lens.clone(),
+            orig_seq_lens=base_lens.to(torch.int32),
+            input_ids=None,
+            out_cache_loc=None,
+            forward_mode=ForwardMode.DECODE,
+            return_logprob=False,
+            has_grammar=False,
+            is_prefill_only=False,
+        )
+        prefill_batch.mixed_spec_running_batch = running_batch
+
+        accept_lens = torch.arange(1, EAGLE_VERIFY_WIDTH + 1, dtype=torch.int32)
+        decode_result = GenerationBatchResult(
+            next_token_ids=torch.arange(
+                EAGLE_VERIFY_WIDTH * EAGLE_VERIFY_WIDTH, dtype=torch.int64
+            ),
+            accept_lens=accept_lens,
+            speculative_num_draft_tokens=EAGLE_VERIFY_WIDTH,
+            next_draft_input=decode_draft,
+            new_seq_lens=base_lens + accept_lens,
+        )
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([9]),
+            next_draft_input=prefill_draft,
+            new_seq_lens=torch.tensor([8]),
+            mixed_spec_decode_result=decode_result,
+            mixed_spec_info=MixedSpecBatchInfo.verify(
+                [8], verify_bs=EAGLE_VERIFY_WIDTH
+            ),
+        )
+
+        Scheduler._materialize_mixed_spec_result(None, prefill_batch, result)
+
+        # Rejoin publishes accepted batch-local lengths and next draft state,
+        # but request-visible KV is still transactional until result processing.
+        self.assertTrue(
+            torch.equal(
+                prefill_batch.seq_lens,
+                torch.cat([torch.tensor([8]), base_lens + accept_lens]),
+            )
+        )
+        self.assertEqual(
+            [req.kv_committed_len for req in decode_reqs], base_lens.tolist()
+        )
+        self.assertEqual(result.mixed_spec_prefill_batch.reqs, [prefill_req])
+        self.assertEqual(result.mixed_spec_decode_batch.reqs, decode_reqs)
+        prefill_draft.merge_batch.assert_called_once_with(decode_draft)
+
+        fake_processor = types.SimpleNamespace(
+            model_worker=types.SimpleNamespace(
+                on_verify_complete_cpu=MagicMock()
+            ),
+            advance_grammar_fsm=lambda _result, _batch: None,
+        )
+        accepted = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+            fake_processor, decode_result, result.mixed_spec_decode_batch
+        )
+
+        self.assertEqual([len(tokens) for tokens in accepted], list(range(1, 7)))
+        self.assertEqual(
+            [req.kv_committed_len for req in decode_reqs],
+            (base_lens + accept_lens).tolist(),
+        )
+        self.assertEqual([req.spec_verify_ct for req in decode_reqs], [1] * 6)
+
+    def test_shared_verify_finisher_clears_rejected_state_for_lengths_one_to_six(
+        self,
+    ):
+        base_lens = torch.arange(10, 16, dtype=torch.int64)
+        accept_lens = torch.arange(1, 7, dtype=torch.int32)
+        predict = torch.arange(36, dtype=torch.int64)
+        accept_index = torch.arange(36, dtype=torch.int64).reshape(6, 6)
+        clear_unaccepted = MagicMock()
+        allocator = types.SimpleNamespace(
+            get_kvcache=lambda: types.SimpleNamespace(
+                clear_unaccepted_c128_draft_states=clear_unaccepted
+            )
+        )
+        batch = ScheduleBatch(
+            reqs=[self._req(int(x)) for x in base_lens],
+            device="cpu",
+            spec_algorithm=_SpecAlgorithm(),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=base_lens.clone(),
+            req_pool_indices=torch.arange(6),
+            return_logprob=False,
+        )
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=torch.zeros((36, 8)),
+            hidden_states=torch.arange(36, dtype=torch.float32).unsqueeze(1),
+        )
+
+        def fill_bonus(accept_tokens, lens, bonus, stride, bs):
+            rows = accept_tokens.reshape(bs, stride)
+            bonus.copy_(rows[torch.arange(bs), lens.to(torch.int64) - 1])
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_common.eagle_sample",
+                return_value=(predict, accept_lens, accept_index),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_common.fill_bonus_tokens_func",
+                side_effect=fill_bonus,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_common.commit_mamba_states_after_verify"
+            ) as commit_mamba,
+        ):
+            result = finish_eagle_verify(
+                batch,
+                verify_input=types.SimpleNamespace(),
+                logits_output=logits_output,
+                target_worker=MagicMock(),
+                token_to_kv_pool_allocator=allocator,
+                topk=1,
+                num_steps=5,
+                num_draft_tokens=6,
+                device="cpu",
+                can_run_cuda_graph=False,
+                finalize_tree_path=True,
+            )
+
+        self.assertTrue(torch.equal(result.new_seq_lens, base_lens + accept_lens))
+        self.assertTrue(torch.equal(result.accept_lens, accept_lens))
+        self.assertTrue(
+            torch.equal(
+                result.next_draft_input.bonus_tokens,
+                torch.tensor([0, 7, 14, 21, 28, 35], dtype=torch.int32),
+            )
+        )
+        clear_unaccepted.assert_called_once()
+        clear_args = clear_unaccepted.call_args.args
+        self.assertTrue(torch.equal(clear_args[1], base_lens))
+        self.assertTrue(torch.equal(clear_args[2], accept_lens))
+        self.assertEqual(clear_args[3], 6)
+        commit_mamba.assert_called_once()
+        self.assertEqual(
+            [req.kv_committed_len for req in batch.reqs], base_lens.tolist()
+        )
+
+    def test_mixed_result_cpu_copy_recurses_into_decode_partition(self):
+        event = MagicMock()
+        decode_result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.zeros((6, 8)),
+                hidden_states=torch.arange(6, dtype=torch.float32).unsqueeze(1),
+            ),
+            next_token_ids=torch.arange(6),
+            accept_lens=torch.tensor([3], dtype=torch.int32),
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.zeros((1, 8)),
+                hidden_states=torch.ones((1, 1)),
+            ),
+            next_token_ids=torch.tensor([7]),
+            mixed_spec_decode_result=decode_result,
+            copy_done=event,
+        )
+
+        result.copy_to_cpu(return_logprob=False, return_hidden_states=True)
+
+        self.assertIs(decode_result.copy_done, event)
+        self.assertTrue(result.next_token_ids.is_cpu)
+        self.assertTrue(decode_result.next_token_ids.is_cpu)
+        self.assertTrue(decode_result.accept_lens.is_cpu)
+        self.assertEqual(event.record.call_count, 2)
 
 
 if __name__ == "__main__":

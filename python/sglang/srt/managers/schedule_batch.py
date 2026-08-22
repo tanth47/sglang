@@ -1865,6 +1865,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mixed_spec_info: Optional[MixedSpecBatchInfo] = None
     # Disposable running half used only by the one-shot V1 differential gate.
     mixed_spec_differential_running_batch: Optional[ScheduleBatch] = None
+    # Scheduler-owned running partition attached to a real mixed verify. The
+    # worker treats it transactionally; the scheduler rejoins it only after a
+    # successful target forward, acceptance, and draft resynchronization.
+    mixed_spec_running_batch: Optional[ScheduleBatch] = None
 
     # For split prefill
     split_index: int = 0

@@ -45,7 +45,7 @@ def _valid_view(**overrides):
 
 
 class TestMixedSpecConfig(unittest.TestCase):
-    def test_accepts_narrow_glm52_target_only_scope(self):
+    def test_accepts_narrow_glm52_mixed_verify_scope(self):
         for tp_size in (4, 8):
             with self.subTest(tp_size=tp_size):
                 _validate_mixed_spec_chunk(

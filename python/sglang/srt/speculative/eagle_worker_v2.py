@@ -39,7 +39,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -74,6 +78,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
+    finish_eagle_verify,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -1141,6 +1146,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.mixed_spec_differential_running_batch,
             )
 
+        if batch.mixed_spec_running_batch is not None:
+            assert on_publish is None, "Mixed spec V1 requires overlap disabled."
+            assert grammar_barrier is None
+            return self.forward_mixed_spec_generation(
+                batch, batch.mixed_spec_running_batch
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if batch.mixed_spec_info is not None:
                 assert batch.forward_mode.is_mixed()
@@ -1239,6 +1251,202 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def forward_mixed_spec_generation(
+        self,
+        prefill_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,
+    ) -> GenerationBatchResult:
+        """Run one real mixed prefill + EAGLE verify transaction.
+
+        The heterogeneous target forward is shared. Its outputs are then
+        demultiplexed and fed back into the existing prefill sampler and EAGLE
+        acceptance/draft-resynchronization owners. Both scheduler-owned batch
+        objects are restored before returning; the scheduler materializes the
+        two successful next states only after the worker returns.
+        """
+        assert self.topk == 1
+        assert self.speculative_num_draft_tokens == EAGLE_VERIFY_WIDTH
+        assert not prefill_batch.enable_overlap
+        assert prefill_batch.forward_mode.is_extend()
+        assert running_batch.forward_mode.is_decode()
+        assert prefill_batch.input_ids is not None
+        assert running_batch.spec_info is not None
+        assert not prefill_batch.return_logprob
+        assert not running_batch.return_logprob
+        assert not prefill_batch.has_grammar
+        assert not running_batch.has_grammar
+
+        prefill_state = {
+            field.name: getattr(prefill_batch, field.name)
+            for field in dataclasses.fields(prefill_batch)
+        }
+        running_state = {
+            field.name: getattr(running_batch, field.name)
+            for field in dataclasses.fields(running_batch)
+        }
+
+        # The outer scheduler isolation already made prefill sampling state
+        # forward-only. Make the attached running partition forward-only too,
+        # and keep pristine shallow replacements because merge_batch rebinds
+        # every batched sampling tensor in place.
+        prefill_sampling_info = replace(prefill_batch.sampling_info)
+        running_sampling_info = running_batch.sampling_info.copy_for_forward()
+        prefill_batch.sampling_info = replace(prefill_sampling_info)
+        running_batch.sampling_info = replace(running_sampling_info)
+
+        def restore_batch(batch, state, sampling_info):
+            for name, value in state.items():
+                setattr(batch, name, value)
+            batch.sampling_info = replace(sampling_info)
+
+        try:
+            self.activate_step_by_batch(running_batch.batch_size())
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("mixed_draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    running_batch
+                )
+            assert verify_input.is_verify_input()
+
+            mixed_spec_info = prefill_batch.mix_with_running_verify(
+                running_batch, verify_input
+            )
+            assert mixed_spec_info.mode is MixedSpecMode.VERIFY
+
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
+            )
+            with spec_stage_span("mixed_target_verify"):
+                mixed_output = self.target_worker.forward_batch_generation(
+                    prefill_batch,
+                    is_verify=True,
+                    capture_hidden_mode=capture_mode,
+                )
+
+            mixed_logits_output = mixed_output.logits_output
+            prefill_logits, verify_logits = mixed_spec_info.split_target_outputs(
+                mixed_logits_output.next_token_logits
+            )
+            prefill_hidden = verify_hidden = None
+            if mixed_logits_output.hidden_states is not None:
+                prefill_hidden, verify_hidden = (
+                    mixed_spec_info.split_flattened_tokens(
+                        mixed_logits_output.hidden_states
+                    )
+                )
+
+            prefill_logits_output = replace(
+                mixed_logits_output,
+                next_token_logits=prefill_logits,
+                hidden_states=prefill_hidden,
+                mm_input_embeds=None,
+            )
+            verify_logits_output = replace(
+                mixed_logits_output,
+                next_token_logits=verify_logits,
+                hidden_states=verify_hidden,
+                mm_input_embeds=None,
+            )
+            verify_out_cache_loc = prefill_batch.out_cache_loc[
+                mixed_spec_info.prefill_num_tokens :
+            ]
+
+            # Return to the two logical batches before consuming their outputs.
+            restore_batch(prefill_batch, prefill_state, prefill_sampling_info)
+            restore_batch(running_batch, running_state, running_sampling_info)
+
+            verify_input.seq_lens_cpu = running_batch.seq_lens_cpu
+            verify_input.seq_lens_sum = (
+                int(running_batch.seq_lens_cpu.sum())
+                if running_batch.seq_lens_cpu is not None
+                else None
+            )
+            running_batch.forward_mode = ForwardMode.TARGET_VERIFY
+            running_batch.spec_info = verify_input
+            running_batch.input_ids = verify_input.draft_token
+            running_batch.out_cache_loc = verify_out_cache_loc
+            decode_result = finish_eagle_verify(
+                running_batch,
+                verify_input=verify_input,
+                logits_output=verify_logits_output,
+                target_worker=self.target_worker,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                can_run_cuda_graph=False,
+                finalize_tree_path=True,
+            )
+
+            prefill_forward_batch = ForwardBatch.init_new(
+                prefill_batch,
+                self.target_worker.model_runner,
+                capture_hidden_mode=capture_mode,
+                return_hidden_states_before_norm=False,
+            )
+            prefill_next_token_ids = self.target_worker.model_runner.sample(
+                prefill_logits_output, prefill_forward_batch
+            )
+            prefill_result = GenerationBatchResult(
+                logits_output=prefill_logits_output,
+                next_token_ids=prefill_next_token_ids,
+                can_run_cuda_graph=False,
+                new_seq_lens=prefill_batch.seq_lens,
+                routed_experts_output=mixed_output.routed_experts_output,
+                indexer_topk_output=mixed_output.indexer_topk_output,
+                expert_distribution_metrics=mixed_output.expert_distribution_metrics,
+            )
+
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("mixed_prefill_draft_extend"),
+            ):
+                prefill_result.next_draft_input = (
+                    self.draft_worker._draft_extend_for_prefill(
+                        prefill_batch,
+                        prefill_logits_output.hidden_states,
+                        prefill_next_token_ids,
+                        prefill_logits_output.mm_input_embeds,
+                    )
+                )
+
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("mixed_decode_draft_extend"),
+            ):
+                self.draft_worker._draft_extend_for_decode(
+                    running_batch, decode_result
+                )
+
+            prefill_result.mixed_spec_decode_result = decode_result
+            prefill_result.mixed_spec_info = mixed_spec_info
+            return prefill_result
+        finally:
+            # No failed or successful forward may leak the disposable mixed
+            # view into scheduler state. Request KV watermarks are committed by
+            # the result processor only after this transaction returns.
+            for name, value in prefill_state.items():
+                setattr(prefill_batch, name, value)
+            for name, value in running_state.items():
+                setattr(running_batch, name, value)
 
     def forward_mixed_spec_verify_target_for_differential(
         self,
