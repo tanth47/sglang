@@ -1863,6 +1863,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     decoding_reqs: List[Req] = None
     # Authoritative partition/layout for mixed prefill + speculative fallback.
     mixed_spec_info: Optional[MixedSpecBatchInfo] = None
+    # Disposable running half used only by the one-shot V1 differential gate.
+    mixed_spec_differential_running_batch: Optional[ScheduleBatch] = None
 
     # For split prefill
     split_index: int = 0

@@ -1,5 +1,7 @@
 import contextlib
+import dataclasses
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -65,6 +67,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
+    eagle_prepare_for_verify,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -91,6 +94,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -1127,6 +1131,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
+        if batch.mixed_spec_differential_running_batch is not None:
+            self.run_mixed_spec_verify_target_differential(
+                batch,
+                batch.mixed_spec_differential_running_batch,
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if batch.mixed_spec_info is not None:
                 assert batch.forward_mode.is_mixed()
@@ -1289,6 +1299,268 @@ class EAGLEWorkerV2(BaseSpecWorker):
             mixed_spec_info.split_flattened_tokens(hidden_states)
 
         return batch_output, verify_input, mixed_spec_info
+
+    def run_mixed_spec_verify_target_differential(
+        self,
+        prefill_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,
+    ) -> None:
+        """Run split and mixed target forwards, save evidence, then fail closed."""
+        output_base = envs.SGLANG_MIXED_SPEC_DIFFERENTIAL_OUTPUT.get()
+        assert output_base
+        assert self.topk == 1
+        assert self.speculative_num_draft_tokens == EAGLE_VERIFY_WIDTH
+        assert not self.speculative_algorithm.is_standalone()
+        assert prefill_batch.forward_mode.is_extend()
+        assert running_batch.forward_mode.is_decode()
+
+        def snapshot(batch: ScheduleBatch):
+            return {
+                field.name: getattr(batch, field.name)
+                for field in dataclasses.fields(batch)
+            }
+
+        def restore(batch: ScheduleBatch, state) -> None:
+            for name, value in state.items():
+                setattr(batch, name, value)
+
+        def clone_tensor(value):
+            return None if value is None else value.detach().clone()
+
+        def compare(reference: torch.Tensor, mixed: torch.Tensor):
+            if reference.shape != mixed.shape:
+                return {
+                    "shape_equal": False,
+                    "reference_shape": tuple(reference.shape),
+                    "mixed_shape": tuple(mixed.shape),
+                }
+            exact = torch.equal(reference, mixed)
+            if reference.numel() == 0:
+                max_abs = mean_abs = 0.0
+                close_1e3 = close_1e2 = True
+            else:
+                delta = (reference.float() - mixed.float()).abs()
+                max_abs = float(delta.max().item())
+                mean_abs = float(delta.mean().item())
+                close_1e3 = torch.allclose(
+                    reference.float(), mixed.float(), rtol=1e-3, atol=1e-3
+                )
+                close_1e2 = torch.allclose(
+                    reference.float(), mixed.float(), rtol=1e-2, atol=1e-2
+                )
+            return {
+                "shape_equal": True,
+                "shape": tuple(reference.shape),
+                "exact": exact,
+                "allclose_1e-3": close_1e3,
+                "allclose_1e-2": close_1e2,
+                "max_abs": max_abs,
+                "mean_abs": mean_abs,
+            }
+
+        def capture_indexer_topk(out_cache_loc: torch.Tensor):
+            capturer = get_global_indexer_capturer()
+            if capturer is None:
+                return None
+            return capturer.host_cache.buffer[out_cache_loc.cpu()].clone()
+
+        def capture_kv(out_cache_loc: torch.Tensor):
+            pool = self.target_worker.model_runner.token_to_kv_pool
+            start_layer = getattr(pool, "start_layer", 0) or 0
+            end_layer = getattr(pool, "end_layer", None)
+            if end_layer is None:
+                end_layer = start_layer + getattr(pool, "layer_num", 1)
+            layer_ids = sorted(
+                {
+                    start_layer,
+                    (start_layer + end_layer - 1) // 2,
+                    end_layer - 1,
+                }
+            )
+            locations = out_cache_loc.to(device=self.device, dtype=torch.long)
+            captured = {}
+            for layer_id in layer_ids:
+                for getter_name in (
+                    "get_key_buffer",
+                    "get_value_buffer",
+                    "get_index_k_buffer",
+                ):
+                    getter = getattr(pool, getter_name, None)
+                    if getter is None:
+                        continue
+                    try:
+                        buffer = getter(layer_id)
+                    except (AssertionError, IndexError, KeyError):
+                        continue
+                    if isinstance(buffer, torch.Tensor):
+                        captured[f"{getter_name}:{layer_id}"] = (
+                            buffer[locations].detach().clone()
+                        )
+            return captured
+
+        self.activate_step_by_batch(running_batch.batch_size())
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("mixed_differential_draft"),
+        ):
+            verify_input = self.draft_worker.draft(running_batch)
+        assert verify_input.is_verify_input()
+        assert verify_input.draft_token_num == EAGLE_VERIFY_WIDTH
+
+        prefill_state = snapshot(prefill_batch)
+        running_state = snapshot(running_batch)
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+
+        with spec_stage_span("mixed_differential_split_prefill"):
+            prefill_reference = self.target_worker.forward_batch_generation(
+                prefill_batch,
+                is_verify=True,
+                capture_hidden_mode=capture_mode,
+            )
+        prefill_out_cache_loc = prefill_batch.out_cache_loc.detach().clone()
+        prefill_reference_logits = clone_tensor(
+            prefill_reference.logits_output.next_token_logits
+        )
+        prefill_reference_hidden = clone_tensor(
+            prefill_reference.logits_output.hidden_states
+        )
+
+        running_batch.spec_info = verify_input
+        with self.plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                self.req_to_token_pool,
+                running_batch,
+                self.target_worker,
+            )
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+        assert not can_run_cuda_graph
+        with spec_stage_span("mixed_differential_split_verify"):
+            verify_reference = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
+        verify_out_cache_loc = running_batch.out_cache_loc.detach().clone()
+        verify_reference_logits = clone_tensor(
+            verify_reference.logits_output.next_token_logits
+        )
+        verify_reference_hidden = clone_tensor(
+            verify_reference.logits_output.hidden_states
+        )
+
+        reference_out_cache_loc = torch.cat(
+            [prefill_out_cache_loc, verify_out_cache_loc]
+        )
+        reference_logits = torch.cat(
+            [prefill_reference_logits, verify_reference_logits]
+        )
+        reference_hidden = torch.cat(
+            [prefill_reference_hidden, verify_reference_hidden]
+        )
+        reference_indexer_topk = capture_indexer_topk(reference_out_cache_loc)
+        reference_kv = capture_kv(reference_out_cache_loc)
+
+        restore(prefill_batch, prefill_state)
+        restore(running_batch, running_state)
+        mixed_output, _, mixed_spec_info = (
+            self.forward_mixed_spec_verify_target_for_differential(
+                prefill_batch,
+                running_batch,
+            )
+        )
+        mixed_logits = clone_tensor(mixed_output.logits_output.next_token_logits)
+        mixed_hidden = clone_tensor(mixed_output.logits_output.hidden_states)
+        mixed_out_cache_loc = prefill_batch.out_cache_loc.detach().clone()
+        mixed_indexer_topk = capture_indexer_topk(mixed_out_cache_loc)
+        mixed_kv = capture_kv(mixed_out_cache_loc)
+
+        comparisons = {
+            "logits": compare(reference_logits, mixed_logits),
+            "hidden": compare(reference_hidden, mixed_hidden),
+            "out_cache_loc_exact": torch.equal(
+                reference_out_cache_loc, mixed_out_cache_loc
+            ),
+        }
+        if reference_indexer_topk is not None and mixed_indexer_topk is not None:
+            comparisons["indexer_topk"] = compare(
+                reference_indexer_topk, mixed_indexer_topk
+            )
+        kv_comparisons = {
+            name: compare(reference_kv[name], mixed_kv[name])
+            for name in reference_kv.keys() & mixed_kv.keys()
+        }
+        comparisons["kv"] = kv_comparisons
+        pass_checks = [
+            comparisons["logits"].get("allclose_1e-2", False),
+            comparisons["hidden"].get("allclose_1e-2", False),
+            comparisons["out_cache_loc_exact"],
+            "indexer_topk" in comparisons,
+            bool(kv_comparisons),
+        ]
+        if "indexer_topk" in comparisons:
+            pass_checks.append(comparisons["indexer_topk"].get("exact", False))
+        pass_checks.extend(
+            result.get("allclose_1e-2", False)
+            for result in kv_comparisons.values()
+        )
+
+        artifact = {
+            "passed": all(pass_checks),
+            "tp_rank": self.ps.tp_rank,
+            "tp_size": self.ps.tp_size,
+            "layout": {
+                "query_lens": mixed_spec_info.query_lens,
+                "query_start_loc": mixed_spec_info.query_start_loc,
+                "prefill_bs": mixed_spec_info.prefill_bs,
+                "verify_bs": mixed_spec_info.verify_bs,
+                "num_tokens": mixed_spec_info.num_tokens,
+                "causal_context_lens": mixed_spec_info.causal_context_lens(
+                    prefill_batch.prefix_lens
+                ),
+            },
+            "comparisons": comparisons,
+            "reference": {
+                "logits": reference_logits.cpu(),
+                "hidden": reference_hidden.cpu(),
+                "out_cache_loc": reference_out_cache_loc.cpu(),
+                "indexer_topk": reference_indexer_topk,
+                "kv": {name: value.cpu() for name, value in reference_kv.items()},
+            },
+            "mixed": {
+                "logits": mixed_logits.cpu(),
+                "hidden": mixed_hidden.cpu(),
+                "out_cache_loc": mixed_out_cache_loc.cpu(),
+                "indexer_topk": mixed_indexer_topk,
+                "kv": {name: value.cpu() for name, value in mixed_kv.items()},
+            },
+        }
+        output_path = f"{output_base}.tp{self.ps.tp_rank}.pt"
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        torch.save(artifact, output_path)
+        logger.error(
+            "Mixed-spec differential complete: rank=%s passed=%s artifact=%s",
+            self.ps.tp_rank,
+            artifact["passed"],
+            output_path,
+        )
+        raise RuntimeError(
+            f"MIXED_SPEC_DIFFERENTIAL_COMPLETE rank={self.ps.tp_rank} "
+            f"passed={artifact['passed']} artifact={output_path}"
+        )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

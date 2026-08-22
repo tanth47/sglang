@@ -783,6 +783,11 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # One-shot development harness. When non-empty, the scheduler captures the
+    # first eligible mixed prefill/spec pair, runs split-vs-mixed target
+    # forwards, saves per-TP-rank evidence under this path, then aborts before
+    # sampling, acceptance, or request-level KV commit.
+    SGLANG_MIXED_SPEC_DIFFERENTIAL_OUTPUT = EnvStr("")
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

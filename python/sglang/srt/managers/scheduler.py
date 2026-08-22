@@ -3177,17 +3177,23 @@ class Scheduler(
             running_batch.filter_batch()
             if not running_batch.is_empty():
                 if self.is_mixed_spec_chunk:
-                    mixed_spec_info = MixedSpecBatchInfo.target_only(
-                        new_batch.extend_lens, running_batch.batch_size()
-                    )
-                    running_input_ids = (
-                        running_batch.prepare_for_mixed_spec_target_only()
-                    )
-                    new_batch.mix_with_running(
-                        running_batch,
-                        running_input_ids=running_input_ids,
-                        mixed_spec_info=mixed_spec_info,
-                    )
+                    if envs.SGLANG_MIXED_SPEC_DIFFERENTIAL_OUTPUT.get():
+                        running_batch.prepare_for_decode()
+                        new_batch.mixed_spec_differential_running_batch = (
+                            running_batch
+                        )
+                    else:
+                        mixed_spec_info = MixedSpecBatchInfo.target_only(
+                            new_batch.extend_lens, running_batch.batch_size()
+                        )
+                        running_input_ids = (
+                            running_batch.prepare_for_mixed_spec_target_only()
+                        )
+                        new_batch.mix_with_running(
+                            running_batch,
+                            running_input_ids=running_input_ids,
+                            mixed_spec_info=mixed_spec_info,
+                        )
                 else:
                     running_batch.prepare_for_decode()
                     new_batch.mix_with_running(running_batch)
