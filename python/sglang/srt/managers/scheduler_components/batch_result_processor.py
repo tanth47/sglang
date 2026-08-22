@@ -611,10 +611,18 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
-            if req.is_retracted or req.finished():
+            if (
+                req.is_retracted
+                or req.finished()
+                or getattr(req, "to_finish", None) is not None
+            ):
                 # Nothing to settle: no worker pre-claims the bonus, so
                 # kv_committed_len already holds the committed prefix.
-                pass
+                # Do not leak tokens from the in-flight verify into an aborted
+                # request.  Retracted/finished requests are skipped below;
+                # to_finish still needs an empty logical result so the normal
+                # finish/release path runs without publishing new tokens.
+                accept_tokens = []
             else:
                 if req.grammar is not None:
                     # FSM already advanced + truncated by advance_grammar_fsm; reuse
@@ -786,11 +794,13 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
+            if req.finished() or req.is_retracted:
+                # Overlap scheduling can leave a stale logical result after a
+                # request was finished/retracted.  Mixed speculative scheduling
+                # also demultiplexes an earlier physical forward into logical
+                # results, so make the ownership rule unconditional: stale
+                # results never publish tokens.  The release/retraction owner
+                # frees every over-allocated slot.
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified

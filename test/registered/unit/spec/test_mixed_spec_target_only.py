@@ -1,5 +1,6 @@
 import types
 import unittest
+from array import array
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -15,7 +16,12 @@ from sglang.srt.layers.logits_processor import (  # noqa: E402
     LogitsProcessorOutput,
 )
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    FINISH_ABORT,
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import (  # noqa: E402
     Scheduler,
     _supports_mixed_spec_verify_requests,
@@ -24,7 +30,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (  #
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
+from sglang.srt.mem_cache.common import release_kv_cache  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.eagle_worker_common import (  # noqa: E402
     finish_eagle_verify,
 )
@@ -644,6 +652,241 @@ class TestMixedSpecVerifySettlement(unittest.TestCase):
         self.assertTrue(decode_result.next_token_ids.is_cpu)
         self.assertTrue(decode_result.accept_lens.is_cpu)
         self.assertEqual(event.record.call_count, 2)
+
+
+class TestMixedSpecVerifyLifecycleBoundaries(unittest.TestCase):
+    @staticmethod
+    def _real_req(
+        *,
+        rid="mixed-boundary",
+        prompt_len=3,
+        output_ids=(),
+        max_new_tokens=128,
+        eos_token_ids=frozenset(),
+    ):
+        sampling_params = SamplingParams(
+            max_new_tokens=max_new_tokens,
+            temperature=0,
+        )
+        sampling_params.normalize(None)
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", range(1, prompt_len + 1)),
+            sampling_params=sampling_params,
+            eos_token_ids=set(eos_token_ids),
+            vocab_size=1024,
+        )
+        req.output_ids = array("q", output_ids)
+        req.kv_committed_len = prompt_len + len(output_ids)
+        return req
+
+    @staticmethod
+    def _resolve(req, tokens):
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor(tokens, dtype=torch.int64),
+            accept_lens=torch.tensor([len(tokens)], dtype=torch.int32),
+            speculative_num_draft_tokens=EAGLE_VERIFY_WIDTH,
+        )
+        processor = types.SimpleNamespace(
+            model_worker=types.SimpleNamespace(
+                on_verify_complete_cpu=MagicMock()
+            ),
+            advance_grammar_fsm=lambda _result, _batch: None,
+        )
+        batch = types.SimpleNamespace(reqs=[req])
+        accepted = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+            processor, result, batch
+        )
+        return accepted[0], result
+
+    @staticmethod
+    def _release_and_capture(req, *, allocated_len):
+        req.req_pool_idx = 0
+        req.kv = ReqKvInfo(
+            kv_allocated_len=allocated_len,
+            swa_evicted_seqlen=0,
+        )
+        req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.arange(128, dtype=torch.int64).reshape(1, 128),
+            free=MagicMock(),
+        )
+        allocator = types.SimpleNamespace(free=MagicMock())
+        tree_cache = types.SimpleNamespace(
+            cache_finished_req=MagicMock(),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        server_args = types.SimpleNamespace(
+            page_size=1,
+            speculative_algorithm="EAGLE",
+            strip_thinking_cache=False,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.get_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.mem_cache.common.get_server_args",
+                return_value=server_args,
+            ),
+        ):
+            release_kv_cache(req, tree_cache)
+        return tree_cache, allocator, req_to_token_pool
+
+    def test_eos_at_every_verify_position_limits_radix_visible_watermark(self):
+        for eos_position in range(EAGLE_VERIFY_WIDTH):
+            with self.subTest(eos_position=eos_position):
+                req = self._real_req(output_ids=[40, 41], eos_token_ids={99})
+                base_len = req.kv_committed_len
+                tokens = [50, 51, 52, 53, 54, 55]
+                tokens[eos_position] = 99
+
+                accepted, _ = self._resolve(req, tokens)
+                req.output_ids.extend(accepted)
+                req.update_finish_state(len(accepted))
+
+                self.assertEqual(accepted, tokens)
+                self.assertEqual(req.kv_committed_len, base_len + len(tokens))
+                self.assertEqual(req.finished_len, 2 + eos_position + 1)
+                server_args = types.SimpleNamespace(strip_thinking_cache=False)
+                with patch(
+                    "sglang.srt.managers.schedule_batch.get_server_args",
+                    return_value=server_args,
+                ):
+                    self.assertEqual(
+                        req.effective_kv_committed_len(),
+                        base_len + eos_position + 1,
+                    )
+
+    def test_max_new_tokens_and_context_clip_trim_speculative_tail(self):
+        max_req = self._real_req(output_ids=[40, 41], max_new_tokens=3)
+        base_len = max_req.kv_committed_len
+        accepted, _ = self._resolve(max_req, [50, 51, 52, 53, 54, 55])
+        max_req.output_ids.extend(accepted)
+        max_req.update_finish_state(len(accepted))
+
+        context_req = self._real_req(prompt_len=7, max_new_tokens=100)
+        fake_scheduler = types.SimpleNamespace(
+            max_new_tokens_limit=None,
+            max_req_len=10,
+            max_total_num_tokens=128,
+            page_size=1,
+        )
+        Scheduler.init_req_max_new_tokens(fake_scheduler, context_req)
+        context_base = context_req.kv_committed_len
+        context_accepted, _ = self._resolve(
+            context_req, [60, 61, 62, 63, 64, 65]
+        )
+        context_req.output_ids.extend(context_accepted)
+        context_req.update_finish_state(len(context_accepted))
+
+        server_args = types.SimpleNamespace(strip_thinking_cache=False)
+        with patch(
+            "sglang.srt.managers.schedule_batch.get_server_args",
+            return_value=server_args,
+        ):
+            self.assertEqual(max_req.finished_len, 3)
+            self.assertEqual(max_req.effective_kv_committed_len(), base_len + 1)
+            self.assertEqual(context_req.sampling_params.max_new_tokens, 2)
+            self.assertEqual(context_req.finished_len, 2)
+            self.assertEqual(
+                context_req.effective_kv_committed_len(), context_base + 2
+            )
+
+    def test_abort_drops_inflight_acceptance_and_releases_full_reserve(self):
+        req = self._real_req(output_ids=[40, 41])
+        base_len = req.kv_committed_len
+        req.to_finish = FINISH_ABORT()
+
+        accepted, _ = self._resolve(req, [50, 51, 52, 53, 54, 55])
+        req.output_ids.extend(accepted)
+        req.update_finish_state(len(accepted))
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(req.kv_committed_len, base_len)
+        self.assertEqual(list(req.output_ids), [40, 41])
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+
+        allocated_len = base_len + 2 * EAGLE_VERIFY_WIDTH
+        tree_cache, allocator, req_to_token_pool = self._release_and_capture(
+            req, allocated_len=allocated_len
+        )
+        self.assertEqual(
+            tree_cache.cache_finished_req.call_args.kwargs["kv_len_to_handle"],
+            base_len,
+        )
+        self.assertTrue(
+            torch.equal(
+                allocator.free.call_args.args[0],
+                torch.arange(base_len, allocated_len),
+            )
+        )
+        req_to_token_pool.free.assert_called_once_with(req)
+        self.assertIsNone(req.kv)
+
+    def test_retracted_logical_result_never_republishes_tokens(self):
+        req = self._real_req(output_ids=[40, 41])
+        base_len = req.kv_committed_len
+        req.is_retracted = True
+        allocator = types.SimpleNamespace(
+            free_group_begin=MagicMock(),
+            free_group_end=MagicMock(),
+        )
+        metrics_reporter = types.SimpleNamespace(
+            num_generated_tokens=0,
+            forward_ct_decode=0,
+            update_spec_metrics=MagicMock(),
+            report_decode_stats=MagicMock(),
+        )
+        output_streamer = types.SimpleNamespace(stream_output=MagicMock())
+        processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=None,
+            enable_overlap=False,
+            enable_overlap_mlx=False,
+            server_args=types.SimpleNamespace(enable_metrics=False),
+            model_config=types.SimpleNamespace(think_end_id=None),
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=None,
+            hisparse_coordinator=None,
+            req_to_token_pool=None,
+            decode_offload_manager=None,
+            metrics_collector=None,
+            metrics_reporter=metrics_reporter,
+            draft_worker=None,
+            model_worker=types.SimpleNamespace(
+                on_verify_complete_cpu=MagicMock()
+            ),
+            logprob_result_processor=None,
+            output_streamer=output_streamer,
+            abort_request=lambda *_args, **_kwargs: None,
+        )
+        batch = ScheduleBatch(
+            reqs=[req],
+            spec_algorithm=_SpecAlgorithm(),
+            forward_mode=ForwardMode.DECODE,
+            return_logprob=False,
+            return_hidden_states=False,
+            has_grammar=False,
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=torch.zeros((EAGLE_VERIFY_WIDTH, 8))
+            ),
+            next_token_ids=torch.tensor([50, 51, 52, 53, 54, 55]),
+            accept_lens=torch.tensor([EAGLE_VERIFY_WIDTH], dtype=torch.int32),
+            speculative_num_draft_tokens=EAGLE_VERIFY_WIDTH,
+        )
+
+        processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(req.kv_committed_len, base_len)
+        self.assertEqual(list(req.output_ids), [40, 41])
+        allocator.free_group_begin.assert_called_once()
+        allocator.free_group_end.assert_called_once()
+        output_streamer.stream_output.assert_called_once()
 
 
 if __name__ == "__main__":

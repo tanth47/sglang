@@ -1118,11 +1118,25 @@ class Req(ReqDllmMixin):
         )
 
     def effective_kv_committed_len(self) -> int:
+        committed_len = self.kv_committed_len
+
+        # A speculative verify can accept several tokens after the first EOS,
+        # stop condition, or max_new_tokens boundary.  Those rows were valid
+        # target writes, but they are not part of the request-visible sequence
+        # and must not become radix-visible when the finished request is
+        # released.  Keep output_ids intact for the output/logprob processors;
+        # release_kv_cache uses this semantic watermark to cache the visible
+        # prefix and return the speculative tail to the allocator.
+        if self.finished_len is not None:
+            committed_len = min(
+                committed_len, len(self.origin_input_ids) + self.finished_len
+            )
+
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            committed_len = min(committed_len, len(self.origin_input_ids))
+        return committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.
